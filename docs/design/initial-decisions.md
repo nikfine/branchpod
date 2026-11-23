@@ -172,9 +172,12 @@ Rules for file resources:
 - Lock files live in `locks/<pod id>.lock` in the `bp` home, outside the pod directory, and are never
   deleted: removing one while a process waits on it would let two processes hold the lock at once.
 - Waiting has no timeout: a waiter cannot tell a long `up` (first image pull) from a hung one, so any fixed
-  limit either breaks the normal case or is too long to matter. Steps bound their own run time instead, and
-  the waiter reports who holds the lock (command, pid, how long), recorded in a separate file because a
-  locked file cannot be read on Windows.
+  limit either breaks the normal case or is too long to matter. The waiter reports who holds the lock
+  (command, pid, how long), recorded in a separate file because a locked file cannot be read on Windows.
+- Steps have no time limit either, for the same reason: `bp` never kills a running `up` / `down` or one of
+  its commands. A hung step (a child that never exits, or a background descendant that keeps the
+  inherited output pipes open) holds the lock until the user stops the holder the waiter names; what was
+  created or intended stays in the ledger for `bp down`.
 - `gc` takes a pod's lock only if it is free and skips busy pods instead of waiting.
 - The lock is not re-entrant: taking it again in the same process is an error, not a deadlock.
 - Lock order: the pod lock before the port registry lock, never the other way round.
