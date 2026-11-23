@@ -103,6 +103,27 @@ Rules for file resources:
   rule that matches nothing is an error (drift in the source is noticed). Files that legitimately contain
   `{{ }}` (Blade, Vue) set `vars = false` and keep only `replace`; the `with` side is always substituted.
 
+## Command resources
+
+- `create` and `destroy` are argument arrays run without a shell, stdin closed, output captured. A
+  non-zero exit fails the step; its stderr is quoted (tail) in the error and kept whole for the run log.
+- stdout is decoded as UTF-8, never with the console code page; invalid UTF-8 is an error. A leading
+  byte order mark is dropped and surrounding whitespace trimmed; the result is
+  `{{command.<name>.stdout}}`.
+- The ledger stores `destroy` fully rendered, captured output included, so teardown needs neither the
+  config nor the worktree. When `destroy` does not reference its own output (a deterministic name such
+  as `bp-{{pod.id}}`), it is rendered into the intent, so an interrupted creation is still undone;
+  otherwise such a resource is left to `gc` by label.
+- Teardown must never run with an empty or garbled id. Empty output defines no variable, so any
+  reference to it is an unknown name and fails when planning. A rendered `destroy` argument must be a
+  single line, whichever command's output it comes from: a warning printed next to an id would otherwise
+  become part of it. Output that no `destroy` depends on is kept whole.
+- A program given as a relative path with a directory part (`./scripts/up.sh`) is resolved against the
+  command's working directory on every platform; Windows would otherwise resolve it against `bp`'s own.
+  A bare name is searched on `PATH`.
+- On Windows a `.cmd` / `.bat` program is named with its extension (`npx.cmd`): spawning without a
+  shell does not resolve it through `PATHEXT`.
+
 ## File sync (Mutagen)
 
 Plain resources, no special-casing in the core beyond a readiness hook:
