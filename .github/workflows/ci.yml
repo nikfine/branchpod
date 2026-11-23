@@ -33,8 +33,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  # The job name is a required status check: keep it free of the version number.
   msrv:
-    name: msrv (1.89)
+    name: msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -14,6 +14,9 @@ Guidance for AI coding agents (and humans) working on branchpod.
   up-to-date `main`. Small maintenance without an issue: `chore-<slug>`.
 - Changes reach `main` through pull requests; the PR body links the issue (`Closes #7`). CI runs on
   pull requests.
+- MSRV: raise `rust-version` freely when a newer language or library feature is needed, in the same PR
+  as the toolchain of the `msrv` CI job. Older Rust versions are not supported; the field and the job
+  only guarantee that the declared version is true.
 
 ## Principles
 
