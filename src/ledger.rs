@@ -41,7 +41,8 @@ impl Kind {
 
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // pad, not write_str: honours width and alignment ({:<8}) in tables.
+        f.pad(self.as_str())
     }
 }
 
@@ -104,7 +105,8 @@ impl Status {
 
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // pad, not write_str: honours width and alignment ({:<8}) in tables.
+        f.pad(self.as_str())
     }
 }
 
@@ -440,6 +442,12 @@ mod tests {
         )
         .unwrap();
         assert!(read(&path).is_err());
+    }
+
+    #[test]
+    fn names_line_up_in_tables() {
+        assert_eq!(format!("{:<8}|", Kind::Port), "port    |");
+        assert_eq!(format!("{:>9}|", Status::Live), "     live|");
     }
 
     #[test]

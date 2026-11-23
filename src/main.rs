@@ -3,7 +3,6 @@
 // Some helpers are only used by tests so far and by `bp gc`, which lands later.
 #![allow(dead_code)]
 
-
 mod commands;
 mod config;
 mod down;

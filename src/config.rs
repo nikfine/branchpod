@@ -63,6 +63,19 @@ pub enum FileMode {
     Ignore,
 }
 
+impl FileMode {
+    /// The name used in the config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileMode::Copy => "copy",
+            FileMode::Reflink => "reflink",
+            FileMode::Link => "link",
+            FileMode::Template => "template",
+            FileMode::Ignore => "ignore",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileSpec {
@@ -388,6 +401,14 @@ mod tests {
         assert_eq!(config.file[0].mode, FileMode::Template);
         assert_eq!(config.command[0].name, "app");
         assert_eq!(config.service[0].env["NODE_ENV"], "development");
+    }
+
+    #[test]
+    fn mode_names_match_the_config() {
+        use FileMode::*;
+        for mode in [Copy, Reflink, Link, Template, Ignore] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+        }
     }
 
     #[test]

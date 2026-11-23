@@ -57,21 +57,27 @@ impl Worktree {
         })
     }
 
-    /// The checked-out branch, short form (`feature/x`); `None` on a detached HEAD. A branch
-    /// without commits yet counts as checked out.
+    /// The checked-out branch name (`feature/x`); `None` on a detached HEAD. A branch without
+    /// commits yet counts as checked out.
     pub fn branch(&self) -> Result<Option<String>> {
-        // `symbolic-ref -q` exits with 1 and prints nothing when HEAD is not a branch.
+        // `symbolic-ref -q` exits with 1 and prints nothing when HEAD is not a branch. Not
+        // `--short`: it abbreviates to a name unambiguous among all refs, so a tag with the same
+        // name as the branch turns `feature` into `heads/feature`.
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.root)
-            .args(["symbolic-ref", "-q", "--short", "HEAD"])
+            .args(["symbolic-ref", "-q", "HEAD"])
             .output()
             .context("cannot run git (is it installed and on PATH?)")?;
         match output.status.code() {
             Some(0) => {
-                let name =
+                let full =
                     String::from_utf8(output.stdout).context("git printed non-UTF-8 output")?;
-                Ok(Some(name.trim().to_owned()))
+                let full = full.trim();
+                match full.strip_prefix("refs/heads/") {
+                    Some(name) => Ok(Some(name.to_owned())),
+                    None => bail!("HEAD points to {full}, not to a branch"),
+                }
             }
             Some(1) if output.stdout.is_empty() => Ok(None),
             _ => bail!(
@@ -299,6 +305,9 @@ mod tests {
         assert_eq!(from_linked.root, canonical(&linked).unwrap());
         assert_eq!(from_linked.main_checkout, Some(canonical(&main).unwrap()));
 
+        assert_eq!(from_linked.branch().unwrap().as_deref(), Some("feature"));
+        // A tag with the same name does not change how the branch is named.
+        git_ok(&linked, &["tag", "feature"]);
         assert_eq!(from_linked.branch().unwrap().as_deref(), Some("feature"));
         git_ok(&linked, &["checkout", "-q", "--detach"]);
         assert_eq!(from_linked.branch().unwrap(), None);

@@ -5,6 +5,10 @@
 //! first because templates and commands reference them; files before commands because a command
 //! (a container) may mount a file provisioned for it.
 //!
+//! Before anything is created, the whole config is planned once with stand-in values for what only
+//! creation yields (ports, command output): a typo in the last command or a missing source fails
+//! before the first port is allocated. What only creation can reveal still fails midway.
+//!
 //! Every resource goes through the write-ahead ledger: the intent (with what is needed to undo an
 //! interrupted creation) before it is created, its data after, or the failure. On failure nothing
 //! is rolled back here: what was created stays recorded and `bp down` removes it.
@@ -46,30 +50,48 @@ pub struct Item {
 }
 
 /// `up` failed after recording resources. They may exist and are left for `bp down`.
+///
+/// The cause is `error`, not a `source()`: the message already includes it, and a source would
+/// print it twice in an error chain. A typed cause (such as [`commands::Failed`] with the full
+/// stderr) is reached with `failed.error.downcast_ref()`.
 #[derive(Debug)]
 pub struct Failed {
     pub error: anyhow::Error,
     pub pod: String,
     pub worktree: PathBuf,
-    /// Every resource of the pod that is not destroyed, as the ledger has it now.
+    /// Every resource of the pod that is not destroyed, as the ledger has it now. Empty if the
+    /// ledger could not be read back.
     pub recorded: Vec<ResourceState>,
 }
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:#}\n\nresources recorded for pod {} (they may exist):\n{}\
-             run `bp down \"{}\"` to remove them",
-            self.error,
-            self.pod,
-            listing(&self.recorded),
-            self.worktree.display()
-        )
+        write!(f, "{:#}\n\n", self.error)?;
+        if self.recorded.is_empty() {
+            writeln!(
+                f,
+                "resources may have been created for pod {} (the ledger could not be read back)",
+                self.pod
+            )?;
+        } else {
+            write!(
+                f,
+                "resources recorded for pod {} (they may exist):\n{}",
+                self.pod,
+                listing(&self.recorded)
+            )?;
+        }
+        write!(f, "run `bp down {}` to remove them", quote(&self.worktree))
     }
 }
 
 impl std::error::Error for Failed {}
+
+/// The ledger, remembering whether this run wrote anything to it.
+struct Journal {
+    ledger: Ledger,
+    wrote: bool,
+}
 
 /// Provisions the pod of `wt` from `config`. `on_wait` is called if another `bp` holds the pod
 /// lock, before waiting for it.
@@ -87,8 +109,18 @@ pub fn up(
     }
     let main = wt.main_checkout.as_deref();
     let needs_main = config.file.iter().any(|f| f.mode != FileMode::Ignore);
-    if needs_main && main.is_none() {
-        bail!("file resources are copied from the main checkout, but the repository is bare");
+    if needs_main {
+        match main {
+            None => bail!(
+                "file resources are copied from the main checkout, but the repository is bare"
+            ),
+            Some(main) if pod::same_path(main, &wt.root) => bail!(
+                "{} is the main checkout: file resources are carried over from it into linked \
+                 worktrees, so there is nothing to carry over here; run `bp up` in a linked worktree",
+                wt.root.display()
+            ),
+            Some(_) => {}
+        }
     }
 
     let id = pod::pod_id(&wt.root);
@@ -98,11 +130,14 @@ pub fn up(
     if !existing.is_empty() {
         bail!(
             "pod {id} already has resources recorded:\n{}\
-             run `bp down \"{}\"` first",
+             run `bp down {}` first",
             listing(&existing),
-            wt.root.display()
+            quote(&wt.root)
         );
     }
+
+    let mut vars = builtin_vars(&id, wt);
+    check(config, wt, main, &vars)?;
 
     let meta = PodMeta {
         v: META_VERSION,
@@ -112,8 +147,10 @@ pub fn up(
     };
     store.write_meta(&meta)?;
 
-    let mut vars = builtin_vars(&id, wt)?;
-    let mut ledger = Ledger::open(&store.ledger_path(&id))?;
+    let mut journal = Journal {
+        ledger: Ledger::open(&store.ledger_path(&id))?,
+        wrote: false,
+    };
     let mut items = Vec::new();
     let result = provision(
         store,
@@ -121,17 +158,15 @@ pub fn up(
         wt,
         main,
         config,
-        &mut ledger,
+        &mut journal,
         &mut vars,
         &mut items,
     );
     match result {
         Ok(()) => Ok(Report { pod: meta, items }),
+        Err(error) if !journal.wrote => Err(error),
         Err(error) => {
             let recorded = store.resources(&id).map(live).unwrap_or_default();
-            if recorded.is_empty() {
-                return Err(error);
-            }
             Err(Failed {
                 error,
                 pod: id,
@@ -143,6 +178,27 @@ pub fn up(
     }
 }
 
+/// Plans every resource with stand-in values for what only creation yields: the first port of
+/// each range, a single-line placeholder for each command's output. Nothing is written.
+fn check(config: &Config, wt: &Worktree, main: Option<&Path>, vars: &Vars) -> Result<()> {
+    let mut probe = vars.clone();
+    for (name, spec) in &config.port {
+        probe.set(format!("port.{name}"), spec.range[0].to_string());
+    }
+    for spec in &config.file {
+        if spec.mode == FileMode::Ignore {
+            continue;
+        }
+        let main = main.expect("checked before taking the lock");
+        files::plan(spec, main, &wt.root, &probe)?;
+    }
+    for spec in &config.command {
+        commands::plan(spec, &wt.root, &probe)?;
+        probe.set(commands::stdout_var(&spec.name), "placeholder");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn provision(
     store: &Store,
@@ -150,14 +206,17 @@ fn provision(
     wt: &Worktree,
     main: Option<&Path>,
     config: &Config,
-    ledger: &mut Ledger,
+    journal: &mut Journal,
     vars: &mut Vars,
     items: &mut Vec<Item>,
 ) -> Result<()> {
     // The pod lock is held: the registry lock is taken after it, as the lock order requires.
     let registry = Registry::new(store.home());
     for (name, spec) in &config.port {
-        let record = step(ledger, Kind::Port, name, Value::Null, || {
+        let record = step(journal, Kind::Port, name, Value::Null, || {
+            // The pod has nothing live, so a registration it still has is stale (a lost ledger,
+            // a pod directory removed by hand): it would be returned without a bind check.
+            registry.release(id, name)?;
             let port = registry.allocate(id, name, spec.range)?;
             Ok(ports::Record { port })
         })
@@ -176,11 +235,8 @@ fn provision(
         }
         let main = main.expect("checked before taking the lock");
         let name = spec.name();
-        let mode = serde_json::to_value(spec.mode)?
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        // Checked against the disk before the intent: a rule that cannot be created records nothing.
+        // Planned again with the real values; still before the intent, so a rule that cannot be
+        // created records nothing.
         let Some(plan) = files::plan(spec, main, &wt.root, vars)? else {
             items.push(Item {
                 kind: Kind::File,
@@ -190,11 +246,11 @@ fn provision(
             continue;
         };
         let intent = serde_json::to_value(&plan.record)?;
-        step(ledger, Kind::File, &name, intent, || files::create(&plan))?;
+        step(journal, Kind::File, &name, intent, || files::create(&plan))?;
         items.push(Item {
             kind: Kind::File,
             name,
-            detail: mode,
+            detail: spec.mode.as_str().to_owned(),
         });
     }
 
@@ -202,7 +258,7 @@ fn provision(
         let plan = commands::plan(spec, &wt.root, vars)?;
         let intent = serde_json::to_value(&plan.record)?;
         // stderr of a successful command is for the run log, which does not exist yet.
-        let record = step(ledger, Kind::Command, &spec.name, intent, || {
+        let record = step(journal, Kind::Command, &spec.name, intent, || {
             commands::create(&plan).map(|out| out.record)
         })?;
         commands::export(&spec.name, &record, vars);
@@ -217,12 +273,15 @@ fn provision(
 
 /// Records the intent, runs `create` and records its data or its failure.
 fn step<T: Serialize>(
-    ledger: &mut Ledger,
+    journal: &mut Journal,
     kind: Kind,
     name: &str,
     intent: Value,
     create: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    // Set before the write: a failed write may still have reached the file.
+    journal.wrote = true;
+    let ledger = &mut journal.ledger;
     ledger.record(kind, name, Event::Intent { data: intent })?;
     match create() {
         Ok(created) => {
@@ -246,7 +305,7 @@ fn step<T: Serialize>(
 /// `pod.id`, `worktree`, `main` and `branch`. A name that has no value here (a detached HEAD, a
 /// bare repository, a path that is not UTF-8) is declared unavailable with the reason, so that a
 /// reference to it fails with an explanation instead of rendering something wrong.
-fn builtin_vars(id: &str, wt: &Worktree) -> Result<Vars> {
+fn builtin_vars(id: &str, wt: &Worktree) -> Vars {
     let mut vars = Vars::new();
     vars.set("pod.id", id);
     path_var(&mut vars, "worktree", &wt.root);
@@ -254,11 +313,25 @@ fn builtin_vars(id: &str, wt: &Worktree) -> Result<Vars> {
         Some(main) => path_var(&mut vars, "main", main),
         None => vars.set_unavailable("main", "the repository is bare"),
     }
-    match wt.branch()? {
-        Some(branch) => vars.set("branch", branch),
-        None => vars.set_unavailable("branch", "HEAD is detached"),
+    // A config that does not use `branch` must not fail because it cannot be determined.
+    match wt.branch() {
+        Ok(Some(branch)) => vars.set("branch", branch),
+        Ok(None) => vars.set_unavailable("branch", "HEAD is detached"),
+        Err(e) => vars.set_unavailable("branch", format!("{e:#}")),
     }
-    Ok(vars)
+    vars
+}
+
+/// `path` quoted for the user's shell, for a command to copy from a message: single quotes on
+/// Unix (nothing expands inside them), double quotes on Windows (`cmd.exe` knows no others;
+/// PowerShell takes both).
+fn quote(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        format!("\"{text}\"")
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
 }
 
 fn path_var(vars: &mut Vars, name: &str, path: &Path) {
@@ -290,33 +363,9 @@ fn live(resources: Vec<ResourceState>) -> Vec<ResourceState> {
 fn listing(resources: &[ResourceState]) -> String {
     let mut out = String::new();
     for r in resources {
-        out.push_str(&format!(
-            "  {:<8} {:<24} {}\n",
-            kind_name(r.kind),
-            r.name,
-            status_name(r.status)
-        ));
+        out.push_str(&format!("  {:<8} {:<24} {}\n", r.kind, r.name, r.status));
     }
     out
-}
-
-pub fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Git => "git",
-        Kind::File => "file",
-        Kind::Port => "port",
-        Kind::Command => "command",
-        Kind::Service => "service",
-    }
-}
-
-fn status_name(status: Status) -> &'static str {
-    match status {
-        Status::Pending => "pending",
-        Status::Live => "live",
-        Status::Failed => "failed",
-        Status::Destroyed => "destroyed",
-    }
 }
 
 #[cfg(test)]
@@ -595,6 +644,77 @@ mod tests {
         let err = format!("{:#}", run(&r, &text).unwrap_err());
         assert!(err.contains("HEAD is detached"), "{err}");
         assert!(resources(&r).is_empty());
+    }
+
+    #[test]
+    fn mistakes_anywhere_in_the_config_fail_before_anything_is_created() {
+        let r = repo();
+        fs::write(r.main.join(".env"), "URL=localhost:{{port.web}}\n").unwrap();
+        let typo = format!(
+            "[[command]]\nname = 'late'\ncreate = {}\n",
+            echo("{{command.app.stdout}}-{{port.wbe}}")
+        );
+        let missing = "[[file]]\npath = 'absent.txt'\nmode = 'copy'\n";
+        for (extra, expected) in [(typo.as_str(), "port.wbe"), (missing, "does not exist")] {
+            let err = format!("{:#}", run(&r, &config(extra)).unwrap_err());
+            assert!(err.contains(expected), "{err}");
+            assert!(resources(&r).is_empty(), "{err}");
+            assert!(!r.linked.join(".env").exists());
+            let registry = Registry::new(r.store.home());
+            assert!(registry.list().unwrap().is_empty(), "no port allocated");
+        }
+    }
+
+    #[test]
+    fn the_main_checkout_is_refused_when_files_would_be_carried_over() {
+        let r = repo();
+        fs::write(r.main.join(".env"), "A=1\n").unwrap();
+        let wt = Worktree::resolve(Some(r.main.as_os_str())).unwrap();
+        let config = Config::parse(&config("")).unwrap();
+        let err = format!(
+            "{:#}",
+            up(&r.store, &wt, &config, |_| panic!()).unwrap_err()
+        );
+        assert!(err.contains("is the main checkout"), "{err}");
+        assert!(r.store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stale_port_registration_is_not_trusted() {
+        let r = repo();
+        let id = pod::pod_id(&r.linked);
+        // Left behind by a ledger that was lost: a port that someone else now listens on.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy = listener.local_addr().unwrap().port();
+        if busy == u16::MAX {
+            return;
+        }
+        let range = [busy, busy + 1];
+        // Register the busy port for the pod the way an earlier `up` would have.
+        let text = format!(
+            "version = 1\n[port.web]\nrange = [{}, {}]\n",
+            range[0], range[1]
+        );
+        fs::create_dir_all(r.store.home()).unwrap();
+        fs::write(
+            r.store.home().join("ports.json"),
+            format!(r#"{{"v":1,"ports":{{"{busy}":{{"pod":"{id}","name":"web"}}}}}}"#),
+        )
+        .unwrap();
+        match run(&r, &text) {
+            Ok(report) => assert_ne!(report.items[0].detail, busy.to_string()),
+            // The neighbour may be busy on this machine too; the stale port is never handed out.
+            Err(e) => assert!(format!("{e:#}").contains("no free port"), "{e:#}"),
+        }
+    }
+
+    #[test]
+    fn hints_quote_the_path_for_the_shell() {
+        if cfg!(windows) {
+            assert_eq!(quote(Path::new(r"C:\a b")), r#""C:\a b""#);
+        } else {
+            assert_eq!(quote(Path::new("/a $b/it's")), r"'/a $b/it'\''s'");
+        }
     }
 
     #[test]
