@@ -5,6 +5,7 @@
 
 mod commands;
 mod config;
+mod control;
 mod down;
 mod files;
 mod fsutil;
@@ -13,6 +14,9 @@ mod ledger;
 mod pod;
 mod podlock;
 mod ports;
+mod proc;
+mod services;
+mod supervisor;
 mod up;
 mod vars;
 mod worktree;
@@ -49,7 +53,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Provision a worktree: ports, files and commands from its configuration.
+    /// Provision a worktree: ports, files, commands and services from its configuration.
     Up {
         /// Worktree path; defaults to the current directory.
         path: Option<OsString>,
@@ -69,6 +73,12 @@ enum Cmd {
     Down {
         /// Worktree path; defaults to the current directory.
         path: Option<OsString>,
+    },
+    /// Internal: the supervisor process of a pod, started by `bp up`.
+    #[command(hide = true)]
+    Supervise {
+        /// Control channel to listen on.
+        endpoint: String,
     },
 }
 
@@ -102,7 +112,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let wt = worktree::Worktree::resolve(path.as_deref())?;
             let config = config::Config::load(&wt.root, wt.main_checkout.as_deref())?;
             let store = pod::Store::open()?;
-            let report = up::up(&store, &wt, &config, |holder| match holder {
+            let launcher = supervisor::Launcher::current_exe()?;
+            let report = up::up(&store, &wt, &config, &launcher, |holder| match holder {
                 Some(holder) => eprintln!("bp: waiting for {holder} to finish"),
                 None => eprintln!("bp: waiting for another bp process on this worktree"),
             })?;
@@ -112,7 +123,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 report.pod.worktree.display()
             );
             for item in &report.items {
-                println!("  {:<8} {:<24} {}", item.kind, item.name, item.detail);
+                println!("  {:<10} {:<24} {}", item.kind, item.name, item.detail);
             }
         }
         Cmd::Status { path, json } => {
@@ -131,13 +142,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     Some(m) => {
                         println!("pod {} ({})", m.id, m.worktree.display());
                         for r in &resources {
-                            println!("  {:<8} {:<24} {}", r.kind, r.name, r.status);
+                            println!("  {:<10} {:<24} {}", r.kind, r.name, r.status);
                         }
                     }
                 }
             }
         }
         Cmd::Down { path } => return down(path.as_deref()),
+        Cmd::Supervise { endpoint } => supervisor::serve(&endpoint)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -167,7 +179,7 @@ fn down(path: Option<&OsStr>) -> Result<ExitCode> {
         } else {
             "left"
         };
-        println!("  {:<9} {:<8} {}", outcome, s.kind, s.name);
+        println!("  {:<9} {:<10} {}", outcome, s.kind, s.name);
     }
     for s in report.leftovers() {
         eprintln!(

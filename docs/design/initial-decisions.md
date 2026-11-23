@@ -79,8 +79,8 @@ Rules:
 - Every resource that is not destroyed is visited, pending and failed ones included. Each outcome is
   recorded (`destroyed`, or `failed` with the error and the data kept for the next attempt); a failure
   never stops the other steps.
-- Order: the reverse of creation, except that services stop first and file links are removed before
-  anything else.
+- Order: the reverse of creation, except that services stop first, then their supervisor, and file
+  links are removed before anything else.
 - Exit code: `0` nothing is left, `3` resources are left behind (run it again once the cause is fixed),
   `1` teardown could not run (the ledger cannot be read). `2` stays with usage errors.
 - Once nothing is left, the pod's state directory is removed too (`pod.json` last, so an interruption
@@ -111,10 +111,48 @@ directory there; teardown must never stop halfway through such a directory.
 
 One supervisor process per worktree, no global daemon; control over a local socket / named pipe.
 
-- Windows: Job Object with `KILL_ON_JOB_CLOSE`.
-- Linux: own process group (`setsid`) + `PR_SET_PDEATHSIG`; cgroups via `systemd-run --user --scope` when
+- **Start.** `bp up` starts it after the commands, only when the config has services, as the hidden
+  `bp supervise <endpoint>` of the same binary, detached from the caller: its own session (Unix); no
+  console window, its own process group and, when the caller's Job Object allows it, outside that job
+  (Windows). It inherits none of the caller's standard handles: an IDE hook waiting for the end of
+  `bp`'s output must not wait for the supervisor. Its working directory is the `bp` home, never the
+  worktree or the pod directory, which Windows could then not remove.
+- **Readiness.** The supervisor prints one line once it listens (or why it cannot) and `bp up` reads it.
+  No time limit: if the supervisor dies first, the pipe closes and `up` fails.
+- **Control.** One JSON line per request and per answer, one connection per request, versioned:
+  `start` (a service fully rendered by `bp up`, so the supervisor needs no config), `stop`, `status`,
+  `shutdown`. The protocol is internal; the public contract stays `--json` and events. Unix: a socket
+  in a directory only the user can enter (`$XDG_RUNTIME_DIR/branchpod`, else `<temp>/branchpod-<uid>`):
+  socket paths are limited to about 104 bytes, more than a data directory path leaves. Windows: a named
+  pipe created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, rejecting remote clients, with an explicit DACL for
+  the current user and SYSTEM only (the default one lets everyone open it for reading) and a spare
+  instance always open; clients connect at identification level only. Endpoints carry a random part
+  and are recorded in the ledger. The supervisor serves one request at a time and gives up on a client
+  that sends nothing for 10 s. Clients have no time limit for the answer: a supervisor that listens but
+  hangs keeps `bp down` waiting, like any other step.
+- **Ledger.** The supervisor never writes the ledger: it reports, and `bp up` / `bp down` record under
+  the pod lock, so the ledger keeps a single writer. The supervisor is a resource of its own
+  (`supervisor`: endpoint, pid + start time); each service records its pid + start time. The start
+  time is the OS's own token (Linux `/proc/<pid>/stat` field 22, macOS `proc_pidinfo`, Windows
+  `GetProcessTimes`), not wall-clock time; a pid with another start time is another process.
+- **Services** are not restarted; one that exits keeps its status until it is stopped. Their stdout and
+  stderr go to `pods/<id>/logs/<service>.log` through an inherited handle, not through the supervisor,
+  so output keeps flowing if the supervisor dies. Rotation and `bp logs` are #17. The environment is
+  passed to the supervisor but not recorded (it may hold secrets).
+- **Stop.** `bp down` asks the supervisor to stop each service, then to shut down, and waits for it to
+  exit (killing it after 10 s). A stopped service gets `SIGTERM` to its group and 10 s before `SIGKILL`.
+  When nothing listens on the supervisor's endpoint, a service's tree is stopped by its recorded leader: on Unix
+  `killpg(pid)` unless the pid now belongs to another process (a pid is not reused while a group with
+  that id exists, so a group whose leader is gone is still ours). A service that never reported its
+  pid was known only to that supervisor and is considered gone with it (it is, once the platform
+  measures below tie services to the supervisor's life).
+- Windows: Job Object with `KILL_ON_JOB_CLOSE` (#14). Until then only the service process itself is
+  terminated; its children outlive it.
+- Linux: own process group + `PR_SET_PDEATHSIG` (#15); cgroups via `systemd-run --user --scope` when
   available.
-- macOS: process group + kqueue; if the supervisor is SIGKILLed, `gc` finishes the group.
+- macOS: process group + kqueue (#16); if the supervisor is SIGKILLed, `gc` finishes the group.
+- Known limitation: while a supervisor runs, Windows keeps the `bp` executable in use, so replacing it
+  in place (an upgrade) may fail until the pods with services are down.
 
 ## Git-ignored files
 
@@ -186,8 +224,8 @@ Rules for file resources:
 
 ## `bp up`
 
-- Resources are created in a fixed order of kinds — ports, files, commands (services later) — and within a
-  kind in config order (ports by name: they never depend on each other). Templates and commands reference
+- Resources are created in a fixed order of kinds — ports, files, commands, then the supervisor and
+  services — and within a kind in config order (ports by name: they never depend on each other). Templates and commands reference
   ports; a command (a container) may mount a file provisioned for it. The price: a file cannot reference
   `{{command.<name>.stdout}}`. A single ordered list or ordering by references would lift that, at the cost
   of a format change or implicit ordering.
@@ -206,7 +244,8 @@ Rules for file resources:
   ledger is stale (a lost ledger) and is released first, so the port is bind-checked again.
 - Built-in variables: `pod.id`, `worktree`, `main` (main checkout), `branch`. When one has no value (a
   detached HEAD, a bare repository, a path that is not UTF-8), a reference to it fails and says why.
-- A config with services is refused until the supervisor exists, rather than reported as up without them.
+- `up` returns once every service is started (its process exists), not once it is ready: readiness
+  hooks are #18.
 
 ## File sync (Mutagen)
 

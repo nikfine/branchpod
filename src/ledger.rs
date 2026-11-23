@@ -24,6 +24,8 @@ pub enum Kind {
     Port,
     Command,
     Service,
+    /// The pod's supervisor process, which runs its services.
+    Supervisor,
 }
 
 impl Kind {
@@ -35,6 +37,7 @@ impl Kind {
             Kind::Port => "port",
             Kind::Command => "command",
             Kind::Service => "service",
+            Kind::Supervisor => "supervisor",
         }
     }
 }

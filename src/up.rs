@@ -1,9 +1,11 @@
 //! `bp up`: provision everything a worktree needs.
 //!
-//! Under the pod lock, resources are created in a fixed order of kinds — ports, files, commands —
-//! and within a kind in config order (ports by name: they never depend on each other). Ports come
-//! first because templates and commands reference them; files before commands because a command
-//! (a container) may mount a file provisioned for it.
+//! Under the pod lock, resources are created in a fixed order of kinds — ports, files, commands,
+//! services — and within a kind in config order (ports by name: they never depend on each other).
+//! Ports come first because templates and commands reference them; files before commands because a
+//! command (a container) may mount a file provisioned for it; services last, because they use all
+//! of it. Services run under the pod's supervisor, started (and recorded) just before the first of
+//! them.
 //!
 //! Before anything is created, the whole config is planned once with stand-in values for what only
 //! creation yields (ports, command output): a typo in the last command or a missing source fails
@@ -29,9 +31,11 @@ use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
 use crate::pod::{self, META_VERSION, PodMeta, Store};
 use crate::podlock::Holder;
 use crate::ports::{self, Registry};
+use crate::proc::ProcId;
+use crate::supervisor::{self, Launcher, Request};
 use crate::vars::Vars;
 use crate::worktree::Worktree;
-use crate::{commands, files};
+use crate::{commands, control, files, services};
 
 /// A provisioned pod.
 #[derive(Debug)]
@@ -99,14 +103,9 @@ pub fn up(
     store: &Store,
     wt: &Worktree,
     config: &Config,
+    launcher: &Launcher,
     on_wait: impl FnOnce(Option<&Holder>),
 ) -> Result<Report> {
-    if let Some(service) = config.service.first() {
-        bail!(
-            "service {:?}: services are not supported yet (the supervisor is not implemented)",
-            service.name
-        );
-    }
     let main = wt.main_checkout.as_deref();
     let needs_main = config.file.iter().any(|f| f.mode != FileMode::Ignore);
     if needs_main {
@@ -137,7 +136,7 @@ pub fn up(
     }
 
     let mut vars = builtin_vars(&id, wt);
-    check(config, wt, main, &vars)?;
+    check(config, wt, main, &vars, &store.pod_dir(&id))?;
 
     let meta = PodMeta {
         v: META_VERSION,
@@ -158,6 +157,7 @@ pub fn up(
         wt,
         main,
         config,
+        launcher,
         &mut journal,
         &mut vars,
         &mut items,
@@ -180,7 +180,13 @@ pub fn up(
 
 /// Plans every resource with stand-in values for what only creation yields: the first port of
 /// each range, a single-line placeholder for each command's output. Nothing is written.
-fn check(config: &Config, wt: &Worktree, main: Option<&Path>, vars: &Vars) -> Result<()> {
+fn check(
+    config: &Config,
+    wt: &Worktree,
+    main: Option<&Path>,
+    vars: &Vars,
+    pod_dir: &Path,
+) -> Result<()> {
     let mut probe = vars.clone();
     for (name, spec) in &config.port {
         probe.set(format!("port.{name}"), spec.range[0].to_string());
@@ -196,6 +202,9 @@ fn check(config: &Config, wt: &Worktree, main: Option<&Path>, vars: &Vars) -> Re
         commands::plan(spec, &wt.root, &probe)?;
         probe.set(commands::stdout_var(&spec.name), "placeholder");
     }
+    for spec in &config.service {
+        services::plan(spec, &wt.root, &probe, pod_dir)?;
+    }
     Ok(())
 }
 
@@ -206,6 +215,7 @@ fn provision(
     wt: &Worktree,
     main: Option<&Path>,
     config: &Config,
+    launcher: &Launcher,
     journal: &mut Journal,
     vars: &mut Vars,
     items: &mut Vec<Item>,
@@ -268,7 +278,65 @@ fn provision(
             detail: command_detail(record.stdout.as_deref().unwrap_or_default()),
         });
     }
+
+    if config.service.is_empty() {
+        return Ok(());
+    }
+    let pod_dir = store.pod_dir(id);
+    let intent = supervisor::Record {
+        endpoint: control::new_endpoint(id)?,
+        process: None,
+    };
+    // Not the worktree or the pod directory: on Windows its working directory could not be
+    // removed while it runs.
+    let cwd = std::path::absolute(store.home())?;
+    let sup = step(
+        journal,
+        Kind::Supervisor,
+        SUPERVISOR,
+        serde_json::to_value(&intent)?,
+        || {
+            let log = pod_dir.join("logs").join("supervisor.log");
+            let process = launcher.launch(&intent.endpoint, &cwd, &log)?;
+            Ok(supervisor::Record {
+                process: Some(process),
+                ..intent.clone()
+            })
+        },
+    )?;
+    items.push(Item {
+        kind: Kind::Supervisor,
+        name: SUPERVISOR.to_owned(),
+        detail: process_detail(sup.process),
+    });
+
+    for spec in &config.service {
+        let plan = services::plan(spec, &wt.root, vars, &pod_dir)?;
+        let intent = serde_json::to_value(&plan.record)?;
+        let record = step(journal, Kind::Service, &spec.name, intent, || {
+            let data = supervisor::request(&sup.endpoint, &Request::Start(plan.start.clone()))?;
+            Ok(services::Record {
+                process: Some(serde_json::from_value(data)?),
+                ..plan.record.clone()
+            })
+        })
+        .with_context(|| format!("service {:?}", spec.name))?;
+        items.push(Item {
+            kind: Kind::Service,
+            name: spec.name.clone(),
+            detail: process_detail(record.process),
+        });
+    }
     Ok(())
+}
+
+/// Ledger name of the supervisor resource.
+const SUPERVISOR: &str = "supervisor";
+
+fn process_detail(process: Option<ProcId>) -> String {
+    process
+        .map(|p| format!("pid {}", p.pid))
+        .unwrap_or_default()
 }
 
 /// Records the intent, runs `create` and records its data or its failure.
@@ -368,7 +436,7 @@ fn live(resources: Vec<ResourceState>) -> Vec<ResourceState> {
 fn listing(resources: &[ResourceState]) -> String {
     let mut out = String::new();
     for r in resources {
-        out.push_str(&format!("  {:<8} {:<24} {}\n", r.kind, r.name, r.status));
+        out.push_str(&format!("  {:<10} {:<24} {}\n", r.kind, r.name, r.status));
     }
     out
 }
@@ -443,7 +511,13 @@ mod tests {
 
     fn run(r: &Repo, config: &str) -> Result<Report> {
         let config = Config::parse(config).unwrap();
-        up(&r.store, &worktree(r), &config, |_| panic!("lock is busy"))
+        up(
+            &r.store,
+            &worktree(r),
+            &config,
+            &supervisor::tests::launcher(),
+            |_| panic!("lock is busy"),
+        )
     }
 
     /// TOML array printing its arguments joined by spaces, using what every CI runner has.
@@ -676,9 +750,10 @@ mod tests {
         fs::write(r.main.join(".env"), "A=1\n").unwrap();
         let wt = Worktree::resolve(Some(r.main.as_os_str())).unwrap();
         let config = Config::parse(&config("")).unwrap();
+        let launcher = supervisor::tests::launcher();
         let err = format!(
             "{:#}",
-            up(&r.store, &wt, &config, |_| panic!()).unwrap_err()
+            up(&r.store, &wt, &config, &launcher, |_| panic!()).unwrap_err()
         );
         assert!(err.contains("is the main checkout"), "{err}");
         assert!(r.store.list().unwrap().is_empty());
@@ -722,13 +797,107 @@ mod tests {
         }
     }
 
+    fn service_config(name: &str, run: &[String]) -> String {
+        format!(
+            "[[service]]\nname = '{name}'\nrun = {}\nenv = {{ BP_PORT = '{{{{port.web}}}}' }}\n",
+            serde_json::to_string(run).unwrap()
+        )
+    }
+
     #[test]
-    fn services_are_refused_before_anything_happens() {
+    fn services_run_under_a_supervisor_until_down() {
         let r = repo();
-        let text = "version = 1\n[[service]]\nname = 'vite'\nrun = ['npx.cmd', 'vite']\n";
-        let err = format!("{:#}", run(&r, text).unwrap_err());
-        assert!(err.contains("not supported yet"), "{err}");
-        assert!(r.store.list().unwrap().is_empty());
+        let text = format!(
+            "version = 1\n[port.web]\nrange = [41000, 41999]\n{}",
+            service_config("web", &supervisor::tests::long_running("web-up"))
+        );
+        let result = run(&r, &text);
+        let _reaper = supervisor::tests::reap_pod(&r.store, &pod::pod_id(&r.linked));
+        let report = result.unwrap();
+        let kinds: Vec<(Kind, &str)> = report
+            .items
+            .iter()
+            .map(|i| (i.kind, i.name.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (Kind::Port, "web"),
+                (Kind::Supervisor, "supervisor"),
+                (Kind::Service, "web"),
+            ]
+        );
+
+        let state = resources(&r);
+        assert!(state.iter().all(|s| s.status == Status::Live), "{state:?}");
+        let sup: supervisor::Record = serde_json::from_value(state[1].data.clone()).unwrap();
+        let web: services::Record = serde_json::from_value(state[2].data.clone()).unwrap();
+        let (sup_process, web_process) = (sup.process.unwrap(), web.process.unwrap());
+        assert!(crate::proc::is_running(sup_process));
+        assert!(crate::proc::is_running(web_process));
+        assert_eq!(web.cwd, r.linked);
+        // The environment is passed to the service but not recorded.
+        assert!(!state[2].data.to_string().contains("BP_PORT"));
+
+        let meta = r.store.find_by_worktree(&r.linked).unwrap().unwrap();
+        let log = services::log_path(&r.store.pod_dir(&meta.id), "web");
+        for _ in 0..400 {
+            if fs::read_to_string(&log).is_ok_and(|s| s.contains("web-up")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(fs::read_to_string(&log).unwrap().contains("web-up"));
+
+        let teardown = crate::down::teardown(&r.store, &meta).unwrap();
+        assert!(teardown.is_clean(), "{teardown:?}");
+        let order: Vec<&str> = teardown.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(order, ["web", "supervisor", "web"]);
+        assert!(!crate::proc::is_running(web_process));
+        assert!(!crate::proc::is_running(sup_process));
+        assert!(!r.store.pod_dir(&meta.id).exists());
+    }
+
+    #[test]
+    fn a_service_that_cannot_start_is_left_for_down() {
+        let r = repo();
+        let text = format!(
+            "version = 1\n[port.web]\nrange = [41000, 41999]\n{}",
+            service_config("broken", &["bp-no-such-program".to_owned()])
+        );
+        let result = run(&r, &text);
+        let _reaper = supervisor::tests::reap_pod(&r.store, &pod::pod_id(&r.linked));
+        let err = result.unwrap_err();
+        let failed = err.downcast_ref::<Failed>().expect("typed failure");
+        let statuses: Vec<_> = failed.recorded.iter().map(|s| (s.kind, s.status)).collect();
+        assert_eq!(
+            statuses,
+            [
+                (Kind::Port, Status::Live),
+                (Kind::Supervisor, Status::Live),
+                (Kind::Service, Status::Failed),
+            ]
+        );
+        assert!(format!("{err:#}").contains("program not found"), "{err:#}");
+
+        let meta = r.store.find_by_worktree(&r.linked).unwrap().unwrap();
+        let teardown = crate::down::teardown(&r.store, &meta).unwrap();
+        assert!(teardown.is_clean(), "{teardown:?}");
+    }
+
+    #[test]
+    fn service_mistakes_fail_before_anything_is_created() {
+        let r = repo();
+        let text = format!(
+            "version = 1\n{}",
+            service_config("web", &["x".to_owned(), "{{port.nope}}".to_owned()])
+        );
+        let err = format!("{:#}", run(&r, &text).unwrap_err());
+        assert!(
+            err.contains("port.nope") || err.contains("port.web"),
+            "{err}"
+        );
+        assert!(resources(&r).is_empty());
     }
 
     #[test]

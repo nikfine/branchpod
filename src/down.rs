@@ -14,7 +14,8 @@ use serde::de::DeserializeOwned;
 use crate::files::{self, EntryType};
 use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
 use crate::pod::{PodMeta, Store};
-use crate::{commands, ports};
+use crate::supervisor::{self, Request};
+use crate::{commands, control, ports, proc, services};
 
 /// Outcome of tearing down one resource.
 #[derive(Debug)]
@@ -52,12 +53,17 @@ impl Report {
 pub fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
     let resources = store.resources(&meta.id)?;
     let todo = order(&resources);
+    // Services are stopped through the supervisor that runs them.
+    let supervisor = resources
+        .iter()
+        .rfind(|r| r.kind == Kind::Supervisor)
+        .and_then(|r| data::<supervisor::Record>(r).ok());
     let mut steps = Vec::new();
     if !todo.is_empty() {
         let mut ledger = Ledger::open(&store.ledger_path(&meta.id))?;
         for i in todo {
             let r = &resources[i];
-            let mut error = destroy(store, meta, r, &mut ledger)
+            let mut error = destroy(store, meta, r, supervisor.as_ref(), &mut ledger)
                 .err()
                 .map(|e| format!("{e:#}"));
             let event = match &error {
@@ -91,9 +97,9 @@ pub fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
 }
 
 /// Indices of the resources to visit, in teardown order: the reverse of creation, except that
-/// services stop first (Windows keeps the files a process holds locked) and file links go before
-/// anything else is removed, so that no recursive delete can reach into the main checkout through
-/// one.
+/// services stop first (Windows keeps the files a process holds locked), followed by the
+/// supervisor that ran them, and file links go before anything else is removed, so that no
+/// recursive delete can reach into the main checkout through one.
 fn order(resources: &[ResourceState]) -> Vec<usize> {
     let mut todo: Vec<usize> = (0..resources.len())
         .rev()
@@ -106,13 +112,26 @@ fn order(resources: &[ResourceState]) -> Vec<usize> {
 fn phase(r: &ResourceState) -> u8 {
     match r.kind {
         Kind::Service => 0,
-        Kind::File if data::<files::Record>(r).is_ok_and(|f| f.entry == EntryType::Link) => 1,
-        _ => 2,
+        Kind::Supervisor => 1,
+        Kind::File if data::<files::Record>(r).is_ok_and(|f| f.entry == EntryType::Link) => 2,
+        _ => 3,
     }
 }
 
-fn destroy(store: &Store, meta: &PodMeta, r: &ResourceState, ledger: &mut Ledger) -> Result<()> {
+fn destroy(
+    store: &Store,
+    meta: &PodMeta,
+    r: &ResourceState,
+    supervisor: Option<&supervisor::Record>,
+    ledger: &mut Ledger,
+) -> Result<()> {
     match r.kind {
+        Kind::Service => {
+            let record: services::Record = data(r)?;
+            stop_service(supervisor, &r.name, &record)
+                .with_context(|| format!("service {:?}", r.name))
+        }
+        Kind::Supervisor => stop_supervisor(&data(r)?),
         Kind::File => {
             let record: files::Record = data(r)?;
             files::remove(&record, |moved| {
@@ -130,10 +149,55 @@ fn destroy(store: &Store, meta: &PodMeta, r: &ResourceState, ledger: &mut Ledger
                 .map(drop)
                 .with_context(|| format!("command {:?}", r.name))
         }
-        Kind::Service | Kind::Git => {
+        Kind::Git => {
             bail!("teardown of {} resources is not supported yet", r.kind)
         }
     }
+}
+
+/// Asks the supervisor to stop the service. When it is gone, the service's process tree is
+/// stopped by its recorded leader instead; a service never reported as started had its pid known
+/// only to that supervisor.
+fn stop_service(
+    supervisor: Option<&supervisor::Record>,
+    name: &str,
+    record: &services::Record,
+) -> Result<()> {
+    if let Some(sup) = supervisor {
+        let stop = Request::Stop {
+            name: name.to_owned(),
+        };
+        match supervisor::request(&sup.endpoint, &stop) {
+            Ok(_) => {}
+            Err(e) if supervisor::is_unreachable(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // Also after the supervisor answered: it may not know a process recorded for this pod.
+    if let Some(process) = record.process {
+        proc::stop_recorded_tree(process, supervisor::GRACE)?;
+    }
+    Ok(())
+}
+
+/// Shuts the supervisor down (it stops whatever still runs) and waits for it to exit; kills it if
+/// it does not answer or does not exit.
+fn stop_supervisor(record: &supervisor::Record) -> Result<()> {
+    let answered = match supervisor::request(&record.endpoint, &Request::Shutdown) {
+        Ok(_) => true,
+        Err(e) if supervisor::is_unreachable(&e) => false,
+        Err(e) => return Err(e),
+    };
+    if let Some(process) = record.process {
+        let exited = answered && proc::wait_gone(process, supervisor::EXIT_WAIT);
+        if !exited {
+            proc::kill(process)?;
+            if !proc::wait_gone(process, supervisor::EXIT_WAIT) {
+                bail!("supervisor (pid {}) does not exit", process.pid);
+            }
+        }
+    }
+    control::remove_stale(&record.endpoint)
 }
 
 fn data<T: DeserializeOwned>(r: &ResourceState) -> Result<T> {
@@ -155,6 +219,7 @@ fn command_cwd(store: &Store, meta: &PodMeta) -> Result<PathBuf> {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::time::Duration;
 
     use serde_json::{Value, json};
 
@@ -353,6 +418,94 @@ mod tests {
         let report = teardown(&s.store, &s.meta).unwrap();
         assert!(report.is_clean() && report.steps.is_empty());
         assert!(!s.store.pod_dir(&s.meta.id).exists());
+    }
+
+    /// Starts a supervisor running one long service; records both as `bp up` would.
+    fn supervised(
+        s: &Setup,
+    ) -> (
+        supervisor::Record,
+        services::Record,
+        supervisor::tests::Reaper,
+    ) {
+        let endpoint = control::new_endpoint(&s.meta.id).unwrap();
+        let process = supervisor::tests::launcher()
+            .launch(&endpoint, &s.tmp, &s.tmp.join("supervisor.log"))
+            .unwrap();
+        let mut reaper = supervisor::tests::Reaper(vec![process]);
+        let sup = supervisor::Record {
+            endpoint,
+            process: Some(process),
+        };
+        let start = supervisor::Start {
+            name: "web".into(),
+            run: supervisor::tests::long_running("web"),
+            cwd: s.meta.worktree.clone(),
+            env: Default::default(),
+            log: s.tmp.join("web.log"),
+        };
+        let data = supervisor::request(&sup.endpoint, &Request::Start(start.clone())).unwrap();
+        let web = services::Record {
+            run: start.run,
+            cwd: start.cwd,
+            process: Some(serde_json::from_value(data).unwrap()),
+        };
+        reaper.0.extend(web.process);
+        s.live(
+            Kind::Supervisor,
+            "supervisor",
+            serde_json::to_value(&sup).unwrap(),
+        );
+        s.live(Kind::Service, "web", serde_json::to_value(&web).unwrap());
+        (sup, web, reaper)
+    }
+
+    #[test]
+    fn services_are_stopped_through_the_supervisor() {
+        let s = setup(true);
+        let (sup, web, _reaper) = supervised(&s);
+        let report = teardown(&s.store, &s.meta).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(!proc::is_running(web.process.unwrap()));
+        assert!(!proc::is_running(sup.process.unwrap()));
+        assert!(!s.store.pod_dir(&s.meta.id).exists());
+    }
+
+    #[test]
+    fn services_are_stopped_when_the_supervisor_is_gone() {
+        let s = setup(true);
+        let (sup, web, _reaper) = supervised(&s);
+        let sup_process = sup.process.unwrap();
+        proc::kill(sup_process).unwrap();
+        assert!(proc::wait_gone(sup_process, supervisor::EXIT_WAIT));
+        let web_process = web.process.unwrap();
+        assert!(
+            proc::is_running(web_process),
+            "a service outlives a killed supervisor"
+        );
+
+        let report = teardown(&s.store, &s.meta).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(proc::wait_gone(web_process, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_supervisor_that_never_reported_is_not_waited_for() {
+        let s = setup(true);
+        // Interrupted between the intent and the supervisor's answer: nothing listens.
+        let intent = supervisor::Record {
+            endpoint: control::new_endpoint(&s.meta.id).unwrap(),
+            process: None,
+        };
+        s.record(
+            Kind::Supervisor,
+            "supervisor",
+            vec![Event::Intent {
+                data: serde_json::to_value(&intent).unwrap(),
+            }],
+        );
+        let report = teardown(&s.store, &s.meta).unwrap();
+        assert!(report.is_clean(), "{report:?}");
     }
 
     #[test]

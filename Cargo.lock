@@ -82,6 +82,7 @@ dependencies = [
  "directories",
  "dunce",
  "junction",
+ "libc",
  "reflink-copy",
  "serde",
  "serde_json",

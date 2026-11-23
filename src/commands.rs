@@ -275,7 +275,7 @@ fn run(argv: &[String], cwd: &Path) -> Result<Run> {
 /// `tools\up.cmd`) is resolved against `cwd` here: Unix would do so, Windows would resolve it
 /// against `bp`'s own working directory, and the same config must mean the same thing on every
 /// platform. A bare name (`docker`) is left to the `PATH` search.
-fn resolve_program(program: &str, cwd: &Path) -> PathBuf {
+pub(crate) fn resolve_program(program: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(program);
     let relative = path.components().all(|c| {
         matches!(
@@ -295,7 +295,7 @@ fn resolve_program(program: &str, cwd: &Path) -> PathBuf {
     resolved
 }
 
-fn spawn_error(program: &str, e: io::Error) -> anyhow::Error {
+pub(crate) fn spawn_error(program: &str, e: io::Error) -> anyhow::Error {
     if e.kind() == io::ErrorKind::NotFound {
         // Windows does not resolve `npx` to `npx.cmd` by PATHEXT when spawning without a shell.
         let hint = if cfg!(windows) && Path::new(program).extension().is_none() {
