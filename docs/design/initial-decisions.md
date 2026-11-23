@@ -114,7 +114,13 @@ Rules for file resources:
   config nor the worktree. When `destroy` does not reference its own output (a deterministic name such
   as `bp-{{pod.id}}`), it is rendered into the intent, so an interrupted creation is still undone;
   otherwise such a resource is left to `gc` by label.
-- Empty output that `destroy` references is an error: teardown must never run with an empty id.
+- Teardown must never run with an empty or garbled id. Empty output defines no variable, so any
+  reference to it is an unknown name and fails when planning. Output that a command's own `destroy`
+  references must be a single line: a warning printed next to the id would otherwise become part of it.
+  Output nothing in `destroy` depends on is kept whole.
+- A program given as a relative path with a directory part (`./scripts/up.sh`) is resolved against the
+  command's working directory on every platform; Windows would otherwise resolve it against `bp`'s own.
+  A bare name is searched on `PATH`.
 - On Windows a `.cmd` / `.bat` program is named with its extension (`npx.cmd`): spawning without a
   shell does not resolve it through `PATHEXT`.
 

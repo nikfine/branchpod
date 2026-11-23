@@ -14,7 +14,7 @@
 
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -74,24 +74,46 @@ pub struct Failed {
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} exited with {}", self.program, self.status)?;
-        let lines: Vec<&str> = self.stderr.trim_end().lines().collect();
-        if !lines.is_empty() {
-            let tail = &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..];
-            write!(f, "; stderr:")?;
-            for line in tail {
-                write!(f, "\n  {line}")?;
-            }
-        }
-        Ok(())
+        write!(
+            f,
+            "{} exited with {}{}",
+            self.program,
+            self.status,
+            stderr_tail(&self.stderr)
+        )
     }
 }
 
 impl std::error::Error for Failed {}
 
+/// `"; stderr:"` followed by the last lines of `stderr`, indented; empty if there is none.
+fn stderr_tail(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.trim_end().lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("; stderr:");
+    for line in &lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..] {
+        out.push_str("\n  ");
+        out.push_str(line);
+    }
+    out
+}
+
 /// The variable holding the captured output of command `name`.
 pub fn stdout_var(name: &str) -> String {
     format!("command.{name}.stdout")
+}
+
+/// Makes the captured output of a created command available to later resources as
+/// `{{command.<name>.stdout}}`.
+///
+/// Empty output defines no variable, so a reference to it is an unknown name and fails when
+/// planning, instead of rendering an empty argument (`docker rm ""`, `bp-`).
+pub fn export(name: &str, record: &Record, vars: &mut Vars) {
+    if let Some(stdout) = record.stdout.as_deref().filter(|s| !s.is_empty()) {
+        vars.set(stdout_var(name), stdout);
+    }
 }
 
 /// Renders a command resource. `create` runs in `cwd` (the worktree root).
@@ -135,7 +157,8 @@ fn plan_inner(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
 }
 
 /// Runs `create` and returns the final record for the ledger. A non-zero exit is an error
-/// ([`Failed`]); so is output that is not UTF-8, or empty output that `destroy` depends on.
+/// ([`Failed`]); so is output that is not UTF-8, or output that `destroy` depends on and that is
+/// empty or spans several lines (a warning printed next to the id would become part of it).
 pub fn create(plan: &Plan) -> Result<Output> {
     create_inner(plan).with_context(|| format!("command {:?}: create", plan.name))
 }
@@ -145,12 +168,24 @@ const MAY_EXIST: &str = "the resource may have been created; `bp gc` finds it by
 
 fn create_inner(plan: &Plan) -> Result<Output> {
     let run = run(&plan.record.create, &plan.cwd)?;
-    let stdout = decode_stdout(run.stdout).context(MAY_EXIST)?;
+    // stderr of a command that succeeded best explains output that cannot be used.
+    let stdout = decode_stdout(run.stdout)
+        .with_context(|| format!("{MAY_EXIST}{}", stderr_tail(&run.stderr)))?;
 
     let mut record = plan.record.clone();
     if let Some(argv) = record.destroy_unresolved.take() {
-        if stdout.is_empty() {
-            bail!("printed nothing, but `destroy` needs its output; {MAY_EXIST}");
+        let problem = if stdout.is_empty() {
+            Some("printed nothing")
+        } else if stdout.contains('\n') {
+            Some("printed several lines")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            bail!(
+                "{problem}, but `destroy` needs a single-line output; {MAY_EXIST}{}",
+                stderr_tail(&run.stderr)
+            );
         }
         let mut vars = plan.vars.clone();
         vars.set(stdout_var(&plan.name), stdout.as_str());
@@ -196,12 +231,18 @@ struct Run {
 /// Runs `argv` without a shell, stdin closed, stdout and stderr captured.
 fn run(argv: &[String], cwd: &Path) -> Result<Run> {
     let (program, args) = argv.split_first().context("empty argument array")?;
-    let output = Command::new(program)
+    if !cwd.is_dir() {
+        bail!(
+            "cannot run {program}: directory {} does not exist",
+            cwd.display()
+        );
+    }
+    let output = Command::new(resolve_program(program, cwd))
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| spawn_error(program, cwd, e))?;
+        .map_err(|e| spawn_error(program, e))?;
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
         return Err(Failed {
@@ -217,14 +258,32 @@ fn run(argv: &[String], cwd: &Path) -> Result<Run> {
     })
 }
 
-fn spawn_error(program: &str, cwd: &Path, e: io::Error) -> anyhow::Error {
-    if e.kind() == io::ErrorKind::NotFound {
-        if !cwd.is_dir() {
-            return anyhow::anyhow!(
-                "cannot run {program}: directory {} does not exist",
-                cwd.display()
-            );
+/// A program given as a relative path with a directory part (`./scripts/up.sh`,
+/// `tools\up.cmd`) is resolved against `cwd` here: Unix would do so, Windows would resolve it
+/// against `bp`'s own working directory, and the same config must mean the same thing on every
+/// platform. A bare name (`docker`) is left to the `PATH` search.
+fn resolve_program(program: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(program);
+    let relative = path.components().all(|c| {
+        matches!(
+            c,
+            Component::Normal(_) | Component::CurDir | Component::ParentDir
+        )
+    });
+    if !relative || path.components().count() < 2 {
+        return path.to_path_buf();
+    }
+    let mut resolved = cwd.to_path_buf();
+    for component in path.components() {
+        if component != Component::CurDir {
+            resolved.push(component);
         }
+    }
+    resolved
+}
+
+fn spawn_error(program: &str, e: io::Error) -> anyhow::Error {
+    if e.kind() == io::ErrorKind::NotFound {
         // Windows does not resolve `npx` to `npx.cmd` by PATHEXT when spawning without a shell.
         let hint = if cfg!(windows) && Path::new(program).extension().is_none() {
             " (a .cmd or .bat script must be named with its extension, e.g. `npx.cmd`)"
@@ -299,7 +358,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A non-ASCII path: the temp directory itself often is one on Windows.
         let out = dir.path().join("вывод ü.txt");
-        fs::write(&out, "\u{feff}  abc123\r\nsecond line \r\n\r\n").unwrap();
+        fs::write(&out, "\u{feff}  abc123 \r\n\r\n").unwrap();
 
         let destroy = strings(&[
             "docker",
@@ -314,18 +373,127 @@ mod tests {
 
         let created = create(&plan).unwrap();
         let record = created.record;
-        assert_eq!(record.stdout.as_deref(), Some("abc123\r\nsecond line"));
+        assert_eq!(record.stdout.as_deref(), Some("abc123"));
         assert_eq!(
             record.destroy.unwrap(),
-            strings(&[
-                "docker",
-                "rm",
-                "-f",
-                "abc123\r\nsecond line",
-                "feature-x-1a2b3c4d"
-            ])
+            strings(&["docker", "rm", "-f", "abc123", "feature-x-1a2b3c4d"])
         );
         assert_eq!(record.destroy_unresolved, None);
+    }
+
+    #[test]
+    fn several_lines_are_kept_unless_destroy_needs_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        fs::write(&out, "abc123\r\nWARNING: something\r\n").unwrap();
+
+        let record = create(&plan(&spec("app", cat(&out), None), dir.path(), &vars()).unwrap())
+            .unwrap()
+            .record;
+        assert_eq!(
+            record.stdout.as_deref(),
+            Some("abc123\r\nWARNING: something")
+        );
+
+        let destroy = strings(&["docker", "rm", "{{command.app.stdout}}"]);
+        let plan = plan(&spec("app", cat(&out), Some(destroy)), dir.path(), &vars()).unwrap();
+        let err = format!("{:#}", create(&plan).unwrap_err());
+        assert!(err.contains("several lines"), "{err}");
+    }
+
+    #[test]
+    fn empty_output_defines_no_variable() {
+        let mut vars = vars();
+        let empty = Record {
+            create: strings(&["x"]),
+            stdout: Some(String::new()),
+            destroy: None,
+            destroy_unresolved: None,
+        };
+        export("net", &empty, &mut vars);
+        let dir = tempfile::tempdir().unwrap();
+        let destroy = strings(&["docker", "network", "rm", "bp-{{command.net.stdout}}"]);
+        let err = plan(
+            &spec("app", strings(&["x"]), Some(destroy)),
+            dir.path(),
+            &vars,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("unknown variable"), "{err:#}");
+
+        let full = Record {
+            stdout: Some("n1".into()),
+            ..empty
+        };
+        export("net", &full, &mut vars);
+        assert_eq!(vars.get("command.net.stdout"), Some("n1"));
+    }
+
+    #[test]
+    fn relative_program_is_resolved_against_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("tools")).unwrap();
+        let program = if cfg!(windows) {
+            fs::write(
+                dir.path().join("tools").join("hi.cmd"),
+                "@echo hi-from-tool\r\n",
+            )
+            .unwrap();
+            "./tools/hi.cmd"
+        } else {
+            let script = dir.path().join("tools").join("hi.sh");
+            fs::write(&script, "#!/bin/sh\necho hi-from-tool\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            "./tools/hi.sh"
+        };
+        // The test process runs elsewhere, so this only passes if `cwd` is used.
+        assert!(!std::env::current_dir().unwrap().join("tools").exists());
+        let plan = plan(&spec("app", strings(&[program]), None), dir.path(), &vars()).unwrap();
+        let record = create(&plan).unwrap().record;
+        assert_eq!(record.stdout.as_deref(), Some("hi-from-tool"));
+        // Recorded as configured, not as resolved.
+        assert_eq!(record.create, strings(&[program]));
+    }
+
+    #[test]
+    fn program_resolution() {
+        let cwd = Path::new("base");
+        assert_eq!(resolve_program("docker", cwd), Path::new("docker"));
+        assert_eq!(
+            resolve_program("./a/b", cwd),
+            Path::new("base").join("a").join("b")
+        );
+        assert_eq!(
+            resolve_program("../x", cwd),
+            Path::new("base").join("..").join("x")
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                resolve_program(r"C:\t\x.exe", cwd),
+                Path::new(r"C:\t\x.exe")
+            );
+            assert_eq!(resolve_program(r"\t\x.exe", cwd), Path::new(r"\t\x.exe"));
+        } else {
+            assert_eq!(resolve_program("/usr/bin/x", cwd), Path::new("/usr/bin/x"));
+        }
+    }
+
+    #[test]
+    fn missing_cwd_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let record = Record {
+            create: strings(&["x"]),
+            stdout: None,
+            destroy: Some(strings(&["docker", "version"])),
+            destroy_unresolved: None,
+        };
+        let err = format!("{:#}", destroy(&record, &gone).unwrap_err());
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[test]
