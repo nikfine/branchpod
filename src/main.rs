@@ -9,6 +9,7 @@ mod files;
 mod fsutil;
 mod ledger;
 mod pod;
+mod podlock;
 mod ports;
 mod vars;
 mod worktree;

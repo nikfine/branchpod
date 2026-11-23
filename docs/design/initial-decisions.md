@@ -124,6 +124,23 @@ Rules for file resources:
 - On Windows a `.cmd` / `.bat` program is named with its extension (`npx.cmd`): spawning without a
   shell does not resolve it through `PATHEXT`.
 
+## Pod lock
+
+- One `up` / `down` at a time per pod: IDE hooks may fire both for a worktree in quick succession, and the
+  second one waits for the first.
+- The lock is an OS file lock (`flock` / `LockFileEx`), not a pid file. The OS releases it when the holder
+  exits, crashes or is killed, so a lock is never stale and nothing detects or takes one over. Child
+  processes do not inherit it.
+- Lock files live in `locks/<pod id>.lock` in the `bp` home, outside the pod directory, and are never
+  deleted: removing one while a process waits on it would let two processes hold the lock at once.
+- Waiting has no timeout: a waiter cannot tell a long `up` (first image pull) from a hung one, so any fixed
+  limit either breaks the normal case or is too long to matter. Steps bound their own run time instead, and
+  the waiter reports who holds the lock (command, pid, how long), recorded in a separate file because a
+  locked file cannot be read on Windows.
+- `gc` takes a pod's lock only if it is free and skips busy pods instead of waiting.
+- The lock is not re-entrant: taking it again in the same process is an error, not a deadlock.
+- Lock order: the pod lock before the port registry lock, never the other way round.
+
 ## File sync (Mutagen)
 
 Plain resources, no special-casing in the core beyond a readiness hook:
