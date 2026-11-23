@@ -103,6 +103,21 @@ Rules for file resources:
   rule that matches nothing is an error (drift in the source is noticed). Files that legitimately contain
   `{{ }}` (Blade, Vue) set `vars = false` and keep only `replace`; the `with` side is always substituted.
 
+## Command resources
+
+- `create` and `destroy` are argument arrays run without a shell, stdin closed, output captured. A
+  non-zero exit fails the step; its stderr is quoted (tail) in the error and kept whole for the run log.
+- stdout is decoded as UTF-8, never with the console code page; invalid UTF-8 is an error. A leading
+  byte order mark is dropped and surrounding whitespace trimmed; the result is
+  `{{command.<name>.stdout}}`.
+- The ledger stores `destroy` fully rendered, captured output included, so teardown needs neither the
+  config nor the worktree. When `destroy` does not reference its own output (a deterministic name such
+  as `bp-{{pod.id}}`), it is rendered into the intent, so an interrupted creation is still undone;
+  otherwise such a resource is left to `gc` by label.
+- Empty output that `destroy` references is an error: teardown must never run with an empty id.
+- On Windows a `.cmd` / `.bat` program is named with its extension (`npx.cmd`): spawning without a
+  shell does not resolve it through `PATHEXT`.
+
 ## File sync (Mutagen)
 
 Plain resources, no special-casing in the core beyond a readiness hook:

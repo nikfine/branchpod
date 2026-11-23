@@ -66,6 +66,23 @@ impl Vars {
     }
 }
 
+/// Whether `input` references the variable `name`. Malformed references are ignored here;
+/// rendering reports them.
+pub fn references(input: &str, name: &str) -> bool {
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return false;
+        };
+        if after[..end].trim() == name {
+            return true;
+        }
+        rest = &after[end + 2..];
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +112,18 @@ mod tests {
         let mut v = Vars::new();
         v.set("a", "{{b}}");
         assert_eq!(v.render("{{a}}").unwrap(), "{{b}}");
+    }
+
+    #[test]
+    fn finds_references() {
+        assert!(references(
+            "x {{ command.app.stdout }} y",
+            "command.app.stdout"
+        ));
+        assert!(references("{{a}}{{b}}", "b"));
+        assert!(!references("{{command.app.stdout2}}", "command.app.stdout"));
+        assert!(!references("command.app.stdout", "command.app.stdout"));
+        assert!(!references("{{command.app.stdout", "command.app.stdout"));
     }
 
     #[test]

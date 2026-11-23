@@ -3,6 +3,7 @@
 // The ledger, variables and pod store are used by `bp up` / `bp down`, which land next.
 #![allow(dead_code)]
 
+mod commands;
 mod config;
 mod files;
 mod fsutil;
