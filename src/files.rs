@@ -89,6 +89,19 @@ fn plan_inner(spec: &FileSpec, main: &Path, root: &Path, vars: &Vars) -> Result<
     }
 
     let path = join(root, &spec.name());
+    // Config validation keeps both inside; this guards against a validation gap.
+    if !source.starts_with(main) || !path.starts_with(root) || path == root {
+        bail!("path escapes the main checkout or the worktree");
+    }
+    if meta.is_dir()
+        && matches!(spec.mode, FileMode::Copy | FileMode::Reflink)
+        && root.starts_with(&source)
+    {
+        bail!(
+            "cannot copy {} into the worktree inside it",
+            source.display()
+        );
+    }
     let created_dirs = missing_parents(root, &path)?;
     match fs::symlink_metadata(&path) {
         Ok(_) => bail!(
@@ -175,49 +188,60 @@ fn create_inner(plan: &Plan, record: &mut Record) -> Result<()> {
     for dir in &record.created_dirs {
         match fs::create_dir(dir) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            // Created meanwhile by someone else: fine if it is a real directory, never a link.
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    && fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) => {}
             Err(e) => return Err(e).with_context(|| format!("cannot create {}", dir.display())),
         }
     }
     let path = &record.path;
     match &plan.action {
         Action::Copy { source, reflink } => {
-            let mut cloned = true;
+            let mut cloned = None;
             if record.entry == EntryType::Dir {
                 fs::create_dir(path)?;
                 copy_tree(source, path, *reflink, &mut cloned)?;
             } else {
-                cloned = copy_file(source, path, *reflink)?;
+                cloned = Some(copy_file(source, path, *reflink)?);
             }
-            record.cloned = reflink.then_some(cloned);
+            // `None` for a reflink of a tree without files: nothing was cloned or copied.
+            record.cloned = if *reflink { cloned } else { None };
         }
         Action::Link { target, dir } => make_link(target, path, *dir)?,
         Action::Write { bytes, source } => {
             let mut file = File::create_new(path)?;
             file.write_all(bytes)?;
-            #[cfg(unix)]
+            // Mode bits on Unix, the read-only attribute on Windows, as `copy` does.
             file.set_permissions(fs::metadata(source)?.permissions())?;
-            #[cfg(not(unix))]
-            let _ = source;
         }
     }
     Ok(())
 }
 
-/// Copies one file; returns whether it was cloned copy-on-write.
+/// Copies one file into a new `dest`; returns whether it was cloned copy-on-write.
+///
+/// `dest` is always created exclusively, so a file or link that appeared there since `plan` is
+/// never overwritten or written through (`fs::copy` would do both).
 fn copy_file(source: &Path, dest: &Path, reflink: bool) -> Result<bool> {
-    let cloned = if reflink {
-        reflink_copy::reflink_or_copy(source, dest)?.is_none()
-    } else {
-        fs::copy(source, dest)?;
-        false
-    };
-    Ok(cloned)
+    let mut from = File::open(source)?;
+    if reflink {
+        match reflink_copy::reflink_file_to_path(&from, dest) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e.into()),
+            // Not supported here (file system, platform): fall back to a plain copy.
+            Err(_) => {}
+        }
+    }
+    let mut to = File::create_new(dest)?;
+    io::copy(&mut from, &mut to)?;
+    to.set_permissions(from.metadata()?.permissions())?;
+    Ok(false)
 }
 
 /// Copies the contents of `source` into the existing, empty `dest`. Links inside the tree are
 /// recreated as links to the same target, never followed.
-fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut bool) -> Result<()> {
+fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut Option<bool>) -> Result<()> {
     let entries =
         fs::read_dir(source).with_context(|| format!("cannot read {}", source.display()))?;
     for entry in entries {
@@ -233,14 +257,19 @@ fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut bool) -> Re
         } else if file_type.is_file() {
             let this = copy_file(&from, &to, reflink)
                 .with_context(|| format!("cannot copy {}", from.display()))?;
-            *cloned &= this;
+            *cloned = Some(cloned.unwrap_or(true) && this);
         } else {
             bail!("{} is not a file, directory or link", from.display());
         }
     }
-    // Last, so that a read-only source directory does not block writing its contents.
+    // Last, so that a read-only source directory does not block writing its contents. The owner
+    // keeps write access: in a read-only directory nothing could be removed on teardown.
     #[cfg(unix)]
-    fs::set_permissions(dest, fs::metadata(source)?.permissions())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(source)?.permissions().mode() | 0o200;
+        fs::set_permissions(dest, fs::Permissions::from_mode(mode))?;
+    }
     Ok(())
 }
 
@@ -349,6 +378,11 @@ fn remove_entry(path: &Path, expected: EntryType, meta: &Metadata) -> Result<()>
         EntryType::File => file_type.is_file(),
         EntryType::Dir => file_type.is_dir(),
     };
+    // On Windows a junction starts as an empty directory; a crash before it became a junction
+    // leaves that directory behind. `remove_dir` only ever removes it while empty.
+    if expected == EntryType::Link && cfg!(windows) && file_type.is_dir() {
+        return fs::remove_dir(path).context("left in place: not a link and not empty");
+    }
     if !matches {
         bail!(
             "left in place: it is no longer the {} bp created",
@@ -879,5 +913,87 @@ mod tests {
             r.unwrap();
         }
         assert!(!t.wt.join("objs").exists() && !t.wt.join("ro.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_copies_of_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tree();
+        write(&t.main.join("modcache/pkg/a.go"), "package a");
+        for p in ["modcache/pkg", "modcache"] {
+            fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let record = up(&t, &spec("modcache", FileMode::Copy));
+        let result = remove(&record);
+        // Let the temporary directory clean up the source either way.
+        for p in ["modcache", "modcache/pkg"] {
+            fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        result.unwrap();
+        assert!(!t.wt.join("modcache").exists());
+    }
+
+    /// Something appearing at the destination between `plan` and `create` is never overwritten,
+    /// written through, or later removed as ours.
+    #[test]
+    fn create_never_overwrites_what_appeared_after_plan() {
+        let t = tree();
+        write(&t.main.join("f.txt"), "from main");
+        for mode in [FileMode::Copy, FileMode::Reflink, FileMode::Template] {
+            let plan = plan(&spec("f.txt", mode), &t.main, &t.wt, &vars())
+                .unwrap()
+                .unwrap();
+            write(&t.wt.join("f.txt"), "user data");
+            assert!(create(&plan).is_err(), "{mode:?}");
+            assert_eq!(fs::read_to_string(t.wt.join("f.txt")).unwrap(), "user data");
+            fs::remove_file(t.wt.join("f.txt")).unwrap();
+        }
+
+        // A link planted there is not written through.
+        if file_symlinks_allowed(&t) {
+            write(&t.main.join("victim.txt"), "keep me");
+            let plan = plan(&spec("f.txt", FileMode::Copy), &t.main, &t.wt, &vars())
+                .unwrap()
+                .unwrap();
+            make_link(&t.main.join("victim.txt"), &t.wt.join("f.txt"), false).unwrap();
+            assert!(create(&plan).is_err());
+            assert_eq!(
+                fs::read_to_string(t.main.join("victim.txt")).unwrap(),
+                "keep me"
+            );
+        }
+    }
+
+    #[test]
+    fn create_refuses_a_parent_replaced_by_a_link() {
+        let t = tree();
+        write(&t.main.join("x.txt"), "x");
+        fs::create_dir(t.main.join("elsewhere")).unwrap();
+        let mut s = spec("p/x.txt", FileMode::Copy);
+        s.source = Some("x.txt".into());
+        let plan = plan(&s, &t.main, &t.wt, &vars()).unwrap().unwrap();
+        dir_link(&t.main.join("elsewhere"), &t.wt.join("p"));
+        assert!(create(&plan).is_err());
+        assert!(!t.main.join("elsewhere/x.txt").exists());
+    }
+
+    #[test]
+    fn refuses_to_copy_a_directory_into_itself() {
+        let t = tree();
+        let root = t.main.join("work").join("wt");
+        fs::create_dir_all(&root).unwrap();
+        let mut s = spec("copy", FileMode::Copy);
+        s.source = Some("work".into());
+        let err = plan(&s, &t.main, &root, &vars()).unwrap_err();
+        assert!(format!("{err:#}").contains("inside it"), "{err:#}");
+    }
+
+    #[test]
+    fn reflink_of_an_empty_tree_claims_nothing() {
+        let t = tree();
+        fs::create_dir(t.main.join("empty")).unwrap();
+        let record = up(&t, &spec("empty", FileMode::Reflink));
+        assert_eq!(record.cloned, None);
     }
 }

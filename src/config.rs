@@ -188,6 +188,12 @@ impl Config {
             check_relative(&file.path).with_context(|| format!("file {:?}", file.path))?;
             if let Some(source) = &file.source {
                 check_relative(source).with_context(|| format!("file {:?}: source", file.path))?;
+                if normalize(source).is_empty() {
+                    bail!(
+                        "file {:?}: source must name something inside the main checkout",
+                        file.path
+                    );
+                }
             }
             if !file.replace.is_empty() && file.mode != FileMode::Template {
                 bail!(
@@ -223,7 +229,9 @@ impl Config {
                     file.path
                 );
             }
-            if !paths.insert(normalize(&file.path)) {
+            // Case-insensitive: on Windows and macOS `.env` and `.ENV` are the same file, and the
+            // same config must mean the same thing on every platform.
+            if !paths.insert(normalize(&file.path).to_lowercase()) {
                 bail!("file {:?} is listed twice", file.path);
             }
         }
@@ -328,6 +336,11 @@ fn check_relative(path: &str) -> Result<()> {
     if path.split(['/', '\\']).any(|segment| segment == "..") {
         bail!("path must not contain `..`");
     }
+    // A drive letter in the middle (`a/C:/b`) makes Windows discard everything before it, and
+    // `name:stream` writes an NTFS alternate data stream. `:` is not valid in Windows names.
+    if path.contains(':') {
+        bail!("path must not contain `:`");
+    }
     Ok(())
 }
 
@@ -398,9 +411,18 @@ mod tests {
             "C:\\x",
             "\\\\server\\share",
             "a\\..\\..\\x",
+            "x/C:/y",
+            "x\\C:y",
+            ".env:stream",
         ] {
             let text = format!("version = 1\n[[file]]\npath = '{path}'\nmode = 'copy'\n");
             assert!(Config::parse(&text).is_err(), "{path} should be rejected");
+            let text =
+                format!("version = 1\n[[file]]\npath = 'a'\nsource = '{path}'\nmode = 'copy'\n");
+            assert!(
+                Config::parse(&text).is_err(),
+                "source {path} should be rejected"
+            );
         }
     }
 
@@ -431,6 +453,7 @@ mod tests {
             format!("{base}mode = 'template'\nvars = false\n"),
             format!("{base}mode = 'ignore'\noptional = true\n"),
             "version = 1\n[[file]]\npath = './'\nmode = 'copy'\n".to_owned(),
+            "version = 1\n[[file]]\npath = 'all'\nsource = '.'\nmode = 'copy'\n".to_owned(),
         ] {
             assert!(Config::parse(&bad).is_err(), "{bad}");
         }
@@ -442,6 +465,8 @@ mod tests {
         assert!(Config::parse(dup).is_err());
         let dup_file = "version = 1\n[[file]]\npath = 'a/b'\nmode = 'copy'\n[[file]]\npath = './a\\\\b'\nmode = 'link'\n";
         assert!(Config::parse(dup_file).is_err());
+        let dup_case = "version = 1\n[[file]]\npath = '.env'\nmode = 'copy'\n[[file]]\npath = '.ENV'\nmode = 'copy'\n";
+        assert!(Config::parse(dup_case).is_err());
         assert!(Config::parse("version = 1\n[port.Web]\nrange = [1, 2]\n").is_err());
         assert!(Config::parse("version = 1\n[port.web]\nrange = [9, 2]\n").is_err());
         assert!(Config::parse("version = 1\n[[service]]\nname = 's'\nrun = []\n").is_err());
