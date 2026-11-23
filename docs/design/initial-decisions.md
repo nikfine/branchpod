@@ -137,6 +137,8 @@ Rules for file resources:
   limit either breaks the normal case or is too long to matter. Steps bound their own run time instead, and
   the waiter reports who holds the lock (command, pid, how long), recorded in a separate file because a
   locked file cannot be read on Windows.
+- `gc` takes a pod's lock only if it is free and skips busy pods instead of waiting.
+- The lock is not re-entrant: taking it again in the same process is an error, not a deadlock.
 - Lock order: the pod lock before the port registry lock, never the other way round.
 
 ## File sync (Mutagen)
