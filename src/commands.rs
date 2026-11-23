@@ -124,6 +124,16 @@ pub fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
     plan_inner(spec, cwd, vars).with_context(|| format!("command {:?}", spec.name))
 }
 
+/// A rendered `destroy` argument with a line break carries more than an id: most likely a
+/// warning printed next to it by an earlier command. Teardown must not run with it.
+fn render_destroy(vars: &Vars, argv: &[String]) -> Result<Vec<String>> {
+    let rendered = vars.render_all(argv).context("destroy")?;
+    if let Some(arg) = rendered.iter().find(|arg| arg.contains(['\n', '\r'])) {
+        bail!("destroy: argument {arg:?} spans several lines; teardown needs a single-line value");
+    }
+    Ok(rendered)
+}
+
 fn plan_inner(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
     let own = stdout_var(&spec.name);
     if spec.create.iter().any(|arg| vars::references(arg, &own)) {
@@ -137,10 +147,10 @@ fn plan_inner(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
             // Check every other reference now rather than after the resource exists.
             let mut probe = vars.clone();
             probe.set(own.as_str(), "x");
-            probe.render_all(argv).context("destroy")?;
+            render_destroy(&probe, argv)?;
             (None, Some(argv.clone()))
         }
-        Some(argv) => (Some(vars.render_all(argv).context("destroy")?), None),
+        Some(argv) => (Some(render_destroy(vars, argv)?), None),
     };
 
     Ok(Plan {
@@ -189,7 +199,7 @@ fn create_inner(plan: &Plan) -> Result<Output> {
         }
         let mut vars = plan.vars.clone();
         vars.set(stdout_var(&plan.name), stdout.as_str());
-        record.destroy = Some(vars.render_all(&argv).context("destroy")?);
+        record.destroy = Some(render_destroy(&vars, &argv)?);
     }
     record.stdout = Some(stdout);
     Ok(Output {
@@ -228,8 +238,11 @@ struct Run {
     stderr: String,
 }
 
-/// Runs `argv` without a shell, stdin closed, stdout and stderr captured.
+/// Runs `argv` without a shell, stdin closed, stdout and stderr captured. `cwd` must be
+/// absolute: a relative program is resolved against it, and Unix would resolve the result again
+/// after changing into `cwd`.
 fn run(argv: &[String], cwd: &Path) -> Result<Run> {
+    debug_assert!(cwd.is_absolute(), "relative cwd {}", cwd.display());
     let (program, args) = argv.split_first().context("empty argument array")?;
     if !cwd.is_dir() {
         bail!(
@@ -394,6 +407,25 @@ mod tests {
             record.stdout.as_deref(),
             Some("abc123\r\nWARNING: something")
         );
+
+        // Another command's teardown must not get it either.
+        let mut later = vars();
+        export("app", &record, &mut later);
+        let destroy = strings(&["docker", "network", "disconnect", "{{command.app.stdout}}"]);
+        let err = plan(
+            &spec("net", strings(&["x"]), Some(destroy.clone())),
+            dir.path(),
+            &later,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("several lines"), "{err:#}");
+        let own = strings(&[
+            "docker",
+            "rm",
+            "{{command.net.stdout}}",
+            "{{command.app.stdout}}",
+        ]);
+        assert!(plan(&spec("net", strings(&["x"]), Some(own)), dir.path(), &later).is_err());
 
         let destroy = strings(&["docker", "rm", "{{command.app.stdout}}"]);
         let plan = plan(&spec("app", cat(&out), Some(destroy)), dir.path(), &vars()).unwrap();

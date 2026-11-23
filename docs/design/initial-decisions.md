@@ -115,9 +115,9 @@ Rules for file resources:
   as `bp-{{pod.id}}`), it is rendered into the intent, so an interrupted creation is still undone;
   otherwise such a resource is left to `gc` by label.
 - Teardown must never run with an empty or garbled id. Empty output defines no variable, so any
-  reference to it is an unknown name and fails when planning. Output that a command's own `destroy`
-  references must be a single line: a warning printed next to the id would otherwise become part of it.
-  Output nothing in `destroy` depends on is kept whole.
+  reference to it is an unknown name and fails when planning. A rendered `destroy` argument must be a
+  single line, whichever command's output it comes from: a warning printed next to an id would otherwise
+  become part of it. Output that no `destroy` depends on is kept whole.
 - A program given as a relative path with a directory part (`./scripts/up.sh`) is resolved against the
   command's working directory on every platform; Windows would otherwise resolve it against `bp`'s own.
   A bare name is searched on `PATH`.
