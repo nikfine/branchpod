@@ -72,9 +72,37 @@ pub struct FileSpec {
     /// Source, relative to the main checkout. Defaults to `path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// A missing source is skipped instead of failing `bp up`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+    /// Template mode: substitute `{{var}}` in the source. `false` for sources that legitimately
+    /// contain `{{ }}` (Blade, Vue); only `replace` rules are applied then.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub vars: bool,
     /// Literal find/replace rules, applied after `{{var}}` substitution. Template mode only.
+    /// A rule that matches nothing is an error, so drift in the source file is noticed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replace: Vec<Replace>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
+}
+
+impl FileSpec {
+    /// Source path relative to the main checkout.
+    pub fn source(&self) -> &str {
+        self.source.as_deref().unwrap_or(&self.path)
+    }
+
+    /// Identity of the resource in the ledger: the normalized destination path.
+    pub fn name(&self) -> String {
+        normalize(&self.path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +188,12 @@ impl Config {
             check_relative(&file.path).with_context(|| format!("file {:?}", file.path))?;
             if let Some(source) = &file.source {
                 check_relative(source).with_context(|| format!("file {:?}: source", file.path))?;
+                if normalize(source).is_empty() {
+                    bail!(
+                        "file {:?}: source must name something inside the main checkout",
+                        file.path
+                    );
+                }
             }
             if !file.replace.is_empty() && file.mode != FileMode::Template {
                 bail!(
@@ -170,7 +204,34 @@ impl Config {
             if file.replace.iter().any(|r| r.find.is_empty()) {
                 bail!("file {:?}: `replace.find` must not be empty", file.path);
             }
-            if !paths.insert(normalize(&file.path)) {
+            if !file.vars && file.mode != FileMode::Template {
+                bail!(
+                    "file {:?}: `vars` is only allowed with mode = \"template\"",
+                    file.path
+                );
+            }
+            if !file.vars && file.replace.is_empty() {
+                bail!(
+                    "file {:?}: a template with `vars = false` and no `replace` rules is a \
+                     plain copy; use mode = \"copy\"",
+                    file.path
+                );
+            }
+            if file.mode == FileMode::Ignore && (file.optional || file.source.is_some()) {
+                bail!(
+                    "file {:?}: `optional` and `source` have no effect with mode = \"ignore\"",
+                    file.path
+                );
+            }
+            if normalize(&file.path).is_empty() {
+                bail!(
+                    "file {:?}: path must name something inside the worktree",
+                    file.path
+                );
+            }
+            // Case-insensitive: on Windows and macOS `.env` and `.ENV` are the same file, and the
+            // same config must mean the same thing on every platform.
+            if !paths.insert(normalize(&file.path).to_lowercase()) {
                 bail!("file {:?} is listed twice", file.path);
             }
         }
@@ -275,6 +336,11 @@ fn check_relative(path: &str) -> Result<()> {
     if path.split(['/', '\\']).any(|segment| segment == "..") {
         bail!("path must not contain `..`");
     }
+    // A drive letter in the middle (`a/C:/b`) makes Windows discard everything before it, and
+    // `name:stream` writes an NTFS alternate data stream. `:` is not valid in Windows names.
+    if path.contains(':') {
+        bail!("path must not contain `:`");
+    }
     Ok(())
 }
 
@@ -345,9 +411,18 @@ mod tests {
             "C:\\x",
             "\\\\server\\share",
             "a\\..\\..\\x",
+            "x/C:/y",
+            "x\\C:y",
+            ".env:stream",
         ] {
             let text = format!("version = 1\n[[file]]\npath = '{path}'\nmode = 'copy'\n");
             assert!(Config::parse(&text).is_err(), "{path} should be rejected");
+            let text =
+                format!("version = 1\n[[file]]\npath = 'a'\nsource = '{path}'\nmode = 'copy'\n");
+            assert!(
+                Config::parse(&text).is_err(),
+                "source {path} should be rejected"
+            );
         }
     }
 
@@ -358,11 +433,40 @@ mod tests {
     }
 
     #[test]
+    fn template_options() {
+        let base = "version = 1\n[[file]]\npath = 'a.blade.php'\n";
+        let ok = format!(
+            "{base}mode = 'template'\nvars = false\nreplace = [{{ find = 'x', with = 'y' }}]\noptional = true\n"
+        );
+        let config = Config::parse(&ok).unwrap();
+        assert!(!config.file[0].vars);
+        assert!(config.file[0].optional);
+        // Defaults are left out when printed back.
+        let printed = toml::to_string(&Config::parse(EXAMPLE).unwrap()).unwrap();
+        assert!(
+            !printed.contains("vars") && !printed.contains("optional"),
+            "{printed}"
+        );
+
+        for bad in [
+            format!("{base}mode = 'copy'\nvars = false\n"),
+            format!("{base}mode = 'template'\nvars = false\n"),
+            format!("{base}mode = 'ignore'\noptional = true\n"),
+            "version = 1\n[[file]]\npath = './'\nmode = 'copy'\n".to_owned(),
+            "version = 1\n[[file]]\npath = 'all'\nsource = '.'\nmode = 'copy'\n".to_owned(),
+        ] {
+            assert!(Config::parse(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn rejects_duplicates_and_bad_names() {
         let dup = "version = 1\n[[service]]\nname = 'a'\nrun = ['x']\n[[service]]\nname = 'a'\nrun = ['y']\n";
         assert!(Config::parse(dup).is_err());
         let dup_file = "version = 1\n[[file]]\npath = 'a/b'\nmode = 'copy'\n[[file]]\npath = './a\\\\b'\nmode = 'link'\n";
         assert!(Config::parse(dup_file).is_err());
+        let dup_case = "version = 1\n[[file]]\npath = '.env'\nmode = 'copy'\n[[file]]\npath = '.ENV'\nmode = 'copy'\n";
+        assert!(Config::parse(dup_case).is_err());
         assert!(Config::parse("version = 1\n[port.Web]\nrange = [1, 2]\n").is_err());
         assert!(Config::parse("version = 1\n[port.web]\nrange = [9, 2]\n").is_err());
         assert!(Config::parse("version = 1\n[[service]]\nname = 's'\nrun = []\n").is_err());

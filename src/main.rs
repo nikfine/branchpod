@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod files;
 mod fsutil;
 mod ledger;
 mod pod;
