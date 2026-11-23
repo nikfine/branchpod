@@ -69,6 +69,38 @@ Rules:
 - **Labels everywhere** (`bp.pod=<id>`) on containers, volumes, networks, sync sessions — `gc` finds
   leftovers without the ledger.
 
+## Teardown (`bp down`)
+
+- Driven by the ledger alone: the pod is found by its recorded worktree path, commands are undone in the
+  worktree root while it exists and in the pod's state directory otherwise.
+- Every resource that is not destroyed is visited, pending and failed ones included. Each outcome is
+  recorded (`destroyed`, or `failed` with the error and the data kept for the next attempt); a failure
+  never stops the other steps.
+- Order: the reverse of creation, except that services stop first and file links are removed before
+  anything else.
+- Exit code: `0` nothing is left, `3` resources are left behind (run it again once the cause is fixed),
+  `1` teardown could not run (the ledger cannot be read). `2` stays with usage errors.
+- Once nothing is left, the pod's state directory is removed too (ledger first, `pod.json` last, so an
+  interruption leaves a pod with nothing to tear down); its lock file is kept.
+
+### Files that are in use
+
+On Windows a directory cannot be removed while a process has a file open inside it or its working
+directory there; teardown must never stop halfway through such a directory.
+
+- A copied directory is first renamed to a trash name next to it (`<name>.bp-trash-<unique>`, same
+  volume). On Windows the rename fails while anything inside is in use — an open file, even one opened
+  with `FILE_SHARE_DELETE`, or a process's working directory — and then nothing has been touched. Once
+  renamed, the ledger records the trash path (`moved`) before it is deleted, so an interrupted delete is
+  finished by the next run; if that record cannot be written, the directory is moved back. Single files
+  and links are removed in one operation.
+- Removal and the rename retry with backoff on the transient sharing errors (a scanner or indexer holds a
+  file for a moment).
+- A lock that persists is reported with the processes holding it when the OS can tell: on Windows the
+  Restart Manager (`RmGetList`) over the files of the path. It does not report a process whose only tie
+  is its working directory (checked by hand); the report then still says that the path is in use. On
+  Unix open files do not block removal and nothing is reported.
+
 ## Process supervision
 
 One supervisor process per worktree, no global daemon; control over a local socket / named pipe.

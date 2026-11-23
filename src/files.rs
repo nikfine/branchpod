@@ -5,9 +5,10 @@
 //! exists, the destination is free, a template renders) and yields a [`Record`]; [`create`] then
 //! makes it. The record alone is enough to undo a creation, even an interrupted one.
 //!
-//! Teardown ([`remove`], [`remove_all`]) deletes exactly what a record describes, and only while
-//! it still is what was created: a link is removed as a link and never followed, a path that has
-//! changed type is left in place and reported, and nothing is reached through a link.
+//! Teardown ([`remove`]) deletes exactly what a record describes, and only while it still is what
+//! was created: a link is removed as a link and never followed, a path that has changed type is
+//! left in place and reported, and nothing is reached through a link. `bp down` removes every
+//! link before any directory, so no recursive delete can reach into the main checkout through one.
 
 use std::fs::{self, File, Metadata};
 use std::io::{self, Write};
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{FileMode, FileSpec};
 use crate::vars::Vars;
+use crate::{fsutil, inuse};
 
 /// What a file resource is on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,11 +336,20 @@ fn symlink_error(e: io::Error) -> anyhow::Error {
 
 /// Removes what `record` describes, then the directories created for it while they are empty.
 /// Already gone is fine; a path that is no longer what was created is left in place.
-pub fn remove(record: &Record) -> Result<()> {
-    remove_inner(record).with_context(|| format!("cannot remove {}", record.path.display()))
+///
+/// A directory is removed all or nothing: it is first renamed to a trash name next to it. On
+/// Windows the rename fails while anything inside is in use (an open file, a process's working
+/// directory), and then nothing has been touched. `on_moved` receives the record of the trash
+/// location before it is deleted and must make it durable (the ledger), so that an interrupted
+/// delete is finished from there; if it fails, the directory is moved back. Single files and
+/// links are removed in one operation. Transient locks are retried; a lasting one is reported
+/// with the processes holding the path, when the OS can tell.
+pub fn remove(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
+    remove_inner(record, on_moved)
+        .with_context(|| format!("cannot remove {}", record.path.display()))
 }
 
-fn remove_inner(record: &Record) -> Result<()> {
+fn remove_inner(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
     let path = &record.path;
     let inside = |p: &Path| p.starts_with(&record.root) && p != record.root;
     if !inside(path) || !record.created_dirs.iter().all(|d| inside(d)) {
@@ -347,7 +358,7 @@ fn remove_inner(record: &Record) -> Result<()> {
 
     if parents_are_real_dirs(&record.root, path)? {
         match fs::symlink_metadata(path) {
-            Ok(meta) => remove_entry(path, record.entry, &meta)?,
+            Ok(meta) => remove_entry(record, &meta, on_moved)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -359,18 +370,26 @@ fn remove_inner(record: &Record) -> Result<()> {
             // Gone, or replaced by something we did not create.
             _ => continue,
         }
-        match fs::remove_dir(dir) {
+        match fsutil::retry(|| fs::remove_dir(dir)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             // Holds something we did not create, and so do its parents.
             Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => break,
-            Err(e) => return Err(e).with_context(|| format!("cannot remove {}", dir.display())),
+            Err(e) => {
+                return Err(in_use(dir, e))
+                    .with_context(|| format!("cannot remove {}", dir.display()));
+            }
         }
     }
     Ok(())
 }
 
-fn remove_entry(path: &Path, expected: EntryType, meta: &Metadata) -> Result<()> {
+fn remove_entry(
+    record: &Record,
+    meta: &Metadata,
+    on_moved: impl FnOnce(&Record) -> Result<()>,
+) -> Result<()> {
+    let (path, expected) = (&record.path, record.entry);
     let file_type = meta.file_type();
     // `is_dir` and `is_file` are false for links, junctions included.
     let matches = match expected {
@@ -381,7 +400,8 @@ fn remove_entry(path: &Path, expected: EntryType, meta: &Metadata) -> Result<()>
     // On Windows a junction starts as an empty directory; a crash before it became a junction
     // leaves that directory behind. `remove_dir` only ever removes it while empty.
     if expected == EntryType::Link && cfg!(windows) && file_type.is_dir() {
-        return fs::remove_dir(path).context("left in place: not a link and not empty");
+        return fsutil::retry(|| fs::remove_dir(path))
+            .context("left in place: not a link and not empty");
     }
     if !matches {
         bail!(
@@ -394,12 +414,82 @@ fn remove_entry(path: &Path, expected: EntryType, meta: &Metadata) -> Result<()>
         );
     }
     match expected {
-        EntryType::Link => remove_link(path, meta)?,
-        EntryType::File => fs::remove_file(path)?,
-        // Does not follow links inside the tree: they are removed as links.
-        EntryType::Dir => fs::remove_dir_all(path)?,
+        EntryType::Link => fsutil::retry(|| remove_link(path, meta)).map_err(|e| in_use(path, e)),
+        EntryType::File => fsutil::retry(|| fs::remove_file(path)).map_err(|e| in_use(path, e)),
+        EntryType::Dir => remove_tree(record, on_moved),
     }
-    Ok(())
+}
+
+/// Infix of trash names: `<name>.bp-trash-<unique>` next to the directory being removed.
+const TRASH: &str = ".bp-trash-";
+
+/// Moves a copied directory out of the way, then deletes it (see [`remove`]).
+fn remove_tree(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
+    let path = &record.path;
+    // Already trash: an earlier delete was interrupted after the move was recorded.
+    let trash = if is_trash(path) {
+        path.clone()
+    } else {
+        let trash = trash_path(path);
+        fsutil::retry(|| fs::rename(path, &trash)).map_err(|e| in_use(path, e))?;
+        let moved = Record {
+            path: trash.clone(),
+            ..record.clone()
+        };
+        if let Err(e) = on_moved(&moved) {
+            // Unrecorded, the trash would be invisible to teardown: put the directory back.
+            return Err(match fs::rename(&trash, path) {
+                Ok(()) => e,
+                Err(back) => e.context(format!(
+                    "{} was moved to {} and cannot be moved back: {back}",
+                    path.display(),
+                    trash.display()
+                )),
+            });
+        }
+        trash
+    };
+    // Does not follow links inside the tree: they are removed as links.
+    fsutil::retry(|| fs::remove_dir_all(&trash))
+        .map_err(|e| in_use(&trash, e))
+        .with_context(|| format!("moved to {}, but", trash.display()))
+}
+
+fn is_trash(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().contains(TRASH))
+}
+
+/// A unique sibling of `path` (same directory, so the same volume: the rename never copies).
+fn trash_path(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!("{TRASH}{}-{nanos:x}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// The error for a path that could not be removed. A lock that outlasted the retries is
+/// reported with the processes holding it, when the OS can tell.
+fn in_use(path: &Path, e: io::Error) -> anyhow::Error {
+    if !fsutil::is_transient(&e) {
+        return e.into();
+    }
+    let holders = inuse::holders(path);
+    if holders.is_empty() {
+        anyhow::anyhow!(
+            "in use by another process, or access is denied ({e}); \
+             close what holds it and run `bp down` again"
+        )
+    } else {
+        let names: Vec<String> = holders.iter().map(ToString::to_string).collect();
+        anyhow::anyhow!(
+            "in use by {}; close it and run `bp down` again",
+            names.join(", ")
+        )
+    }
 }
 
 #[cfg(unix)]
@@ -417,31 +507,6 @@ fn remove_link(path: &Path, meta: &Metadata) -> io::Result<()> {
     } else {
         fs::remove_file(path)
     }
-}
-
-/// Removes several resources: every link first, then the rest, each group in reverse order of
-/// creation. Removing links first means no recursive delete can ever reach into the main
-/// checkout through one. Results are returned in the order of `records`; one failure does not
-/// stop the others.
-pub fn remove_all(records: &[Record]) -> Vec<Result<()>> {
-    let mut results: Vec<Option<Result<()>>> = records.iter().map(|_| None).collect();
-    let links = records
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, r)| r.entry == EntryType::Link);
-    let others = records
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, r)| r.entry != EntryType::Link);
-    for (i, record) in links.chain(others) {
-        results[i] = Some(remove(record));
-    }
-    results
-        .into_iter()
-        .map(|r| r.expect("every record visited"))
-        .collect()
 }
 
 /// `base` joined with a `/`- or `\`-separated relative path, using native separators.
@@ -563,6 +628,18 @@ mod tests {
         create(&plan).unwrap()
     }
 
+    /// Removes without a ledger: the trash location is not recorded anywhere.
+    fn rm(record: &Record) -> Result<()> {
+        remove(record, |_| Ok(()))
+    }
+
+    /// Removes links first, then the rest, each in reverse order, as `bp down` does.
+    fn rm_all(records: &[Record]) -> Vec<Result<()>> {
+        let links = records.iter().rev().filter(|r| r.entry == EntryType::Link);
+        let others = records.iter().rev().filter(|r| r.entry != EntryType::Link);
+        links.chain(others).map(rm).collect()
+    }
+
     /// Makes a directory link the way `bp` does on this platform (no privileges needed).
     fn dir_link(target: &Path, link: &Path) {
         make_link(target, link, true).unwrap();
@@ -586,10 +663,10 @@ mod tests {
         assert_eq!(record.entry, EntryType::File);
         assert_eq!(record.cloned, None);
 
-        remove(&record).unwrap();
+        rm(&record).unwrap();
         assert!(!t.wt.join(".env").exists());
         // Idempotent.
-        remove(&record).unwrap();
+        rm(&record).unwrap();
         // The main checkout is untouched.
         assert!(t.main.join(".env").exists());
     }
@@ -614,7 +691,7 @@ mod tests {
 
         // Whatever the app wrote into the copied directory goes with it.
         write(&t.wt.join("deep/er/local/cache.bin"), "x");
-        remove(&record).unwrap();
+        rm(&record).unwrap();
         assert!(!t.wt.join("deep").exists());
         assert!(t.wt.exists());
     }
@@ -625,7 +702,7 @@ mod tests {
         write(&t.main.join("a/b.txt"), "b");
         let record = up(&t, &spec("a/b.txt", FileMode::Copy));
         write(&t.wt.join("a/mine.txt"), "user data");
-        remove(&record).unwrap();
+        rm(&record).unwrap();
         assert!(!t.wt.join("a/b.txt").exists());
         assert!(t.wt.join("a/mine.txt").exists());
     }
@@ -640,7 +717,7 @@ mod tests {
         assert_eq!(fs::read_to_string(t.wt.join("big.bin")).unwrap(), "data");
         assert_eq!(fs::read_to_string(t.wt.join("dir/x.bin")).unwrap(), "x");
         assert!(file.cloned.is_some() && dir.cloned.is_some());
-        for r in remove_all(&[file, dir]) {
+        for r in rm_all(&[file, dir]) {
             r.unwrap();
         }
         assert!(!t.wt.join("big.bin").exists() && !t.wt.join("dir").exists());
@@ -681,7 +758,7 @@ mod tests {
         let err = plan(&s, &t.main, &t.wt, &vars()).unwrap_err();
         assert!(format!("{err:#}").contains("is a link"), "{err:#}");
         assert!(!t.main.join("node_modules/x").exists());
-        remove(&link).unwrap();
+        rm(&link).unwrap();
     }
 
     #[test]
@@ -691,7 +768,7 @@ mod tests {
         let record = up(&t, &spec("f", FileMode::Copy));
         fs::remove_file(t.wt.join("f")).unwrap();
         write(&t.wt.join("f/user.txt"), "user data");
-        let err = remove(&record).unwrap_err();
+        let err = rm(&record).unwrap_err();
         assert!(format!("{err:#}").contains("left in place"), "{err:#}");
         assert!(t.wt.join("f/user.txt").exists());
     }
@@ -708,7 +785,7 @@ mod tests {
         write(&t.wt.join("node_modules/new.js"), "new");
         assert!(t.main.join("node_modules/new.js").exists());
 
-        remove(&record).unwrap();
+        rm(&record).unwrap();
         assert!(fs::symlink_metadata(t.wt.join("node_modules")).is_err());
         assert!(t.main.join("node_modules/pkg/index.js").exists());
         assert!(t.main.join("node_modules/new.js").exists());
@@ -724,7 +801,7 @@ mod tests {
         write(&t.main.join("s3.php"), "<?php");
         let record = up(&t, &spec("s3.php", FileMode::Link));
         assert_eq!(fs::read_to_string(t.wt.join("s3.php")).unwrap(), "<?php");
-        remove(&record).unwrap();
+        rm(&record).unwrap();
         assert!(fs::symlink_metadata(t.wt.join("s3.php")).is_err());
         assert!(t.main.join("s3.php").exists());
     }
@@ -747,7 +824,7 @@ mod tests {
         assert!(copied_link.file_type().is_symlink(), "copied as a link");
         assert!(t.wt.join("app/vendor/sentinel.txt").exists());
 
-        for r in remove_all(&[app.clone(), vendor]) {
+        for r in rm_all(&[app.clone(), vendor]) {
             r.unwrap();
         }
         assert!(!t.wt.join("app").exists());
@@ -759,7 +836,7 @@ mod tests {
         // Even without the links-first pass, the recursive delete removes links as links.
         let app = up(&t, &spec("app", FileMode::Copy));
         dir_link(&t.main.join("shared"), &t.wt.join("app/vendor"));
-        remove(&app).unwrap();
+        rm(&app).unwrap();
         assert!(!t.wt.join("app").exists());
         assert!(t.main.join("shared/sentinel.txt").exists());
         assert!(t.main.join("app/lib").exists());
@@ -775,7 +852,7 @@ mod tests {
         fs::remove_dir_all(t.wt.join("x")).unwrap();
         dir_link(&t.main.join("other"), &t.wt.join("x"));
 
-        let err = remove(&record).unwrap_err();
+        let err = rm(&record).unwrap_err();
         assert!(format!("{err:#}").contains("left in place"), "{err:#}");
         assert!(t.main.join("other/y/z.txt").exists());
     }
@@ -789,11 +866,94 @@ mod tests {
         let plan = plan(&s, &t.main, &t.wt, &vars()).unwrap().unwrap();
         // Crash halfway: parents and part of the tree exist, `create` never returned.
         write(&t.wt.join("p/d/a.txt"), "half");
-        remove(&plan.record).unwrap();
+        rm(&plan.record).unwrap();
         assert!(!t.wt.join("p").exists());
 
         // Crash before anything was made.
-        remove(&plan.record).unwrap();
+        rm(&plan.record).unwrap();
+    }
+
+    #[test]
+    fn a_directory_is_moved_to_trash_and_the_move_recorded_first() {
+        let t = tree();
+        write(&t.main.join("vendor/pkg/a.txt"), "a");
+        let record = up(&t, &spec("vendor", FileMode::Copy));
+        let mut recorded = None;
+        remove(&record, |moved| {
+            // The original path is already free; the trash is still there when it is recorded.
+            assert!(!record.path.exists());
+            assert!(moved.path.join("pkg/a.txt").exists());
+            assert_eq!(moved.path.parent(), record.path.parent());
+            recorded = Some(moved.clone());
+            Ok(())
+        })
+        .unwrap();
+        let moved = recorded.expect("move reported");
+        assert!(!moved.path.exists());
+        assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 0);
+
+        // An interrupted delete is finished from the recorded trash, without another move.
+        fs::create_dir_all(moved.path.join("left")).unwrap();
+        remove(&moved, |_| panic!("already trash")).unwrap();
+        assert!(!moved.path.exists());
+    }
+
+    #[test]
+    fn a_failed_record_of_the_move_puts_the_directory_back() {
+        let t = tree();
+        write(&t.main.join("vendor/a.txt"), "a");
+        let record = up(&t, &spec("vendor", FileMode::Copy));
+        let err = remove(&record, |_| bail!("disk full")).unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "{err:#}");
+        assert!(t.wt.join("vendor/a.txt").exists());
+        assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 1);
+    }
+
+    /// On Windows a directory with an open file inside cannot be renamed, even when the file was
+    /// opened with `FILE_SHARE_DELETE` (as std opens files): nothing is deleted, and the report
+    /// names the holder.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_in_use_is_left_whole_and_its_holder_named() {
+        let t = tree();
+        write(&t.main.join("vendor/a.txt"), "a");
+        write(&t.main.join("vendor/sub/b.txt"), "b");
+        let record = up(&t, &spec("vendor", FileMode::Copy));
+        let open = File::open(t.wt.join("vendor/sub/b.txt")).unwrap();
+
+        let err = remove(&record, |_| panic!("must not move")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("in use by"), "{message}");
+        assert!(
+            message.contains(&format!("pid {}", std::process::id())),
+            "{message}"
+        );
+        assert!(t.wt.join("vendor/a.txt").exists());
+        assert!(t.wt.join("vendor/sub/b.txt").exists());
+
+        drop(open);
+        rm(&record).unwrap();
+        assert!(!t.wt.join("vendor").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_in_use_names_its_holder() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let record = up(&t, &spec(".env", FileMode::Copy));
+        // No FILE_SHARE_DELETE: the way many editors and tools open files.
+        let open = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(t.wt.join(".env"))
+            .unwrap();
+        let err = rm(&record).unwrap_err();
+        assert!(format!("{err:#}").contains("in use by"), "{err:#}");
+        drop(open);
+        rm(&record).unwrap();
+        assert!(!t.wt.join(".env").exists());
     }
 
     #[test]
@@ -806,7 +966,7 @@ mod tests {
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["type"], "file");
         assert_eq!(serde_json::from_value::<Record>(value).unwrap(), record);
-        remove(&record).unwrap();
+        rm(&record).unwrap();
     }
 
     fn template(path: &str) -> FileSpec {
@@ -830,7 +990,7 @@ mod tests {
             fs::read_to_string(t.wt.join(".env")).unwrap(),
             "\u{feff}URL=http://localhost:8003\r\nPROXY=localhost:8003\r\n"
         );
-        remove(&record).unwrap();
+        rm(&record).unwrap();
     }
 
     #[test]
@@ -909,7 +1069,7 @@ mod tests {
         }
         let dir = up(&t, &spec("objs", FileMode::Copy));
         let file = up(&t, &spec("ro.txt", FileMode::Copy));
-        for r in remove_all(&[dir, file]) {
+        for r in rm_all(&[dir, file]) {
             r.unwrap();
         }
         assert!(!t.wt.join("objs").exists() && !t.wt.join("ro.txt").exists());
@@ -925,7 +1085,7 @@ mod tests {
             fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o555)).unwrap();
         }
         let record = up(&t, &spec("modcache", FileMode::Copy));
-        let result = remove(&record);
+        let result = rm(&record);
         // Let the temporary directory clean up the source either way.
         for p in ["modcache", "modcache/pkg"] {
             fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o755)).unwrap();

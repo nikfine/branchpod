@@ -145,6 +145,27 @@ impl Store {
     pub fn resources(&self, id: &str) -> Result<Vec<ledger::ResourceState>> {
         Ok(ledger::state(&ledger::read(&self.ledger_path(id))?))
     }
+
+    /// Removes the state of pod `id` once nothing recorded in it is left. The ledger goes first,
+    /// `pod.json` last: interrupted in between, the pod is still listed with nothing to tear down,
+    /// and the next `bp down` finishes the removal. The lock file is kept (see `podlock`).
+    pub fn remove_pod(&self, id: &str) -> Result<()> {
+        let dir = self.pod_dir(id);
+        for path in [self.ledger_path(id), dir.join("pod.json")] {
+            match crate::fsutil::retry(|| fs::remove_file(&path)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot remove {}", path.display()));
+                }
+            }
+        }
+        match crate::fsutil::retry(|| fs::remove_dir_all(&dir)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("cannot remove {}", dir.display())),
+        }
+    }
 }
 
 #[cfg(test)]
