@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 pub struct Worktree {
     /// Top-level directory of the worktree.
     pub root: PathBuf,
-    /// Top-level directory of the main checkout; `None` for a bare repository.
+    /// Top-level directory of the main checkout; `None` when the common git dir is not a `.git`
+    /// directory inside one (a bare repository, a submodule, `--separate-git-dir`).
     pub main_checkout: Option<PathBuf>,
 }
 

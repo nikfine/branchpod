@@ -168,26 +168,22 @@ impl Config {
         let local_path = main_checkout.map(|main| main.join(LOCAL_FILE));
         let project = read_table(&project_path)?;
         let local = match &local_path {
-            Some(path) => read_table(path)?,
+            Some(path) => read_table(path)?.map(|table| (path, table)),
             None => None,
         };
 
-        let (value, source) = match (project, local, &local_path) {
-            (Some(mut value), local, local_path) => {
-                let source = match (local, local_path) {
-                    (Some(local), Some(local_path)) => {
-                        merge(&mut value, local);
-                        format!(
-                            "{} with {} layered on top",
-                            project_path.display(),
-                            local_path.display()
-                        )
-                    }
-                    _ => project_path.display().to_string(),
-                };
+        let (value, source) = match (project, local) {
+            (Some(mut value), Some((local_path, local))) => {
+                merge(&mut value, local);
+                let source = format!(
+                    "{} with {} layered on top",
+                    project_path.display(),
+                    local_path.display()
+                );
                 (value, source)
             }
-            (None, Some(local), Some(local_path)) => {
+            (Some(value), None) => (value, project_path.display().to_string()),
+            (None, Some((local_path, local))) => {
                 // Without this check the error would be serde's bare "missing field `version`".
                 if !local.contains_key("version") {
                     bail!(
@@ -199,22 +195,24 @@ impl Config {
                 }
                 (local, local_path.display().to_string())
             }
-            (None, _, Some(local_path)) => bail!(
-                "no configuration: neither {} nor {} exists",
-                project_path.display(),
-                local_path.display()
-            ),
-            (None, _, None) => bail!(
-                "no {PROJECT_FILE} in {} (the repository is bare, so there is no main checkout \
-                 to read {LOCAL_FILE} from)",
-                worktree.display()
-            ),
+            (None, None) => match &local_path {
+                Some(local_path) => bail!(
+                    "no configuration: neither {} nor {} exists",
+                    project_path.display(),
+                    local_path.display()
+                ),
+                None => bail!(
+                    "no {PROJECT_FILE} in {} (there is no main checkout to read {LOCAL_FILE} \
+                     from: a bare repository or a separate git dir)",
+                    worktree.display()
+                ),
+            },
         };
 
-        let config: Config = value
-            .try_into()
-            .with_context(|| format!("invalid configuration in {source}"))?;
-        config.validate()?;
+        // The config may come from another directory than the worktree, so every error names it.
+        let invalid = || format!("invalid configuration in {source}");
+        let config: Config = value.try_into().with_context(invalid)?;
+        config.validate().with_context(invalid)?;
         Ok(config)
     }
 
@@ -562,7 +560,10 @@ mod tests {
     fn missing_project_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let err = format!("{:#}", Config::load(dir.path(), None).unwrap_err());
-        assert!(err.contains(PROJECT_FILE) && err.contains("bare"), "{err}");
+        assert!(
+            err.contains(PROJECT_FILE) && err.contains("no main checkout"),
+            "{err}"
+        );
     }
 
     /// A worktree and a main checkout side by side, with non-ASCII names.
@@ -633,5 +634,20 @@ mod tests {
         fs::write(worktree.join(PROJECT_FILE), "version = 1\n").unwrap();
         let err = format!("{:#}", Config::load(&worktree, Some(&main)).unwrap_err());
         assert!(err.contains("layered on top"), "{err}");
+
+        // Validation errors too, not only parse errors.
+        fs::remove_file(worktree.join(PROJECT_FILE)).unwrap();
+        let local = main.join(LOCAL_FILE).display().to_string();
+        for (text, problem) in [
+            ("version = 2\n", "unsupported config version 2"),
+            (
+                "version = 1\n[port.web]\nrange = [9, 3]\n",
+                "port.web: range",
+            ),
+        ] {
+            fs::write(main.join(LOCAL_FILE), text).unwrap();
+            let err = format!("{:#}", Config::load(&worktree, Some(&main)).unwrap_err());
+            assert!(err.contains(&local) && err.contains(problem), "{err}");
+        }
     }
 }

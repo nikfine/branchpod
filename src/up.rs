@@ -111,9 +111,9 @@ pub fn up(
     let needs_main = config.file.iter().any(|f| f.mode != FileMode::Ignore);
     if needs_main {
         match main {
-            None => bail!(
-                "file resources are copied from the main checkout, but the repository is bare"
-            ),
+            None => {
+                bail!("file resources are copied from the main checkout, but {NO_MAIN_CHECKOUT}")
+            }
             Some(main) if pod::same_path(main, &wt.root) => bail!(
                 "{} is the main checkout: file resources are carried over from it into linked \
                  worktrees, so there is nothing to carry over here; run `bp up` in a linked worktree",
@@ -302,8 +302,13 @@ fn step<T: Serialize>(
     }
 }
 
-/// `pod.id`, `worktree`, `main` and `branch`. A name that has no value here (a detached HEAD, a
-/// bare repository, a path that is not UTF-8) is declared unavailable with the reason, so that a
+/// Why `main` has no value. Submodules and `--separate-git-dir` have a main checkout too, but it
+/// cannot be told from the common git dir yet.
+const NO_MAIN_CHECKOUT: &str =
+    "there is no main checkout (a bare repository, or a separate git dir such as a submodule's)";
+
+/// `pod.id`, `worktree`, `main` and `branch`. A name that has no value here (a detached HEAD, no
+/// main checkout, a path that is not UTF-8) is declared unavailable with the reason, so that a
 /// reference to it fails with an explanation instead of rendering something wrong.
 fn builtin_vars(id: &str, wt: &Worktree) -> Vars {
     let mut vars = Vars::new();
@@ -311,7 +316,7 @@ fn builtin_vars(id: &str, wt: &Worktree) -> Vars {
     path_var(&mut vars, "worktree", &wt.root);
     match &wt.main_checkout {
         Some(main) => path_var(&mut vars, "main", main),
-        None => vars.set_unavailable("main", "the repository is bare"),
+        None => vars.set_unavailable("main", NO_MAIN_CHECKOUT),
     }
     // A config that does not use `branch` must not fail because it cannot be determined.
     match wt.branch() {
