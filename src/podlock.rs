@@ -15,8 +15,8 @@
 //! file, and both would hold "the" lock at once.
 //!
 //! Waiting has no timeout: a waiting process cannot tell a long `up` (first image pull, dependency
-//! install) from a hung one. Steps bound their own run time instead; the waiter reports who holds the
-//! lock so that a hung holder can be found and stopped.
+//! install) from a hung one. Steps have no time limit for the same reason; the waiter reports who
+//! holds the lock so that a hung holder can be found and stopped by the user.
 //!
 //! The lock is not re-entrant: OS file locks conflict between two handles of the same process too,
 //! so taking a lock this process already holds would wait forever. It is an error instead.
