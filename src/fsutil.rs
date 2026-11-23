@@ -1,4 +1,4 @@
-//! Small file-system helpers shared by the state files.
+//! Small file-system helpers shared by the state files and teardown.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -21,19 +21,7 @@ pub fn write_atomic(dst: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     drop(file);
 
-    let mut delay = Duration::from_millis(10);
-    let mut attempts = 0;
-    loop {
-        match fs::rename(tmp, dst) {
-            Err(e) if is_transient(&e) && attempts < 8 => {
-                attempts += 1;
-                std::thread::sleep(delay);
-                delay *= 2;
-            }
-            Err(e) => return Err(e),
-            Ok(()) => break,
-        }
-    }
+    retry(|| fs::rename(tmp, dst))?;
 
     #[cfg(unix)]
     if let Some(dir) = dst.parent() {
@@ -42,8 +30,29 @@ pub fn write_atomic(dst: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Runs `op`, retrying with backoff (about 2.5 s in all) while it fails with an error that
+/// [`is_transient`] attributes to another process briefly holding a file open.
+pub fn retry<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut delay = Duration::from_millis(10);
+    let mut attempts = 0;
+    loop {
+        match op() {
+            Err(e) if is_transient(&e) && attempts < 8 => {
+                attempts += 1;
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether `e` is what Windows reports while another process holds the file open (or, for a
+/// directory, a file inside it or its working directory there). A scanner or indexer does so
+/// for a moment; an editor or a dev server until it is closed. Never true on Unix, where open
+/// files do not block renaming or removal.
 #[cfg(windows)]
-fn is_transient(e: &io::Error) -> bool {
+pub fn is_transient(e: &io::Error) -> bool {
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_SHARING_VIOLATION: i32 = 32;
     const ERROR_LOCK_VIOLATION: i32 = 33;
@@ -54,7 +63,7 @@ fn is_transient(e: &io::Error) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_transient(_: &io::Error) -> bool {
+pub fn is_transient(_: &io::Error) -> bool {
     false
 }
 

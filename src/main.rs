@@ -1,12 +1,14 @@
 //! branchpod (`bp`): a resource runtime for git worktrees.
 
-// The ledger, variables and pod store are used by `bp up` / `bp down`, which land next.
+// Variables and resource creation are used by `bp up`, which lands next.
 #![allow(dead_code)]
 
 mod commands;
 mod config;
+mod down;
 mod files;
 mod fsutil;
+mod inuse;
 mod ledger;
 mod pod;
 mod podlock;
@@ -14,7 +16,8 @@ mod ports;
 mod vars;
 mod worktree;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -23,6 +26,10 @@ use serde_json::json;
 
 /// Version of the `--json` output. Part of the public API: bump on breaking changes.
 const JSON_SCHEMA: u32 = 1;
+
+/// Exit code of `bp down` when resources are left behind. 1 means teardown could not run at all;
+/// 2 is taken by usage errors.
+const EXIT_LEFTOVERS: u8 = 3;
 
 #[derive(Parser)]
 #[command(name = "bp", version, about = "A resource runtime for git worktrees")]
@@ -48,11 +55,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Tear down everything recorded for a worktree's pod, in reverse order.
+    ///
+    /// Works when the worktree is already gone. Exits with 0 when nothing is left, 3 when some
+    /// resources are left behind (run it again once their cause is fixed), 1 when teardown could
+    /// not run.
+    Down {
+        /// Worktree path; defaults to the current directory.
+        path: Option<OsString>,
+    },
 }
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("bp: {e:#}");
             ExitCode::FAILURE
@@ -60,7 +76,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Cmd::Config { path, json } => {
             let wt = worktree::Worktree::resolve(path.as_deref())?;
@@ -78,19 +94,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Status { path, json } => {
             let store = pod::Store::open()?;
-            // Prefer a recorded pod: the worktree may already be gone.
-            let target = match &path {
-                Some(p) => std::path::absolute(p)?,
-                None => std::env::current_dir()?,
-            };
-            worktree::reject_placeholder(target.as_os_str())?;
-            let meta = match store.find_by_worktree(&target)? {
-                Some(meta) => Some(meta),
-                None => {
-                    let wt = worktree::Worktree::resolve(Some(target.as_os_str()))?;
-                    store.find_by_worktree(&wt.root)?
-                }
-            };
+            let (target, meta) = find_pod(&store, path.as_deref())?;
             let resources = match &meta {
                 Some(m) => store.resources(&m.id)?,
                 None => Vec::new(),
@@ -104,19 +108,90 @@ fn run(cli: Cli) -> Result<()> {
                     Some(m) => {
                         println!("pod {} ({})", m.id, m.worktree.display());
                         for r in &resources {
-                            let status = serde_json::to_value(r.status)?;
-                            let kind = serde_json::to_value(r.kind)?;
-                            println!(
-                                "  {:<8} {:<24} {}",
-                                kind.as_str().unwrap_or_default(),
-                                r.name,
-                                status.as_str().unwrap_or_default()
-                            );
+                            println!("  {:<8} {:<24} {}", r.kind, r.name, r.status);
                         }
                     }
                 }
             }
         }
+        Cmd::Down { path } => return down(path.as_deref()),
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn down(path: Option<&OsStr>) -> Result<ExitCode> {
+    let store = pod::Store::open()?;
+    let (target, meta) = find_pod(&store, path)?;
+    let Some(meta) = meta else {
+        println!("no pod for {}", target.display());
+        return Ok(ExitCode::SUCCESS);
+    };
+    let _lock = store.lock_pod(&meta.id, "down", |holder| match holder {
+        Some(h) => eprintln!("bp: pod {} is busy: waiting for {h}", meta.id),
+        None => eprintln!("bp: pod {} is busy: waiting", meta.id),
+    })?;
+    // Whoever held the lock may have torn the pod down already.
+    let Some(meta) = store.find_by_worktree(&meta.worktree)? else {
+        println!("no pod for {}", target.display());
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    println!("pod {} ({})", meta.id, meta.worktree.display());
+    let report = down::teardown(&store, &meta)?;
+    for s in &report.steps {
+        let outcome = if s.error.is_none() {
+            "destroyed"
+        } else {
+            "left"
+        };
+        println!("  {:<9} {:<8} {}", outcome, s.kind, s.name);
+    }
+    for s in report.leftovers() {
+        eprintln!(
+            "bp: {} {}: {}",
+            s.kind,
+            s.name,
+            s.error.as_deref().unwrap_or_default()
+        );
+    }
+    if let Some(e) = &report.state_error {
+        eprintln!("bp: {e}");
+    }
+    if report.is_clean() {
+        println!("clean");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        let left = report.leftovers().count();
+        if left > 0 {
+            eprintln!("bp: {left} resource(s) left behind; fix the cause and run `bp down` again");
+        }
+        Ok(ExitCode::from(EXIT_LEFTOVERS))
+    }
+}
+
+/// Finds the pod of `path` (default: the current directory). A recorded pod is preferred, so a
+/// worktree that is already gone is still found, however the caller spells its path (recorded
+/// paths are canonical); a path that does not exist has no other pod.
+fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option<pod::PodMeta>)> {
+    let target = match path {
+        Some(p) => {
+            worktree::reject_placeholder(p)?;
+            std::path::absolute(p)?
+        }
+        None => std::env::current_dir()?,
+    };
+    // Recorded paths are canonical; try the spelling as given too, in case one is not.
+    if let Some(meta) = store.find_by_worktree(&target)? {
+        return Ok((target, Some(meta)));
+    }
+    let target = worktree::normalize(&target)?;
+    if let Some(meta) = store.find_by_worktree(&target)? {
+        return Ok((target, Some(meta)));
+    }
+    if !target.exists() {
+        return Ok((target, None));
+    }
+    let wt = worktree::Worktree::resolve(Some(target.as_os_str()))?;
+    let meta = store.find_by_worktree(&wt.root)?;
+    Ok((target, meta))
 }

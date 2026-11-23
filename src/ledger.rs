@@ -4,6 +4,7 @@
 //! disk) before the resource is created, its identifying data after. A crash between the two
 //! leaves a `pending` resource that teardown still visits, so partial creation is never invisible.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,25 @@ pub enum Kind {
     Service,
 }
 
+impl Kind {
+    /// The name used in the ledger and in output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Git => "git",
+            Kind::File => "file",
+            Kind::Port => "port",
+            Kind::Command => "command",
+            Kind::Service => "service",
+        }
+    }
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Event {
@@ -39,6 +59,10 @@ pub enum Event {
         #[serde(default)]
         data: Value,
     },
+    /// Teardown is about to move the resource before deleting it (a directory renamed to a trash
+    /// name): `data` replaces the recorded data and names the new location, so an interruption at
+    /// any point is finished from the ledger. Status and order are unchanged.
+    Moved { data: Value },
     /// Released by teardown or gc.
     Destroyed,
     /// Creation or teardown failed; the resource may exist partially.
@@ -64,6 +88,24 @@ pub enum Status {
     /// A step failed; may exist partially.
     Failed,
     Destroyed,
+}
+
+impl Status {
+    /// The name used in output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Pending => "pending",
+            Status::Live => "live",
+            Status::Failed => "failed",
+            Status::Destroyed => "destroyed",
+        }
+    }
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -194,6 +236,7 @@ pub fn state(entries: &[Entry]) -> Vec<ResourceState> {
                 r.data = data.clone();
                 r.error = None;
             }
+            (Event::Moved { data }, Some(pos)) => resources[pos].data = data.clone(),
             (Event::Destroyed, Some(pos)) => {
                 resources[pos].status = Status::Destroyed;
                 resources[pos].error = None;
@@ -213,7 +256,7 @@ pub fn state(entries: &[Entry]) -> Vec<ResourceState> {
                     _ => Status::Failed,
                 },
                 data: match event {
-                    Event::Created { data } => data.clone(),
+                    Event::Created { data } | Event::Moved { data } => data.clone(),
                     _ => Value::Null,
                 },
                 error: match event {
@@ -332,6 +375,34 @@ mod tests {
             ["vite", "web"]
         );
         assert_eq!(s[1].status, Status::Pending);
+    }
+
+    #[test]
+    fn moved_replaces_data_and_keeps_status_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap();
+        for name in ["vendor", "web"] {
+            ledger.record(Kind::File, name, Event::intent()).unwrap();
+            ledger
+                .record(Kind::File, name, Event::Created { data: json!({}) })
+                .unwrap();
+        }
+        let trash = json!({"path": "/wt/vendor.bp-trash-1"});
+        ledger
+            .record(
+                Kind::File,
+                "vendor",
+                Event::Moved {
+                    data: trash.clone(),
+                },
+            )
+            .unwrap();
+        drop(ledger);
+
+        let s = state(&read(&path).unwrap());
+        assert_eq!((s[0].name.as_str(), s[0].status), ("vendor", Status::Live));
+        assert_eq!(s[0].data, trash);
     }
 
     #[test]

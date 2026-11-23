@@ -145,6 +145,43 @@ impl Store {
     pub fn resources(&self, id: &str) -> Result<Vec<ledger::ResourceState>> {
         Ok(ledger::state(&ledger::read(&self.ledger_path(id))?))
     }
+
+    /// Removes the state of pod `id` once nothing recorded in it is left. Everything else goes
+    /// before `pod.json`: interrupted or failing before that, the pod is still listed with nothing
+    /// to tear down, and the next `bp down` finishes the removal. The lock file is kept (see
+    /// `podlock`).
+    pub fn remove_pod(&self, id: &str) -> Result<()> {
+        use crate::fsutil::retry;
+
+        let checked = |path: &Path, result: std::io::Result<()>| match result {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("cannot remove {}", path.display()))
+            }
+            _ => Ok(()),
+        };
+        let dir = self.pod_dir(id);
+        let meta = dir.join("pod.json");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path == meta {
+                continue;
+            }
+            let result = if entry.file_type()?.is_dir() {
+                retry(|| fs::remove_dir_all(&path))
+            } else {
+                retry(|| fs::remove_file(&path))
+            };
+            checked(&path, result)?;
+        }
+        checked(&meta, retry(|| fs::remove_file(&meta)))?;
+        checked(&dir, retry(|| fs::remove_dir(&dir)))
+    }
 }
 
 #[cfg(test)]
