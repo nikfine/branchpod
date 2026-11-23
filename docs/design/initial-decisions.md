@@ -84,6 +84,25 @@ Explicit rules `copy | reflink | link | template | ignore` plus `bp doctor`, whi
 covered by any rule. Copying everything by default is rejected (vendor dirs, caches, large build output).
 Templates substitute per-worktree values (ports, URLs) into copied files.
 
+Rules for file resources:
+
+- A missing source is an error; `optional = true` skips the rule instead.
+- An existing destination is an error: `bp` never overwrites (and so would later delete) a file it did not
+  create, such as a committed `.env`. Nothing is created through a link either.
+- Creation is planned before the ledger intent is written: source, destination and template rendering are
+  checked without touching the disk, and the intent carries the planned path, so an interrupted creation is
+  undone from the ledger alone.
+- Teardown removes a path only while it is still what was created (file, directory, link) and is reached
+  without passing through a link; otherwise it is left in place and reported. A copied directory is removed
+  with whatever was written into it; parent directories created for it are removed while empty.
+- `link`: symlink on Unix; on Windows a junction for directories (no privileges needed) and a symlink for
+  files. Without the right to create a file symlink (Developer Mode or admin) it is an error with a hint,
+  not a silent copy: a copy would quietly stop propagating edits. Hard links are rejected (editors that
+  save by rename break them).
+- `template`: UTF-8 text, a single file. `{{var}}` substitution is strict; `replace` rules run after it and a
+  rule that matches nothing is an error (drift in the source is noticed). Files that legitimately contain
+  `{{ }}` (Blade, Vue) set `vars = false` and keep only `replace`; the `with` side is always substituted.
+
 ## File sync (Mutagen)
 
 Plain resources, no special-casing in the core beyond a readiness hook:

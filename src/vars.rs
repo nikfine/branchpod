@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, Default)]
 pub struct Vars(BTreeMap<String, String>);
@@ -23,21 +23,37 @@ impl Vars {
         self.0.get(name).map(String::as_str)
     }
 
-    /// Replaces every `{{ name }}` (surrounding spaces allowed) with its value.
+    /// Replaces every `{{ name }}` (surrounding spaces allowed) with its value. Errors quote the
+    /// input, so this is meant for short strings such as arguments.
     pub fn render(&self, input: &str) -> Result<String> {
+        self.render_inner(input)
+            .map_err(|(_, problem)| anyhow!("{problem} in {input:?}"))
+    }
+
+    /// Like [`Vars::render`] for the contents of a file: errors name the line, not the text.
+    pub fn render_text(&self, input: &str) -> Result<String> {
+        self.render_inner(input).map_err(|(offset, problem)| {
+            let line = input[..offset].matches('\n').count() + 1;
+            anyhow!("line {line}: {problem}")
+        })
+    }
+
+    /// On error returns the byte offset of the offending `{{` and what is wrong with it.
+    fn render_inner(&self, input: &str) -> Result<String, (usize, String)> {
         let mut out = String::with_capacity(input.len());
         let mut rest = input;
         while let Some(start) = rest.find("{{") {
+            let offset = input.len() - rest.len() + start;
             out.push_str(&rest[..start]);
             let after = &rest[start + 2..];
             let Some(end) = after.find("}}") else {
-                bail!("unterminated `{{{{` in {input:?}");
+                return Err((offset, "unterminated `{{`".to_owned()));
             };
             let name = after[..end].trim();
             match self.get(name) {
                 Some(value) => out.push_str(value),
-                None if name.is_empty() => bail!("empty `{{{{}}}}` in {input:?}"),
-                None => bail!("unknown variable `{name}` in {input:?}"),
+                None if name.is_empty() => return Err((offset, "empty `{{}}`".to_owned())),
+                None => return Err((offset, format!("unknown variable `{name}`"))),
             }
             rest = &after[end + 2..];
         }
@@ -86,5 +102,23 @@ mod tests {
         assert!(vars().render("{{port.vite}}").is_err());
         assert!(vars().render("{{port.web").is_err());
         assert!(vars().render("{{}}").is_err());
+    }
+
+    #[test]
+    fn text_errors_name_the_line_not_the_content() {
+        let text = "secret=1\nurl=http://localhost:{{port.web}}\nb={{port.vite}}\n";
+        let err = vars().render_text(text).unwrap_err().to_string();
+        assert_eq!(err, "line 3: unknown variable `port.vite`");
+        assert!(
+            vars()
+                .render_text("a\r\n{{x")
+                .unwrap_err()
+                .to_string()
+                .starts_with("line 2")
+        );
+        assert_eq!(
+            vars().render_text("\u{feff}a\r\n{{port.web}}\r\n").unwrap(),
+            "\u{feff}a\r\n8003\r\n"
+        );
     }
 }

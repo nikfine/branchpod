@@ -72,9 +72,37 @@ pub struct FileSpec {
     /// Source, relative to the main checkout. Defaults to `path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// A missing source is skipped instead of failing `bp up`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+    /// Template mode: substitute `{{var}}` in the source. `false` for sources that legitimately
+    /// contain `{{ }}` (Blade, Vue); only `replace` rules are applied then.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub vars: bool,
     /// Literal find/replace rules, applied after `{{var}}` substitution. Template mode only.
+    /// A rule that matches nothing is an error, so drift in the source file is noticed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replace: Vec<Replace>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(value: &bool) -> bool {
+    *value
+}
+
+impl FileSpec {
+    /// Source path relative to the main checkout.
+    pub fn source(&self) -> &str {
+        self.source.as_deref().unwrap_or(&self.path)
+    }
+
+    /// Identity of the resource in the ledger: the normalized destination path.
+    pub fn name(&self) -> String {
+        normalize(&self.path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +197,31 @@ impl Config {
             }
             if file.replace.iter().any(|r| r.find.is_empty()) {
                 bail!("file {:?}: `replace.find` must not be empty", file.path);
+            }
+            if !file.vars && file.mode != FileMode::Template {
+                bail!(
+                    "file {:?}: `vars` is only allowed with mode = \"template\"",
+                    file.path
+                );
+            }
+            if !file.vars && file.replace.is_empty() {
+                bail!(
+                    "file {:?}: a template with `vars = false` and no `replace` rules is a \
+                     plain copy; use mode = \"copy\"",
+                    file.path
+                );
+            }
+            if file.mode == FileMode::Ignore && (file.optional || file.source.is_some()) {
+                bail!(
+                    "file {:?}: `optional` and `source` have no effect with mode = \"ignore\"",
+                    file.path
+                );
+            }
+            if normalize(&file.path).is_empty() {
+                bail!(
+                    "file {:?}: path must name something inside the worktree",
+                    file.path
+                );
             }
             if !paths.insert(normalize(&file.path)) {
                 bail!("file {:?} is listed twice", file.path);
@@ -355,6 +408,32 @@ mod tests {
     fn rejects_replace_outside_template_mode() {
         let text = "version = 1\n[[file]]\npath = 'a'\nmode = 'copy'\nreplace = [{ find = 'x', with = 'y' }]\n";
         assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn template_options() {
+        let base = "version = 1\n[[file]]\npath = 'a.blade.php'\n";
+        let ok = format!(
+            "{base}mode = 'template'\nvars = false\nreplace = [{{ find = 'x', with = 'y' }}]\noptional = true\n"
+        );
+        let config = Config::parse(&ok).unwrap();
+        assert!(!config.file[0].vars);
+        assert!(config.file[0].optional);
+        // Defaults are left out when printed back.
+        let printed = toml::to_string(&Config::parse(EXAMPLE).unwrap()).unwrap();
+        assert!(
+            !printed.contains("vars") && !printed.contains("optional"),
+            "{printed}"
+        );
+
+        for bad in [
+            format!("{base}mode = 'copy'\nvars = false\n"),
+            format!("{base}mode = 'template'\nvars = false\n"),
+            format!("{base}mode = 'ignore'\noptional = true\n"),
+            "version = 1\n[[file]]\npath = './'\nmode = 'copy'\n".to_owned(),
+        ] {
+            assert!(Config::parse(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

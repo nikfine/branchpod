@@ -28,8 +28,12 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Event {
-    /// About to create the resource.
-    Intent,
+    /// About to create the resource. `data` holds what teardown needs to undo a creation that
+    /// was interrupted (the planned path, for example).
+    Intent {
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        data: Value,
+    },
     /// Created; `data` holds whatever teardown needs (path, port, captured id, pid).
     Created {
         #[serde(default)]
@@ -76,6 +80,13 @@ pub struct ResourceState {
 pub struct Ledger {
     path: PathBuf,
     file: File,
+}
+
+impl Event {
+    /// An intent without data.
+    pub fn intent() -> Event {
+        Event::Intent { data: Value::Null }
+    }
 }
 
 impl Ledger {
@@ -165,7 +176,7 @@ pub fn state(entries: &[Entry]) -> Vec<ResourceState> {
             .iter()
             .position(|r| r.kind == entry.kind && r.name == entry.name);
         match (&entry.event, pos) {
-            (Event::Intent, pos) => {
+            (Event::Intent { data }, pos) => {
                 if let Some(pos) = pos {
                     resources.remove(pos);
                 }
@@ -173,7 +184,7 @@ pub fn state(entries: &[Entry]) -> Vec<ResourceState> {
                     kind: entry.kind,
                     name: entry.name.clone(),
                     status: Status::Pending,
-                    data: Value::Null,
+                    data: data.clone(),
                     error: None,
                 });
             }
@@ -232,7 +243,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pod").join("ledger.jsonl");
         let mut ledger = Ledger::open(&path).unwrap();
-        ledger.record(Kind::Port, "web", Event::Intent).unwrap();
+        ledger.record(Kind::Port, "web", Event::intent()).unwrap();
         ledger
             .record(
                 Kind::Port,
@@ -242,8 +253,10 @@ mod tests {
                 },
             )
             .unwrap();
-        ledger.record(Kind::Command, "app", Event::Intent).unwrap();
-        ledger.record(Kind::File, ".env", Event::Intent).unwrap();
+        ledger
+            .record(Kind::Command, "app", Event::intent())
+            .unwrap();
+        ledger.record(Kind::File, ".env", Event::intent()).unwrap();
         ledger
             .record(
                 Kind::File,
@@ -265,18 +278,52 @@ mod tests {
     }
 
     #[test]
+    fn intent_data_survives_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap();
+        let planned = json!({"path": "/wt/.env"});
+        ledger
+            .record(
+                Kind::File,
+                ".env",
+                Event::Intent {
+                    data: planned.clone(),
+                },
+            )
+            .unwrap();
+        ledger
+            .record(
+                Kind::File,
+                ".env",
+                Event::Failed {
+                    error: "disk full".into(),
+                },
+            )
+            .unwrap();
+        drop(ledger);
+
+        let s = state(&read(&path).unwrap());
+        assert_eq!(s[0].status, Status::Failed);
+        assert_eq!(s[0].data, planned);
+        // An intent without data is written exactly as before.
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"data\":null"), "{text}");
+    }
+
+    #[test]
     fn recreation_moves_resource_to_the_end() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.jsonl");
         let mut ledger = Ledger::open(&path).unwrap();
         for (kind, name) in [(Kind::Port, "web"), (Kind::Service, "vite")] {
-            ledger.record(kind, name, Event::Intent).unwrap();
+            ledger.record(kind, name, Event::intent()).unwrap();
             ledger
                 .record(kind, name, Event::Created { data: Value::Null })
                 .unwrap();
         }
         ledger.record(Kind::Port, "web", Event::Destroyed).unwrap();
-        ledger.record(Kind::Port, "web", Event::Intent).unwrap();
+        ledger.record(Kind::Port, "web", Event::intent()).unwrap();
         drop(ledger);
 
         let s = state(&read(&path).unwrap());
@@ -292,7 +339,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.jsonl");
         let mut ledger = Ledger::open(&path).unwrap();
-        ledger.record(Kind::Port, "web", Event::Intent).unwrap();
+        ledger.record(Kind::Port, "web", Event::intent()).unwrap();
         drop(ledger);
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(br#"{"v":1,"ts_ms":1,"kind":"po"#).unwrap();
@@ -301,7 +348,9 @@ mod tests {
         assert_eq!(read(&path).unwrap().len(), 1);
 
         let mut ledger = Ledger::open(&path).unwrap();
-        ledger.record(Kind::Service, "vite", Event::Intent).unwrap();
+        ledger
+            .record(Kind::Service, "vite", Event::intent())
+            .unwrap();
         drop(ledger);
         let s = state(&read(&path).unwrap());
         assert_eq!(s.len(), 2);
