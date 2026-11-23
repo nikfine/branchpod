@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+    # The defaults plus `ready_for_review`, which starts the full matrix for a draft marked ready.
+    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
 
 # A newer push to the same pull request cancels the run still in progress.
@@ -21,7 +23,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # A draft pull request (under review) runs Linux only; the full matrix runs once it is
+        # marked ready for review, and on a manual run. A draft cannot be merged, so the required
+        # macOS and Windows checks are only needed by then.
+        os: >-
+          ${{ fromJSON(github.event.pull_request.draft
+          && '["ubuntu-latest"]'
+          || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
