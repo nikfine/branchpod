@@ -8,6 +8,16 @@ Guidance for AI coding agents (and humans) working on branchpod.
   Do not reopen a recorded decision silently — propose a change to that file instead.
 - Work tracking lives in GitHub issues and milestones, not in files in the repository.
 
+## Branches and pull requests
+
+- One branch per issue, named `<issue number>-<short-slug>` (e.g. `7-bp-down`), created from an
+  up-to-date `main`. Small maintenance without an issue: `chore-<slug>`.
+- Changes reach `main` through pull requests; the PR body links the issue (`Closes #7`). CI runs on
+  pull requests.
+- MSRV: raise `rust-version` freely when a newer language or library feature is needed, in the same PR
+  as the toolchain of the `msrv` CI job. Older Rust versions are not supported; the field and the job
+  only guarantee that the declared version is true.
+
 ## Principles
 
 - **Clean only what we created.** Every resource `bp` creates is recorded in the ledger and labelled;
