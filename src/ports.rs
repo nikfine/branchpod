@@ -26,6 +26,13 @@ use crate::fsutil;
 pub const REGISTRY_VERSION: u32 = 1;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ledger data of a port resource. Teardown releases by `(pod, name)` and does not need it; it
+/// is recorded for `bp status` and for rendering `{{port.<name>}}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    pub port: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Owner {
     pub pod: String,

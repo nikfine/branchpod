@@ -56,6 +56,30 @@ impl Worktree {
             main_checkout,
         })
     }
+
+    /// The checked-out branch, short form (`feature/x`); `None` on a detached HEAD. A branch
+    /// without commits yet counts as checked out.
+    pub fn branch(&self) -> Result<Option<String>> {
+        // `symbolic-ref -q` exits with 1 and prints nothing when HEAD is not a branch.
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["symbolic-ref", "-q", "--short", "HEAD"])
+            .output()
+            .context("cannot run git (is it installed and on PATH?)")?;
+        match output.status.code() {
+            Some(0) => {
+                let name =
+                    String::from_utf8(output.stdout).context("git printed non-UTF-8 output")?;
+                Ok(Some(name.trim().to_owned()))
+            }
+            Some(1) if output.stdout.is_empty() => Ok(None),
+            _ => bail!(
+                "git symbolic-ref HEAD failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }
+    }
 }
 
 /// Hook runners sometimes pass `%VAR%` or `$VAR` through unexpanded. Such a string is almost
@@ -274,5 +298,9 @@ mod tests {
         let from_linked = Worktree::resolve(Some(linked.as_os_str())).unwrap();
         assert_eq!(from_linked.root, canonical(&linked).unwrap());
         assert_eq!(from_linked.main_checkout, Some(canonical(&main).unwrap()));
+
+        assert_eq!(from_linked.branch().unwrap().as_deref(), Some("feature"));
+        git_ok(&linked, &["checkout", "-q", "--detach"]);
+        assert_eq!(from_linked.branch().unwrap(), None);
     }
 }
