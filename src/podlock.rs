@@ -7,7 +7,8 @@
 //! the `bp` home. The OS releases it whenever the holder exits, crashes or is killed, so a lock is
 //! never stale and nothing has to detect or take one over. The handle is not inherited by child
 //! processes (std opens files close-on-exec / non-inheritable), so a command or service started
-//! while the lock is held does not keep it after `bp` exits.
+//! while the lock is held does not keep it after `bp` exits. (On Unix a child forked by another thread
+//! keeps the lock between `fork` and `exec`, so a released lock may stay busy for that moment.)
 //!
 //! Lock files live outside `pods/<id>/` and are never deleted: removing a lock file while another
 //! process waits on it would let that process lock the unlinked file while a third one creates a new
@@ -235,6 +236,9 @@ mod tests {
     }
 
     /// Polls until the lock is free, so that a regression fails the test instead of hanging it.
+    ///
+    /// Also needed after dropping a lock in this process: other tests spawn processes concurrently,
+    /// and on Unix a child forked while the lock was held keeps it until its `exec`.
     fn wait_free(store: &Store, id: &str) -> PodLock {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -264,7 +268,7 @@ mod tests {
         // The failed attempts did not disturb the lock or its record.
         assert_eq!(store.holder(POD).unwrap().command, "up");
         drop(lock);
-        assert!(store.try_lock_pod(POD, "down").unwrap().is_some());
+        let _lock = wait_free(&store, POD);
     }
 
     #[test]
@@ -276,7 +280,8 @@ mod tests {
         assert_eq!(store.holder(POD), None);
         drop(lock);
         assert_eq!(store.holder(POD), None);
-        let _lock = store.lock_pod(POD, "down", |_| panic!()).unwrap();
+        // May wait for a moment: see `wait_free`.
+        let _lock = store.lock_pod(POD, "down", |_| {}).unwrap();
         assert_eq!(store.holder(POD).unwrap().command, "down");
     }
 
