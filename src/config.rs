@@ -89,7 +89,8 @@ pub struct FileSpec {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
     /// Template mode: substitute `{{var}}` in the source. `false` for sources that legitimately
-    /// contain `{{ }}` (Blade, Vue); only `replace` rules are applied then.
+    /// contain `{{ }}` (Blade, Vue); only `replace` rules are applied then. A few literal `{{`
+    /// can instead be written `{{{{`.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub vars: bool,
     /// Literal find/replace rules, applied after `{{var}}` substitution. Template mode only.
@@ -121,6 +122,8 @@ impl FileSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Replace {
+    /// Text to find, taken literally (no `{{var}}`). It is matched against the rendered text, so
+    /// a source `{{{{x}}` is found as `{{x}}`.
     pub find: String,
     /// Replacement; may contain `{{var}}` references.
     pub with: String,

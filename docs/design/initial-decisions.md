@@ -140,6 +140,8 @@ Rules for file resources:
 - `template`: UTF-8 text, a single file. `{{var}}` substitution is strict; `replace` rules run after it and a
   rule that matches nothing is an error (drift in the source is noticed). Files that legitimately contain
   `{{ }}` (Blade, Vue) set `vars = false` and keep only `replace`; the `with` side is always substituted.
+  A few literal brackets can stay in template mode written as `{{{{` (see "Literal `{{`"). `find` is
+  literal and matches the rendered text, so an escaped `{{{{` is matched as `{{`.
 
 ## Command resources
 
@@ -265,6 +267,14 @@ the Orca plugin catalog).
   (`toml_edit`) needed by future `bp init` / `bp config set`. The schema has a required `version`.
 - **Variables** are written `{{name}}` (`port.<name>`, `command.<name>.stdout`, `pod.id`, ...). An unknown
   name is an error, never an empty string.
+- **Literal `{{`** is written `{{{{`, in command arguments and templates alike, for tools that use the same
+  brackets (Go templates in `docker` / `podman --format`, `kubectl -o go-template`, Helm):
+  `["docker", "inspect", "-f", "{{{{.Config.Image}}", "app"]` passes `{{.Config.Image}}`. Input is read
+  left to right, so `{{{{{{port.web}}}}` renders as `{{8003}}`. Only the opening bracket has an escape: a
+  `}}` outside a reference is already literal, and making `}}}}` mean `}}` would silently change valid
+  text such as minified JSON (`{"a":{"b":{"c":{}}}}`). `{{{{` was an error before, so the escape changes
+  no working config. Rejected: `{{ "{{" }}` (verbose, needs quote-aware parsing and escaped quotes in TOML)
+  and a backslash (collides with Windows paths such as `C:\{{pod.id}}`).
 - **Ledger** is JSON Lines per pod in the user data directory (`$BRANCHPOD_HOME` overrides it); a torn last
   line is tolerated, corruption elsewhere is reported. Pods are found by their recorded worktree path, so
   a deleted worktree is still found.
