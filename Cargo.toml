@@ -1,0 +1,30 @@
+[package]
+name = "branchpod"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A resource runtime for git worktrees: spin up everything a branch needs, track it, and clean it up completely."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nikfine/branchpod"
+readme = "README.md"
+keywords = ["git", "worktree", "devtools", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+# `bp` is the short name used in docs; it is installed as an optional alias because
+# `bp` is taken on crates.io (see docs/design/initial-decisions.md, "Name").
+[[bin]]
+name = "branchpod"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.105"
+clap = { version = "4.6.9", features = ["derive"] }
+directories = "6.0.0"
+dunce = "1.0.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+toml = "1.2.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

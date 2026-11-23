@@ -1,0 +1,14 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Personal agent settings and scratch files
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/tmp/
