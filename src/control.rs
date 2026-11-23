@@ -16,7 +16,7 @@
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -76,6 +76,13 @@ impl Server {
 pub struct Conn(sys::Stream);
 
 impl Conn {
+    /// Like [`Conn::read_line`], but gives up when nothing arrives for `limit`: a server serving
+    /// one connection at a time must not hang on a client that connects and stays silent.
+    pub fn read_line_within(&self, limit: Duration) -> Result<String> {
+        let _deadline = self.0.deadline(limit)?;
+        self.read_line()
+    }
+
     pub fn read_line(&self) -> Result<String> {
         let mut line = String::new();
         BufReader::new((&self.0).take(MAX_LINE))
@@ -121,7 +128,36 @@ mod sys {
 
     use super::Unreachable;
 
-    pub type Stream = UnixStream;
+    pub struct Stream(UnixStream);
+
+    impl Stream {
+        /// Each read gives up after `limit` without data.
+        pub fn deadline(&self, limit: std::time::Duration) -> Result<Deadline> {
+            self.0
+                .set_read_timeout(Some(limit))
+                .context("cannot set a read timeout")?;
+            Ok(Deadline)
+        }
+    }
+
+    /// Nothing to undo: the timeout belongs to the socket, used for one request.
+    pub struct Deadline;
+
+    impl io::Read for &Stream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            io::Read::read(&mut &self.0, buf)
+        }
+    }
+
+    impl io::Write for &Stream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            io::Write::write(&mut &self.0, buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            io::Write::flush(&mut &self.0)
+        }
+    }
 
     pub fn new_endpoint(_pod: &str, nonce: &str) -> Result<String> {
         let dir = runtime_dir()?;
@@ -177,7 +213,7 @@ mod sys {
         }
 
         pub fn accept(&mut self) -> io::Result<Stream> {
-            self.listener.accept().map(|(stream, _)| stream)
+            self.listener.accept().map(|(stream, _)| Stream(stream))
         }
     }
 
@@ -189,7 +225,7 @@ mod sys {
 
     pub fn connect(endpoint: &str) -> Result<Stream> {
         match UnixStream::connect(endpoint) {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => Ok(Stream(stream)),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -222,21 +258,34 @@ mod sys {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::ptr;
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
 
     use anyhow::{Context, Result};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, OPEN_EXISTING,
-        PIPE_ACCESS_DUPLEX,
+        PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
+    use windows_sys::Win32::System::IO::CancelIoEx;
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, NMPWAIT_WAIT_FOREVER, PIPE_READMODE_BYTE,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
-        WaitNamedPipeW,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NMPWAIT_WAIT_FOREVER,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+        PIPE_WAIT, WaitNamedPipeW,
     };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::Unreachable;
 
@@ -249,19 +298,53 @@ mod sys {
         server: bool,
     }
 
+    impl Stream {
+        /// Cancels a read still waiting after `limit`; the read then fails. Synchronous pipe
+        /// reads have no timeout of their own, so a watchdog thread cancels it.
+        pub fn deadline(&self, limit: Duration) -> Result<Deadline> {
+            let (done, wait) = mpsc::channel::<()>();
+            let handle = self.file.as_raw_handle() as usize;
+            let watchdog = std::thread::spawn(move || {
+                if wait.recv_timeout(limit) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    // SAFETY: the handle stays open until `Deadline` has joined this thread.
+                    unsafe { CancelIoEx(handle as HANDLE, ptr::null()) };
+                }
+            });
+            Ok(Deadline {
+                done: Some(done),
+                watchdog: Some(watchdog),
+            })
+        }
+    }
+
+    /// Stops the watchdog when dropped, before the stream can be closed.
+    pub struct Deadline {
+        done: Option<mpsc::Sender<()>>,
+        watchdog: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for Deadline {
+        fn drop(&mut self) {
+            drop(self.done.take());
+            if let Some(watchdog) = self.watchdog.take() {
+                let _ = watchdog.join();
+            }
+        }
+    }
+
     impl io::Read for &Stream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            (&self.file).read(buf)
+            io::Read::read(&mut &self.file, buf)
         }
     }
 
     impl io::Write for &Stream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            (&self.file).write(buf)
+            io::Write::write(&mut &self.file, buf)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            (&self.file).flush()
+            io::Write::flush(&mut &self.file)
         }
     }
 
@@ -289,8 +372,95 @@ mod sys {
             .collect()
     }
 
+    /// A security descriptor granting access to the current user and SYSTEM only. The default
+    /// one of a named pipe also lets everyone, anonymous included, open it for reading.
+    struct Security(PSECURITY_DESCRIPTOR);
+
+    impl Security {
+        fn current_user_only() -> io::Result<Security> {
+            let sid = current_user_sid()?;
+            let sddl = wide(&format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)"));
+            let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            // SAFETY: `sddl` is NUL-terminated; the descriptor is freed with LocalFree on drop.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Security(descriptor))
+        }
+
+        fn attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.0,
+                bInheritHandle: 0,
+            }
+        }
+    }
+
+    impl Drop for Security {
+        fn drop(&mut self) {
+            // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    /// The SID of the user this process runs as, in string form (`S-1-5-21-...`).
+    fn current_user_sid() -> io::Result<String> {
+        let mut token: HANDLE = ptr::null_mut();
+        // SAFETY: the pseudo handle of our own process needs no closing; the token is closed below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = (|| {
+            // TOKEN_USER plus the SID it points to; generously sized, the call says if not.
+            let mut buffer = vec![0u64; 64];
+            let mut needed = 0u32;
+            let size = (buffer.len() * 8) as u32;
+            // SAFETY: the buffer is writable for `size` bytes and 8-byte aligned.
+            let ok = unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    size,
+                    &mut needed,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: filled in by GetTokenInformation as a TOKEN_USER.
+            let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+            let mut text: *mut u16 = ptr::null_mut();
+            // SAFETY: a valid SID; the string is freed with LocalFree below.
+            if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a NUL-terminated string from ConvertSidToStringSidW.
+            let sid = unsafe {
+                let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+                let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                LocalFree(text.cast());
+                sid
+            };
+            Ok(sid)
+        })();
+        // SAFETY: we own the token handle.
+        unsafe { CloseHandle(token) };
+        result
+    }
+
     pub struct Server {
         name: Vec<u16>,
+        security: Security,
         /// The instance the next client connects to.
         next: HANDLE,
     }
@@ -298,21 +468,36 @@ mod sys {
     impl Server {
         pub fn bind(endpoint: &str) -> io::Result<Server> {
             let name = wide(endpoint);
-            let next = create_instance(&name, true)?;
-            Ok(Server { name, next })
+            let security = Security::current_user_only()?;
+            let next = create_instance(&name, &security, true)?;
+            Ok(Server {
+                name,
+                security,
+                next,
+            })
         }
 
         pub fn accept(&mut self) -> io::Result<Stream> {
-            // SAFETY: `next` is a valid pipe instance; synchronous call.
-            if unsafe { ConnectNamedPipe(self.next, ptr::null_mut()) } == 0 {
+            loop {
+                // SAFETY: `next` is a valid pipe instance; synchronous call.
+                if unsafe { ConnectNamedPipe(self.next, ptr::null_mut()) } != 0 {
+                    break;
+                }
                 let e = io::Error::last_os_error();
-                // The client connected between creation and this call: fine.
-                if e.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-                    return Err(e);
+                match e.raw_os_error() {
+                    // The client connected between creation and this call: fine.
+                    Some(code) if code == ERROR_PIPE_CONNECTED as i32 => break,
+                    // The client connected and is already gone: reset the instance and wait
+                    // for the next one, or every later call fails the same way.
+                    Some(code) if code == ERROR_NO_DATA as i32 => {
+                        // SAFETY: a valid pipe instance.
+                        unsafe { DisconnectNamedPipe(self.next) };
+                    }
+                    _ => return Err(e),
                 }
             }
             // Open the spare instance before handing this one out.
-            let spare = create_instance(&self.name, false)?;
+            let spare = create_instance(&self.name, &self.security, false)?;
             let connected = std::mem::replace(&mut self.next, spare);
             // SAFETY: we own `connected`; `File` takes over closing it.
             let file = unsafe { File::from_raw_handle(connected as _) };
@@ -327,14 +512,15 @@ mod sys {
         }
     }
 
-    fn create_instance(name: &[u16], first: bool) -> io::Result<HANDLE> {
+    fn create_instance(name: &[u16], security: &Security, first: bool) -> io::Result<HANDLE> {
         let open_mode = PIPE_ACCESS_DUPLEX
             | if first {
                 FILE_FLAG_FIRST_PIPE_INSTANCE
             } else {
                 0
             };
-        // SAFETY: `name` is NUL-terminated; default security (full control for the owner).
+        let attributes = security.attributes();
+        // SAFETY: `name` is NUL-terminated; `attributes` outlives the call.
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
@@ -344,7 +530,7 @@ mod sys {
                 BUFFER,
                 BUFFER,
                 0,
-                ptr::null(),
+                &attributes,
             )
         };
         if handle == INVALID_HANDLE_VALUE {
@@ -356,6 +542,8 @@ mod sys {
     pub fn connect(endpoint: &str) -> Result<Stream> {
         let name = wide(endpoint);
         loop {
+            // Identification level only: a server that took the name of a dead supervisor cannot
+            // act as us.
             // SAFETY: `name` is NUL-terminated.
             let handle = unsafe {
                 CreateFileW(
@@ -364,7 +552,7 @@ mod sys {
                     0,
                     ptr::null(),
                     OPEN_EXISTING,
-                    0,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                     ptr::null_mut(),
                 )
             };
@@ -430,6 +618,58 @@ mod tests {
         drop(server);
         let err = connect(&endpoint).err().expect("nothing listens any more");
         assert!(err.downcast_ref::<Unreachable>().is_some(), "{err:#}");
+    }
+
+    /// Serves until a request arrives; connections without one are skipped.
+    fn serve_one(server: &mut Server) -> String {
+        loop {
+            let conn = server.accept().unwrap();
+            if let Ok(line) = conn.read_line_within(Duration::from_millis(500)) {
+                conn.write_line(&format!("got {line}")).unwrap();
+                return line;
+            }
+        }
+    }
+
+    #[test]
+    fn a_client_gone_before_accept_does_not_break_the_server() {
+        let endpoint = new_endpoint("test-pod").unwrap();
+        let mut server = Server::bind(&endpoint).unwrap();
+        // Connects to the waiting instance and leaves before the server accepts it.
+        drop(connect(&endpoint).unwrap());
+        let client = std::thread::spawn({
+            let endpoint = endpoint.clone();
+            move || {
+                let conn = connect(&endpoint).unwrap();
+                conn.write_line("hello").unwrap();
+                conn.read_line().unwrap()
+            }
+        });
+        assert_eq!(serve_one(&mut server), "hello");
+        assert_eq!(client.join().unwrap(), "got hello");
+    }
+
+    #[test]
+    fn a_silent_client_is_given_up_on() {
+        let endpoint = new_endpoint("test-pod").unwrap();
+        let mut server = Server::bind(&endpoint).unwrap();
+        let silent = connect(&endpoint).unwrap();
+        let conn = server.accept().unwrap();
+        let started = std::time::Instant::now();
+        assert!(conn.read_line_within(Duration::from_millis(300)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(conn);
+        drop(silent);
+        let client = std::thread::spawn({
+            let endpoint = endpoint.clone();
+            move || {
+                let conn = connect(&endpoint).unwrap();
+                conn.write_line("next").unwrap();
+                conn.read_line().unwrap()
+            }
+        });
+        assert_eq!(serve_one(&mut server), "next");
+        assert_eq!(client.join().unwrap(), "got next");
     }
 
     #[test]

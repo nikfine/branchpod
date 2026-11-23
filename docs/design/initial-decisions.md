@@ -124,8 +124,12 @@ One supervisor process per worktree, no global daemon; control over a local sock
   `shutdown`. The protocol is internal; the public contract stays `--json` and events. Unix: a socket
   in a directory only the user can enter (`$XDG_RUNTIME_DIR/branchpod`, else `<temp>/branchpod-<uid>`):
   socket paths are limited to about 104 bytes, more than a data directory path leaves. Windows: a named
-  pipe created with `FILE_FLAG_FIRST_PIPE_INSTANCE` and rejecting remote clients, with a spare instance
-  always open. Endpoints carry a random part and are recorded in the ledger.
+  pipe created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, rejecting remote clients, with an explicit DACL for
+  the current user and SYSTEM only (the default one lets everyone open it for reading) and a spare
+  instance always open; clients connect at identification level only. Endpoints carry a random part
+  and are recorded in the ledger. The supervisor serves one request at a time and gives up on a client
+  that sends nothing for 10 s. Clients have no time limit for the answer: a supervisor that listens but
+  hangs keeps `bp down` waiting, like any other step.
 - **Ledger.** The supervisor never writes the ledger: it reports, and `bp up` / `bp down` record under
   the pod lock, so the ledger keeps a single writer. The supervisor is a resource of its own
   (`supervisor`: endpoint, pid + start time); each service records its pid + start time. The start
@@ -137,7 +141,7 @@ One supervisor process per worktree, no global daemon; control over a local sock
   passed to the supervisor but not recorded (it may hold secrets).
 - **Stop.** `bp down` asks the supervisor to stop each service, then to shut down, and waits for it to
   exit (killing it after 10 s). A stopped service gets `SIGTERM` to its group and 10 s before `SIGKILL`.
-  When the supervisor does not answer, a service's tree is stopped by its recorded leader: on Unix
+  When nothing listens on the supervisor's endpoint, a service's tree is stopped by its recorded leader: on Unix
   `killpg(pid)` unless the pid now belongs to another process (a pid is not reused while a group with
   that id exists, so a group whose leader is gone is still ours). A service that never reported its
   pid was known only to that supervisor and is considered gone with it (it is, once the platform

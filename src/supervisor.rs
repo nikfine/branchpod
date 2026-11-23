@@ -35,6 +35,10 @@ pub const GRACE: Duration = Duration::from_secs(10);
 /// How long `bp down` waits for a supervisor to exit after `shutdown` answered, before killing it.
 pub const EXIT_WAIT: Duration = Duration::from_secs(10);
 
+/// How long the supervisor waits for a connected client to send its request. Requests are served
+/// one at a time, so a silent client must not keep everyone else waiting.
+const REQUEST_WAIT: Duration = Duration::from_secs(10);
+
 const PROTOCOL: u32 = 1;
 
 /// Prefix of the line a starting supervisor prints on stdout. Found anywhere in a line, so that a
@@ -220,6 +224,16 @@ impl Service {
         }
         self.exit
     }
+
+    /// Stops its process tree. Once the service process is reaped its pid may be reused, so
+    /// what is left of its tree is then stopped by its recorded identity, never by the bare pid.
+    fn stop(&mut self) -> std::io::Result<()> {
+        if self.exit().is_some() {
+            proc::stop_recorded_tree(self.process, GRACE)
+        } else {
+            proc::stop_tree(&mut self.child, GRACE)
+        }
+    }
 }
 
 /// The supervisor process: listens on `endpoint` and serves requests until `shutdown`.
@@ -291,7 +305,7 @@ fn announce(ready: &Ready) {
 
 /// Handles one request; the answer's data and whether to exit afterwards.
 fn handle(conn: &Conn, services: &mut BTreeMap<String, Service>) -> Result<(Value, bool)> {
-    let line = conn.read_line()?;
+    let line = conn.read_line_within(REQUEST_WAIT)?;
     let message: Message<Value> = serde_json::from_str(&line).context("malformed request")?;
     if message.v != PROTOCOL {
         bail!(
@@ -307,9 +321,11 @@ fn handle(conn: &Conn, services: &mut BTreeMap<String, Service>) -> Result<(Valu
             Ok((serde_json::to_value(process)?, false))
         }
         Request::Stop { name } => {
-            if let Some(mut service) = services.remove(&name) {
-                proc::stop_tree(&mut service.child, GRACE)
+            if let Some(service) = services.get_mut(&name) {
+                service
+                    .stop()
                     .with_context(|| format!("cannot stop service {name:?}"))?;
+                services.remove(&name);
             }
             Ok((Value::Null, false))
         }
@@ -326,13 +342,15 @@ fn handle(conn: &Conn, services: &mut BTreeMap<String, Service>) -> Result<(Valu
         }
         Request::Shutdown => {
             let mut errors = Vec::new();
-            for (name, mut service) in std::mem::take(services) {
-                if let Err(e) = proc::stop_tree(&mut service.child, GRACE) {
+            // Only what was stopped is forgotten: the rest can still be stopped through us.
+            services.retain(|name, service| match service.stop() {
+                Ok(()) => false,
+                Err(e) => {
                     errors.push(format!("{name}: {e}"));
+                    true
                 }
-            }
+            });
             if !errors.is_empty() {
-                // Stay up: the services left can still be stopped through us.
                 bail!("cannot stop services: {}", errors.join("; "));
             }
             Ok((Value::Null, true))
@@ -404,6 +422,32 @@ pub mod tests {
             .env(ENDPOINT_ENV, endpoint);
             cmd
         })
+    }
+
+    /// Kills recorded processes (and their trees) on drop, so that a failing test leaves no
+    /// supervisor or service running (on Windows one would also keep the test binary in use).
+    #[derive(Default)]
+    pub struct Reaper(pub Vec<ProcId>);
+
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            // Services were recorded after their supervisor: stop them first.
+            for process in self.0.iter().rev() {
+                let _ = proc::stop_recorded_tree(*process, Duration::from_millis(500));
+                let _ = proc::kill(*process);
+            }
+        }
+    }
+
+    /// A [`Reaper`] for every process recorded in pod `id`'s ledger.
+    pub fn reap_pod(store: &crate::pod::Store, id: &str) -> Reaper {
+        let processes = store
+            .resources(id)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| serde_json::from_value(r.data.get("process")?.clone()).ok())
+            .collect();
+        Reaper(processes)
     }
 
     /// Not a test by itself: the supervisor process for tests.

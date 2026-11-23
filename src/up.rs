@@ -806,7 +806,9 @@ mod tests {
             "version = 1\n[port.web]\nrange = [41000, 41999]\n{}",
             service_config("web", &supervisor::tests::long_running("web-up"))
         );
-        let report = run(&r, &text).unwrap();
+        let result = run(&r, &text);
+        let _reaper = supervisor::tests::reap_pod(&r.store, &pod::pod_id(&r.linked));
+        let report = result.unwrap();
         let kinds: Vec<(Kind, &str)> = report
             .items
             .iter()
@@ -858,7 +860,9 @@ mod tests {
             "version = 1\n[port.web]\nrange = [41000, 41999]\n{}",
             service_config("broken", &["bp-no-such-program".to_owned()])
         );
-        let err = run(&r, &text).unwrap_err();
+        let result = run(&r, &text);
+        let _reaper = supervisor::tests::reap_pod(&r.store, &pod::pod_id(&r.linked));
+        let err = result.unwrap_err();
         let failed = err.downcast_ref::<Failed>().expect("typed failure");
         let statuses: Vec<_> = failed.recorded.iter().map(|s| (s.kind, s.status)).collect();
         assert_eq!(

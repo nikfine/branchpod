@@ -110,7 +110,9 @@ mod sys {
             // A pid is not reused while a process group with that id exists: another process
             // with the pid means the group is gone.
             Some(now) if now != leader => Ok(()),
-            // The leader itself, or the leader gone and perhaps members of its group left.
+            // The leader itself, or the leader gone and perhaps members of its group left. (A
+            // process that reused the pid and is already a zombie also lands here; signalling a
+            // group of that id then reaches nothing that is still running.)
             _ => stop_group(leader.pid as libc::pid_t, grace, || {}),
         }
     }
@@ -268,8 +270,18 @@ mod sys {
     }
 
     pub fn kill(id: ProcId) -> io::Result<()> {
-        let Some(process) = Process::open(id.pid, PROCESS_TERMINATE)? else {
-            return Ok(());
+        let process = match Process::open(id.pid, PROCESS_TERMINATE) {
+            Ok(Some(process)) => process,
+            Ok(None) => return Ok(()),
+            // Not ours to terminate: fine if the pid now belongs to another process, an error
+            // if it is still the recorded one (it must not be recorded as gone).
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                return match start_token(id.pid) {
+                    Some(start) if start == id.start => Err(e),
+                    _ => Ok(()),
+                };
+            }
+            Err(e) => return Err(e),
         };
         if process.start_token() != Some(id.start) {
             return Ok(());
@@ -311,6 +323,7 @@ mod sys {
         }
     }
 
+    /// `None` also when the process is not ours to query: then it is not one we started.
     pub fn start_token(pid: u32) -> Option<u64> {
         let process = Process::open(pid, 0).ok()??;
         if !process.running() {
@@ -323,20 +336,16 @@ mod sys {
     struct Process(HANDLE);
 
     impl Process {
-        /// `None` when there is no such process, or it is not ours to open.
+        /// `None` when there is no such process. Access denied is an error for the caller to
+        /// judge: the pid may belong to someone else's process, or be ours and protected.
         fn open(pid: u32, access: u32) -> io::Result<Option<Process>> {
-            // SAFETY: plain call; the handle is owned by the returned value.
             let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | access;
+            // SAFETY: plain call; the handle is owned by the returned value.
             let handle = unsafe { OpenProcess(access, 0, pid) };
             if handle.is_null() {
                 let e = io::Error::last_os_error();
                 return match e.raw_os_error() {
-                    Some(code)
-                        if code == ERROR_INVALID_PARAMETER as i32
-                            || code == ERROR_ACCESS_DENIED as i32 =>
-                    {
-                        Ok(None)
-                    }
+                    Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Ok(None),
                     _ => Err(e),
                 };
             }

@@ -421,11 +421,18 @@ mod tests {
     }
 
     /// Starts a supervisor running one long service; records both as `bp up` would.
-    fn supervised(s: &Setup) -> (supervisor::Record, services::Record) {
+    fn supervised(
+        s: &Setup,
+    ) -> (
+        supervisor::Record,
+        services::Record,
+        supervisor::tests::Reaper,
+    ) {
         let endpoint = control::new_endpoint(&s.meta.id).unwrap();
         let process = supervisor::tests::launcher()
             .launch(&endpoint, &s.tmp, &s.tmp.join("supervisor.log"))
             .unwrap();
+        let mut reaper = supervisor::tests::Reaper(vec![process]);
         let sup = supervisor::Record {
             endpoint,
             process: Some(process),
@@ -443,19 +450,20 @@ mod tests {
             cwd: start.cwd,
             process: Some(serde_json::from_value(data).unwrap()),
         };
+        reaper.0.extend(web.process);
         s.live(
             Kind::Supervisor,
             "supervisor",
             serde_json::to_value(&sup).unwrap(),
         );
         s.live(Kind::Service, "web", serde_json::to_value(&web).unwrap());
-        (sup, web)
+        (sup, web, reaper)
     }
 
     #[test]
     fn services_are_stopped_through_the_supervisor() {
         let s = setup(true);
-        let (sup, web) = supervised(&s);
+        let (sup, web, _reaper) = supervised(&s);
         let report = teardown(&s.store, &s.meta).unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(!proc::is_running(web.process.unwrap()));
@@ -466,7 +474,7 @@ mod tests {
     #[test]
     fn services_are_stopped_when_the_supervisor_is_gone() {
         let s = setup(true);
-        let (sup, web) = supervised(&s);
+        let (sup, web, _reaper) = supervised(&s);
         let sup_process = sup.process.unwrap();
         proc::kill(sup_process).unwrap();
         assert!(proc::wait_gone(sup_process, supervisor::EXIT_WAIT));
