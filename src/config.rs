@@ -120,10 +120,10 @@ impl Config {
         let mut value = read_table(&project_path)?
             .with_context(|| format!("no {PROJECT_FILE} in {}", worktree.display()))?;
 
-        if let Some(main) = main_checkout {
-            if let Some(local) = read_table(&main.join(LOCAL_FILE))? {
-                merge(&mut value, local);
-            }
+        if let Some(main) = main_checkout
+            && let Some(local) = read_table(&main.join(LOCAL_FILE))?
+        {
+            merge(&mut value, local);
         }
 
         let config: Config = value

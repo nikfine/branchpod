@@ -4,8 +4,10 @@
 #![allow(dead_code)]
 
 mod config;
+mod fsutil;
 mod ledger;
 mod pod;
+mod ports;
 mod vars;
 mod worktree;
 

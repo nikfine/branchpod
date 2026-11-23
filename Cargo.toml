@@ -2,7 +2,8 @@
 name = "branchpod"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.89: std::fs::File::lock
+rust-version = "1.89"
 description = "A resource runtime for git worktrees: spin up everything a branch needs, track it, and clean it up completely."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nikfine/branchpod"

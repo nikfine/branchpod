@@ -108,10 +108,9 @@ impl Store {
     pub fn write_meta(&self, meta: &PodMeta) -> Result<()> {
         let dir = self.pod_dir(&meta.id);
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        let tmp = dir.join("pod.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(meta)?)?;
-        fs::rename(&tmp, dir.join("pod.json")).context("cannot write pod.json")?;
-        Ok(())
+        let path = dir.join("pod.json");
+        crate::fsutil::write_atomic(&path, &serde_json::to_vec_pretty(meta)?)
+            .with_context(|| format!("cannot write {}", path.display()))
     }
 
     pub fn list(&self) -> Result<Vec<PodMeta>> {

@@ -91,12 +91,12 @@ fn unexpanded_variable(text: &str) -> Option<String> {
     }
 
     // ${NAME} anywhere, $NAME at the start
-    if let Some(start) = text.find("${") {
-        if let Some(end) = text[start..].find('}') {
-            let name = &text[start + 2..start + end];
-            if is_ident(name) {
-                return Some(format!("${{{name}}}"));
-            }
+    if let Some(start) = text.find("${")
+        && let Some(end) = text[start..].find('}')
+    {
+        let name = &text[start + 2..start + end];
+        if is_ident(name) {
+            return Some(format!("${{{name}}}"));
         }
     }
     if let Some(rest) = text.strip_prefix('$') {
