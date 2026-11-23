@@ -265,7 +265,9 @@ the Orca plugin catalog).
   pipes, junctions); argument-array process spawning by default; paths as OS strings.
 - **TOML config.** `branchpod.toml` is read from the worktree (each branch carries its own version);
   `branchpod.local.toml` is read from the main checkout (git-ignored files do not exist in a fresh
-  worktree) and layered on top: tables merge key by key, arrays are replaced. Chosen over YAML for the
+  worktree) and layered on top: tables merge key by key, arrays are replaced. Without a project file the
+  local file alone is the configuration and must set `version` itself, so `bp` works for a project whose
+  team does not commit a config; with neither file it is an error naming both places. Chosen over YAML for the
   absence of implicit typing (`no`, `0755`) and significant indentation, and for comment-preserving edits
   (`toml_edit`) needed by future `bp init` / `bp config set`. The schema has a required `version`.
 - **Variables** are written `{{name}}` (`port.<name>`, `command.<name>.stdout`, `pod.id`, ...). An unknown

@@ -6,6 +6,9 @@
 //!
 //! Layering: tables are merged key by key, every other value (including arrays such as `[[file]]`)
 //! is replaced as a whole by the local file.
+//!
+//! Without a project file the local file alone is the configuration (a project whose team does not
+//! commit one), and it must then set `version` itself. With neither file there is no configuration.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -159,21 +162,57 @@ pub struct ServiceSpec {
 
 impl Config {
     /// Loads the project file from `worktree` and layers the local file from `main_checkout` on top.
+    /// Without a project file the local file alone is the configuration.
     pub fn load(worktree: &Path, main_checkout: Option<&Path>) -> Result<Config> {
         let project_path = worktree.join(PROJECT_FILE);
-        let mut value = read_table(&project_path)?
-            .with_context(|| format!("no {PROJECT_FILE} in {}", worktree.display()))?;
+        let local_path = main_checkout.map(|main| main.join(LOCAL_FILE));
+        let project = read_table(&project_path)?;
+        let local = match &local_path {
+            Some(path) => read_table(path)?.map(|table| (path, table)),
+            None => None,
+        };
 
-        if let Some(main) = main_checkout
-            && let Some(local) = read_table(&main.join(LOCAL_FILE))?
-        {
-            merge(&mut value, local);
-        }
+        let (value, source) = match (project, local) {
+            (Some(mut value), Some((local_path, local))) => {
+                merge(&mut value, local);
+                let source = format!(
+                    "{} with {} layered on top",
+                    project_path.display(),
+                    local_path.display()
+                );
+                (value, source)
+            }
+            (Some(value), None) => (value, project_path.display().to_string()),
+            (None, Some((local_path, local))) => {
+                // Without this check the error would be serde's bare "missing field `version`".
+                if !local.contains_key("version") {
+                    bail!(
+                        "{} is the whole configuration here (there is no {PROJECT_FILE} in {}), \
+                         so it must set `version = {SCHEMA_VERSION}`",
+                        local_path.display(),
+                        worktree.display()
+                    );
+                }
+                (local, local_path.display().to_string())
+            }
+            (None, None) => match &local_path {
+                Some(local_path) => bail!(
+                    "no configuration: neither {} nor {} exists",
+                    project_path.display(),
+                    local_path.display()
+                ),
+                None => bail!(
+                    "no {PROJECT_FILE} in {} (there is no main checkout to read {LOCAL_FILE} \
+                     from: a bare repository or a separate git dir)",
+                    worktree.display()
+                ),
+            },
+        };
 
-        let config: Config = value
-            .try_into()
-            .with_context(|| format!("invalid configuration in {}", project_path.display()))?;
-        config.validate()?;
+        // The config may come from another directory than the worktree, so every error names it.
+        let invalid = || format!("invalid configuration in {source}");
+        let config: Config = value.try_into().with_context(invalid)?;
+        config.validate().with_context(invalid)?;
         Ok(config)
     }
 
@@ -520,7 +559,95 @@ mod tests {
     #[test]
     fn missing_project_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let err = Config::load(dir.path(), None).unwrap_err();
-        assert!(format!("{err:#}").contains(PROJECT_FILE));
+        let err = format!("{:#}", Config::load(dir.path(), None).unwrap_err());
+        assert!(
+            err.contains(PROJECT_FILE) && err.contains("no main checkout"),
+            "{err}"
+        );
+    }
+
+    /// A worktree and a main checkout side by side, with non-ASCII names.
+    fn checkouts() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("wt-\u{e9}t\u{e9}");
+        let main = dir.path().join("main-\u{43e}");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&main).unwrap();
+        (dir, worktree, main)
+    }
+
+    #[test]
+    fn local_file_alone_is_the_whole_config() {
+        let (_dir, worktree, main) = checkouts();
+        fs::write(main.join(LOCAL_FILE), EXAMPLE).unwrap();
+        let config = Config::load(&worktree, Some(&main)).unwrap();
+        assert_eq!(config, Config::parse(EXAMPLE).unwrap());
+
+        // Run in the main checkout itself: both files are read from the same directory.
+        assert_eq!(Config::load(&main, Some(&main)).unwrap(), config);
+        fs::write(
+            main.join(PROJECT_FILE),
+            "version = 1\n[port.api]\nrange = [7000, 7001]\n",
+        )
+        .unwrap();
+        let layered = Config::load(&main, Some(&main)).unwrap();
+        assert_eq!(layered.port.len(), 2);
+        assert_eq!(layered.command, config.command);
+    }
+
+    #[test]
+    fn local_file_alone_must_set_version() {
+        let (_dir, worktree, main) = checkouts();
+        fs::write(main.join(LOCAL_FILE), "[port.web]\nrange = [8001, 8020]\n").unwrap();
+        let err = format!("{:#}", Config::load(&worktree, Some(&main)).unwrap_err());
+        assert!(
+            err.contains("must set `version = 1`") && err.contains(LOCAL_FILE),
+            "{err}"
+        );
+        // Layered on a project file, the local file needs no version of its own.
+        fs::write(worktree.join(PROJECT_FILE), "version = 1\n").unwrap();
+        assert_eq!(
+            Config::load(&worktree, Some(&main)).unwrap().port["web"].range,
+            [8001, 8020]
+        );
+    }
+
+    #[test]
+    fn no_config_names_both_places() {
+        let (_dir, worktree, main) = checkouts();
+        let err = format!("{:#}", Config::load(&worktree, Some(&main)).unwrap_err());
+        let project = worktree.join(PROJECT_FILE).display().to_string();
+        let local = main.join(LOCAL_FILE).display().to_string();
+        assert!(err.contains(&project) && err.contains(&local), "{err}");
+    }
+
+    #[test]
+    fn errors_name_the_files_they_come_from() {
+        let (_dir, worktree, main) = checkouts();
+        fs::write(main.join(LOCAL_FILE), "version = 1\nport = 3\n").unwrap();
+        let err = format!("{:#}", Config::load(&worktree, Some(&main)).unwrap_err());
+        assert!(
+            err.contains(&main.join(LOCAL_FILE).display().to_string()),
+            "{err}"
+        );
+
+        fs::write(worktree.join(PROJECT_FILE), "version = 1\n").unwrap();
+        let err = format!("{:#}", Config::load(&worktree, Some(&main)).unwrap_err());
+        assert!(err.contains("layered on top"), "{err}");
+
+        // Validation errors too, not only parse errors.
+        fs::remove_file(worktree.join(PROJECT_FILE)).unwrap();
+        let local = main.join(LOCAL_FILE).display().to_string();
+        for (text, problem) in [
+            ("version = 2\n", "unsupported config version 2"),
+            (
+                "version = 1\n[port.web]\nrange = [9, 3]\n",
+                "port.web: range",
+            ),
+        ] {
+            fs::write(main.join(LOCAL_FILE), text).unwrap();
+            let err = format!("{:#}", Config::load(&worktree, Some(&main)).unwrap_err());
+            assert!(err.contains(&local) && err.contains(problem), "{err}");
+        }
     }
 }
