@@ -8,7 +8,12 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, Default)]
-pub struct Vars(BTreeMap<String, String>);
+pub struct Vars {
+    values: BTreeMap<String, String>,
+    /// Known names without a value here, with the reason (`branch` on a detached HEAD). A
+    /// reference to one is still an error, but one that says why.
+    unavailable: BTreeMap<String, String>,
+}
 
 impl Vars {
     pub fn new() -> Self {
@@ -16,11 +21,20 @@ impl Vars {
     }
 
     pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.0.insert(name.into(), value.into());
+        let name = name.into();
+        self.unavailable.remove(&name);
+        self.values.insert(name, value.into());
+    }
+
+    /// Declares `name` as known but without a value, so that a reference to it explains `reason`.
+    pub fn set_unavailable(&mut self, name: impl Into<String>, reason: impl Into<String>) {
+        let name = name.into();
+        self.values.remove(&name);
+        self.unavailable.insert(name, reason.into());
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.0.get(name).map(String::as_str)
+        self.values.get(name).map(String::as_str)
     }
 
     /// Replaces every `{{ name }}` (surrounding spaces allowed) with its value. Errors quote the
@@ -53,7 +67,13 @@ impl Vars {
             match self.get(name) {
                 Some(value) => out.push_str(value),
                 None if name.is_empty() => return Err((offset, "empty `{{}}`".to_owned())),
-                None => return Err((offset, format!("unknown variable `{name}`"))),
+                None => {
+                    let problem = match self.unavailable.get(name) {
+                        Some(reason) => format!("variable `{name}` is not available: {reason}"),
+                        None => format!("unknown variable `{name}`"),
+                    };
+                    return Err((offset, problem));
+                }
             }
             rest = &after[end + 2..];
         }
@@ -131,6 +151,19 @@ mod tests {
         assert!(vars().render("{{port.vite}}").is_err());
         assert!(vars().render("{{port.web").is_err());
         assert!(vars().render("{{}}").is_err());
+    }
+
+    #[test]
+    fn unavailable_names_explain_why() {
+        let mut v = vars();
+        v.set_unavailable("branch", "HEAD is detached");
+        let err = v.render("{{branch}}").unwrap_err().to_string();
+        assert!(
+            err.contains("`branch` is not available: HEAD is detached"),
+            "{err}"
+        );
+        v.set("branch", "main");
+        assert_eq!(v.render("{{branch}}").unwrap(), "main");
     }
 
     #[test]

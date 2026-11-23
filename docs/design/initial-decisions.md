@@ -179,6 +179,30 @@ Rules for file resources:
 - The lock is not re-entrant: taking it again in the same process is an error, not a deadlock.
 - Lock order: the pod lock before the port registry lock, never the other way round.
 
+## `bp up`
+
+- Resources are created in a fixed order of kinds — ports, files, commands (services later) — and within a
+  kind in config order (ports by name: they never depend on each other). Templates and commands reference
+  ports; a command (a container) may mount a file provisioned for it. The price: a file cannot reference
+  `{{command.<name>.stdout}}`. A single ordered list or ordering by references would lift that, at the cost
+  of a format change or implicit ordering.
+- `up` is not re-entrant: if the ledger holds any resource that is not destroyed (live, pending or failed),
+  it fails at once, lists them and asks for `bp down` first. Reconciling a live pod with a changed config
+  is a separate feature, not a side effect of `up`.
+- Before the first resource is created, the whole config is planned once with stand-in values for what
+  only creation yields (the first port of each range, a placeholder for command output): a typo in the
+  last command or a missing source fails before any port is allocated. Only what creation itself reveals
+  (a command failing, empty output a `destroy` needs) fails midway.
+- On failure nothing is rolled back: what was created stays recorded, and the error lists it with the
+  `bp down` command to run. A resource rejected while planning records nothing.
+- `up` in the main checkout is refused when the config has file rules: files are carried over from the
+  main checkout into linked worktrees, so there every destination is its own source.
+- Ports are allocated afresh: a registration the pod still holds in the registry with nothing live in its
+  ledger is stale (a lost ledger) and is released first, so the port is bind-checked again.
+- Built-in variables: `pod.id`, `worktree`, `main` (main checkout), `branch`. When one has no value (a
+  detached HEAD, a bare repository, a path that is not UTF-8), a reference to it fails and says why.
+- A config with services is refused until the supervisor exists, rather than reported as up without them.
+
 ## File sync (Mutagen)
 
 Plain resources, no special-casing in the core beyond a readiness hook:

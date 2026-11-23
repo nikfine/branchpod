@@ -1,6 +1,6 @@
 //! branchpod (`bp`): a resource runtime for git worktrees.
 
-// Variables and resource creation are used by `bp up`, which lands next.
+// Some helpers are only used by tests so far and by `bp gc`, which lands later.
 #![allow(dead_code)]
 
 mod commands;
@@ -13,6 +13,7 @@ mod ledger;
 mod pod;
 mod podlock;
 mod ports;
+mod up;
 mod vars;
 mod worktree;
 
@@ -47,6 +48,11 @@ enum Cmd {
         /// Print JSON instead of TOML.
         #[arg(long)]
         json: bool,
+    },
+    /// Provision a worktree: ports, files and commands from its configuration.
+    Up {
+        /// Worktree path; defaults to the current directory.
+        path: Option<OsString>,
     },
     /// Show the pod of a worktree and the resources recorded for it.
     Status {
@@ -90,6 +96,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 );
             } else {
                 print!("{}", toml::to_string(&config)?);
+            }
+        }
+        Cmd::Up { path } => {
+            let wt = worktree::Worktree::resolve(path.as_deref())?;
+            let config = config::Config::load(&wt.root, wt.main_checkout.as_deref())?;
+            let store = pod::Store::open()?;
+            let report = up::up(&store, &wt, &config, |holder| match holder {
+                Some(holder) => eprintln!("bp: waiting for {holder} to finish"),
+                None => eprintln!("bp: waiting for another bp process on this worktree"),
+            })?;
+            println!(
+                "pod {} is up ({})",
+                report.pod.id,
+                report.pod.worktree.display()
+            );
+            for item in &report.items {
+                println!("  {:<8} {:<24} {}", item.kind, item.name, item.detail);
             }
         }
         Cmd::Status { path, json } => {
