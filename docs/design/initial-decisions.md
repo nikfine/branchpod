@@ -263,6 +263,14 @@ the Orca plugin catalog).
 
 - **Rust.** A single binary with no runtime; first-class access to Windows APIs (Job Objects, named
   pipes, junctions); argument-array process spawning by default; paths as OS strings.
+- **Supported operating systems:** Windows 10 and 11, macOS, Linux. The floor is what Rust requires
+  of its targets at our MSRV (1.89), per the rustc platform support page; `bp` adds no older-OS
+  workarounds:
+  - Windows: 10+ (Server 2016+) since Rust 1.78 for the `*-pc-windows-*` targets. CI runs
+    `windows-latest`, a Windows Server image; Windows 10 itself is not tested.
+  - macOS: 11.0+ (Big Sur) on Apple silicon, 10.12+ (Sierra) on x86_64. CI runs `macos-latest`
+    (Apple silicon).
+  - Linux (glibc): kernel 3.2+ on x86_64, 4.1+ on ARM64, glibc 2.17+. CI runs `ubuntu-latest`.
 - **TOML config.** `branchpod.toml` is read from the worktree (each branch carries its own version);
   `branchpod.local.toml` is read from the main checkout (git-ignored files do not exist in a fresh
   worktree) and layered on top: tables merge key by key, arrays are replaced. Without a project file the
