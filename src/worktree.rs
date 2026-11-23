@@ -1,7 +1,7 @@
 //! Locating the worktree `bp` was pointed at, and its main checkout.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -116,6 +116,32 @@ pub fn canonical(path: &Path) -> Result<PathBuf> {
     dunce::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))
 }
 
+/// The canonical form of `path`, which may not exist (a worktree deleted behind our back): its
+/// deepest existing ancestor is canonicalized and the rest appended, with `.` and `..` resolved
+/// lexically. So a short 8.3 name on Windows, `..`, or `/var` for `/private/var` on macOS still
+/// matches the canonical path recorded for a pod.
+pub fn normalize(path: &Path) -> Result<PathBuf> {
+    let abs =
+        std::path::absolute(path).with_context(|| format!("cannot resolve {}", path.display()))?;
+    for ancestor in abs.ancestors() {
+        let Ok(mut out) = dunce::canonicalize(ancestor) else {
+            continue;
+        };
+        let rest = abs.strip_prefix(ancestor).unwrap_or(Path::new(""));
+        for component in rest.components() {
+            match component {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other),
+            }
+        }
+        return Ok(out);
+    }
+    Ok(abs)
+}
+
 /// Runs git without a shell and returns stdout. Git prints paths as UTF-8 on every platform, so
 /// the output is never decoded with the console code page.
 pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -162,6 +188,37 @@ mod tests {
         ] {
             assert!(unexpanded_variable(text).is_none(), "{text}");
         }
+    }
+
+    #[test]
+    fn normalizes_a_path_that_does_not_exist() {
+        // The temporary directory is often spelled non-canonically: an 8.3 name on Windows
+        // runners (`RUNNER~1`), `/var` for `/private/var` on macOS.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        let expected = base.join("gone").join("wt");
+        for spelled in [
+            tmp.path().join("gone").join("wt"),
+            tmp.path().join("real").join("..").join("gone").join("wt"),
+            tmp.path()
+                .join("nope")
+                .join("..")
+                .join("gone")
+                .join(".")
+                .join("wt"),
+        ] {
+            assert_eq!(
+                normalize(&spelled).unwrap(),
+                expected,
+                "{}",
+                spelled.display()
+            );
+        }
+        assert_eq!(
+            normalize(&tmp.path().join("real")).unwrap(),
+            base.join("real")
+        );
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {

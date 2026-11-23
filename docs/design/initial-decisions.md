@@ -72,7 +72,10 @@ Rules:
 ## Teardown (`bp down`)
 
 - Driven by the ledger alone: the pod is found by its recorded worktree path, commands are undone in the
-  worktree root while it exists and in the pod's state directory otherwise.
+  worktree root while it exists and in the `bp` home otherwise (not the pod's state directory: a daemon
+  started by `destroy` would keep it as its working directory). A path given for a deleted worktree is
+  matched in canonical form (deepest existing ancestor canonicalized, `..` resolved), so `..`, 8.3 names
+  and `/var` vs `/private/var` still find the pod.
 - Every resource that is not destroyed is visited, pending and failed ones included. Each outcome is
   recorded (`destroyed`, or `failed` with the error and the data kept for the next attempt); a failure
   never stops the other steps.
@@ -80,20 +83,23 @@ Rules:
   anything else.
 - Exit code: `0` nothing is left, `3` resources are left behind (run it again once the cause is fixed),
   `1` teardown could not run (the ledger cannot be read). `2` stays with usage errors.
-- Once nothing is left, the pod's state directory is removed too (ledger first, `pod.json` last, so an
-  interruption leaves a pod with nothing to tear down); its lock file is kept.
+- Once nothing is left, the pod's state directory is removed too (`pod.json` last, so an interruption
+  leaves a pod with nothing to tear down); its lock file is kept.
+- Known limitation until `gc` exists: a resource that cannot be undone from the ledger (a command whose
+  `destroy` needs output never captured, kinds without teardown yet) keeps `bp down` at exit code `3`;
+  there is no way to forget it.
 
 ### Files that are in use
 
 On Windows a directory cannot be removed while a process has a file open inside it or its working
 directory there; teardown must never stop halfway through such a directory.
 
-- A copied directory is first renamed to a trash name next to it (`<name>.bp-trash-<unique>`, same
-  volume). On Windows the rename fails while anything inside is in use — an open file, even one opened
-  with `FILE_SHARE_DELETE`, or a process's working directory — and then nothing has been touched. Once
-  renamed, the ledger records the trash path (`moved`) before it is deleted, so an interrupted delete is
-  finished by the next run; if that record cannot be written, the directory is moved back. Single files
-  and links are removed in one operation.
+- A copied directory is renamed to a trash name next to it (`<name>.bp-trash-<unique>`, same volume)
+  and deleted from there. On Windows the rename fails while anything inside is in use — an open file, even
+  one opened with `FILE_SHARE_DELETE`, or a process's working directory — and then nothing has been
+  touched. The trash name is chosen and recorded in the ledger (`moved`) before the rename, so every
+  interruption is finished by the next run: a leftover trash is deleted, a remaining directory is moved to
+  the recorded name. Single files and links are removed in one operation.
 - Removal and the rename retry with backoff on the transient sharing errors (a scanner or indexer holds a
   file for a moment).
 - A lock that persists is reported with the processes holding it when the OS can tell: on Windows the

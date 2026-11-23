@@ -59,9 +59,9 @@ pub enum Event {
         #[serde(default)]
         data: Value,
     },
-    /// Teardown moved the resource before deleting it (a directory renamed to a trash name):
-    /// `data` replaces the recorded data, so an interrupted delete is finished from the new
-    /// location. Status and order are unchanged.
+    /// Teardown is about to move the resource before deleting it (a directory renamed to a trash
+    /// name): `data` replaces the recorded data and names the new location, so an interruption at
+    /// any point is finished from the ledger. Status and order are unchanged.
     Moved { data: Value },
     /// Released by teardown or gc.
     Destroyed,

@@ -170,7 +170,8 @@ fn down(path: Option<&OsStr>) -> Result<ExitCode> {
 }
 
 /// Finds the pod of `path` (default: the current directory). A recorded pod is preferred, so a
-/// worktree that is already gone is still found; a path that does not exist has no other pod.
+/// worktree that is already gone is still found, however the caller spells its path (recorded
+/// paths are canonical); a path that does not exist has no other pod.
 fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option<pod::PodMeta>)> {
     let target = match path {
         Some(p) => {
@@ -179,6 +180,11 @@ fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option
         }
         None => std::env::current_dir()?,
     };
+    // Recorded paths are canonical; try the spelling as given too, in case one is not.
+    if let Some(meta) = store.find_by_worktree(&target)? {
+        return Ok((target, Some(meta)));
+    }
+    let target = worktree::normalize(&target)?;
     if let Some(meta) = store.find_by_worktree(&target)? {
         return Ok((target, Some(meta)));
     }

@@ -141,13 +141,14 @@ fn data<T: DeserializeOwned>(r: &ResourceState) -> Result<T> {
         .with_context(|| format!("unreadable ledger data of {} {:?}", r.kind, r.name))
 }
 
-/// Commands are undone in the worktree root while it exists, otherwise in the pod's own state
-/// directory, which always does.
+/// Commands are undone in the worktree root while it exists, otherwise in the `bp` home. Not the
+/// pod's state directory: a daemon started by `destroy` (a sync agent, say) would keep it as its
+/// working directory, and on Windows the directory could then never be removed.
 fn command_cwd(store: &Store, meta: &PodMeta) -> Result<PathBuf> {
     if meta.worktree.is_absolute() && meta.worktree.is_dir() {
         return Ok(meta.worktree.clone());
     }
-    Ok(std::path::absolute(store.pod_dir(&meta.id))?)
+    Ok(std::path::absolute(store.home())?)
 }
 
 #[cfg(test)]
@@ -336,13 +337,9 @@ mod tests {
         let trash = wt.join("vendor.bp-trash-1-2");
         fs::create_dir_all(trash.join("half")).unwrap();
         s.live(Kind::File, "vendor", file_record(wt, "vendor", "dir"));
-        s.record(
-            Kind::File,
-            "vendor",
-            vec![Event::Moved {
-                data: file_record(wt, "vendor.bp-trash-1-2", "dir"),
-            }],
-        );
+        let mut moved = file_record(wt, "vendor", "dir");
+        moved["trash"] = json!(trash);
+        s.record(Kind::File, "vendor", vec![Event::Moved { data: moved }]);
         let report = teardown(&s.store, &s.meta).unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(!trash.exists());

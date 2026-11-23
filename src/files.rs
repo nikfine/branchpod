@@ -46,6 +46,10 @@ pub struct Record {
     /// Reflink mode only: whether every file was cloned copy-on-write rather than copied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloned: Option<bool>,
+    /// Directories only: the trash name teardown moves `path` to before deleting it. Chosen and
+    /// recorded before the move, so an interruption at any point is finished from the ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash: Option<PathBuf>,
 }
 
 /// A checked file resource, ready to be created.
@@ -150,6 +154,7 @@ fn plan_inner(spec: &FileSpec, main: &Path, root: &Path, vars: &Vars) -> Result<
             entry,
             created_dirs,
             cloned: None,
+            trash: None,
         },
         action,
     }))
@@ -339,11 +344,12 @@ fn symlink_error(e: io::Error) -> anyhow::Error {
 ///
 /// A directory is removed all or nothing: it is first renamed to a trash name next to it. On
 /// Windows the rename fails while anything inside is in use (an open file, a process's working
-/// directory), and then nothing has been touched. `on_moved` receives the record of the trash
-/// location before it is deleted and must make it durable (the ledger), so that an interrupted
-/// delete is finished from there; if it fails, the directory is moved back. Single files and
-/// links are removed in one operation. Transient locks are retried; a lasting one is reported
-/// with the processes holding the path, when the OS can tell.
+/// directory), and then nothing has been touched. The trash name is chosen before the move and
+/// handed to `on_moved` with the updated record, which must make it durable (the ledger); only
+/// then is the directory moved. Interrupted anywhere after that, the next call with the recorded
+/// record finishes the job: it deletes a leftover trash and moves a remaining directory. Single
+/// files and links are removed in one operation. Transient locks are retried; a lasting one is
+/// reported with the processes holding the path, when the OS can tell.
 pub fn remove(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
     remove_inner(record, on_moved)
         .with_context(|| format!("cannot remove {}", record.path.display()))
@@ -352,11 +358,19 @@ pub fn remove(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> 
 fn remove_inner(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
     let path = &record.path;
     let inside = |p: &Path| p.starts_with(&record.root) && p != record.root;
-    if !inside(path) || !record.created_dirs.iter().all(|d| inside(d)) {
+    let trash_inside = record
+        .trash
+        .as_deref()
+        .is_none_or(|t| inside(t) && t.parent() == path.parent());
+    if !inside(path) || !trash_inside || !record.created_dirs.iter().all(|d| inside(d)) {
         bail!("refusing to touch a path outside {}", record.root.display());
     }
 
     if parents_are_real_dirs(&record.root, path)? {
+        // A delete interrupted after the move; the trash shares the parents of `path`.
+        if let Some(trash) = &record.trash {
+            remove_trash(trash)?;
+        }
         match fs::symlink_metadata(path) {
             Ok(meta) => remove_entry(record, &meta, on_moved)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -423,41 +437,44 @@ fn remove_entry(
 /// Infix of trash names: `<name>.bp-trash-<unique>` next to the directory being removed.
 const TRASH: &str = ".bp-trash-";
 
-/// Moves a copied directory out of the way, then deletes it (see [`remove`]).
+/// Moves a copied directory to its trash name, recorded first, then deletes it (see [`remove`]).
 fn remove_tree(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
     let path = &record.path;
-    // Already trash: an earlier delete was interrupted after the move was recorded.
-    let trash = if is_trash(path) {
-        path.clone()
-    } else {
-        let trash = trash_path(path);
-        fsutil::retry(|| fs::rename(path, &trash)).map_err(|e| in_use(path, e))?;
-        let moved = Record {
-            path: trash.clone(),
-            ..record.clone()
-        };
-        if let Err(e) = on_moved(&moved) {
-            // Unrecorded, the trash would be invisible to teardown: put the directory back.
-            return Err(match fs::rename(&trash, path) {
-                Ok(()) => e,
-                Err(back) => e.context(format!(
-                    "{} was moved to {} and cannot be moved back: {back}",
-                    path.display(),
-                    trash.display()
-                )),
-            });
+    let trash = match &record.trash {
+        // Recorded by an earlier attempt; `remove_inner` has already cleared it.
+        Some(trash) => trash.clone(),
+        None => {
+            let trash = trash_path(path);
+            on_moved(&Record {
+                trash: Some(trash.clone()),
+                ..record.clone()
+            })
+            .context("cannot record the trash name; nothing was moved")?;
+            trash
         }
-        trash
     };
-    // Does not follow links inside the tree: they are removed as links.
-    fsutil::retry(|| fs::remove_dir_all(&trash))
-        .map_err(|e| in_use(&trash, e))
-        .with_context(|| format!("moved to {}, but", trash.display()))
+    fsutil::retry(|| fs::rename(path, &trash)).map_err(|e| in_use(path, e))?;
+    remove_trash(&trash).with_context(|| format!("moved to {}, but", trash.display()))
 }
 
-fn is_trash(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.to_string_lossy().contains(TRASH))
+/// Deletes a trash directory left by `remove_tree`. Gone is fine; anything other than a directory
+/// is not ours and is left in place.
+fn remove_trash(trash: &Path) -> Result<()> {
+    match fs::symlink_metadata(trash) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => bail!(
+            "left in place: {} is not the directory bp moved there",
+            trash.display()
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    // Does not follow links inside the tree: they are removed as links.
+    match fsutil::retry(|| fs::remove_dir_all(trash)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(in_use(trash, e)),
+    }
 }
 
 /// A unique sibling of `path` (same directory, so the same volume: the rename never copies).
@@ -880,26 +897,54 @@ mod tests {
         let record = up(&t, &spec("vendor", FileMode::Copy));
         let mut recorded = None;
         remove(&record, |moved| {
-            // The original path is already free; the trash is still there when it is recorded.
-            assert!(!record.path.exists());
-            assert!(moved.path.join("pkg/a.txt").exists());
-            assert_eq!(moved.path.parent(), record.path.parent());
+            // Recorded before anything is moved.
+            assert!(record.path.join("pkg/a.txt").exists());
+            let trash = moved.trash.as_deref().expect("trash name");
+            assert!(!trash.exists());
+            assert_eq!(trash.parent(), record.path.parent());
+            assert_eq!(moved.path, record.path);
             recorded = Some(moved.clone());
             Ok(())
         })
         .unwrap();
-        let moved = recorded.expect("move reported");
-        assert!(!moved.path.exists());
+        recorded.expect("move reported");
         assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 0);
-
-        // An interrupted delete is finished from the recorded trash, without another move.
-        fs::create_dir_all(moved.path.join("left")).unwrap();
-        remove(&moved, |_| panic!("already trash")).unwrap();
-        assert!(!moved.path.exists());
     }
 
     #[test]
-    fn a_failed_record_of_the_move_puts_the_directory_back() {
+    fn every_interruption_of_a_directory_delete_is_finished_from_the_record() {
+        let t = tree();
+        write(&t.main.join("vendor/a.txt"), "a");
+        let created = up(&t, &spec("vendor", FileMode::Copy));
+        let trash = t.wt.join("vendor.bp-trash-1-2");
+        let recorded = Record {
+            trash: Some(trash.clone()),
+            ..created.clone()
+        };
+        let no_record = |_: &Record| -> Result<()> { panic!("already recorded") };
+
+        // Crashed after recording, before the move: the directory is still in place.
+        rm_with(&recorded, no_record);
+        assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 0);
+
+        // Crashed after the move, during the delete: only a partial trash is left.
+        fs::create_dir_all(trash.join("half")).unwrap();
+        rm_with(&recorded, no_record);
+        assert!(!trash.exists());
+
+        // Both: a new directory at the path (a later `up`) and an old trash.
+        up(&t, &spec("vendor", FileMode::Copy));
+        fs::create_dir_all(trash.join("half")).unwrap();
+        rm_with(&recorded, no_record);
+        assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 0);
+    }
+
+    fn rm_with(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) {
+        remove(record, on_moved).unwrap();
+    }
+
+    #[test]
+    fn a_failed_record_of_the_trash_name_moves_nothing() {
         let t = tree();
         write(&t.main.join("vendor/a.txt"), "a");
         let record = up(&t, &spec("vendor", FileMode::Copy));
@@ -907,6 +952,18 @@ mod tests {
         assert!(format!("{err:#}").contains("disk full"), "{err:#}");
         assert!(t.wt.join("vendor/a.txt").exists());
         assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_trash_outside_the_parent_is_refused() {
+        let t = tree();
+        write(&t.main.join("vendor/a.txt"), "a");
+        let record = Record {
+            trash: Some(t.wt.join("elsewhere").join("x")),
+            ..up(&t, &spec("vendor", FileMode::Copy))
+        };
+        assert!(rm(&record).is_err());
+        assert!(t.wt.join("vendor/a.txt").exists());
     }
 
     /// On Windows a directory with an open file inside cannot be renamed, even when the file was
@@ -921,7 +978,7 @@ mod tests {
         let record = up(&t, &spec("vendor", FileMode::Copy));
         let open = File::open(t.wt.join("vendor/sub/b.txt")).unwrap();
 
-        let err = remove(&record, |_| panic!("must not move")).unwrap_err();
+        let err = rm(&record).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("in use by"), "{message}");
         assert!(

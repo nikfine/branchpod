@@ -70,6 +70,29 @@ fn exit_code_tells_clean_from_leftovers() {
     assert!(stdout.contains("no pod"), "{stdout}");
 }
 
+/// The pod records the canonical path; a hook may spell it with `..`, an 8.3 name (Windows
+/// runners' temp directory) or `/var` for `/private/var` (macOS).
+#[test]
+fn a_gone_worktree_is_found_however_its_path_is_spelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir(tmp.path().join("real")).unwrap();
+    let canonical = dunce::canonicalize(tmp.path()).unwrap().join("gone");
+    let dir = pod(
+        &home,
+        &canonical,
+        &[entry("service", "vite", "intent", serde_json::Value::Null)],
+    );
+    for spelled in [
+        tmp.path().join("gone"),
+        tmp.path().join("real").join("..").join("gone"),
+    ] {
+        let (code, stdout, stderr) = bp(&home, &["down".as_ref(), spelled.as_os_str()]);
+        assert_eq!(code, 3, "{}: {stdout}{stderr}", spelled.display());
+    }
+    assert!(dir.join("pod.json").exists());
+}
+
 #[test]
 fn a_damaged_ledger_means_teardown_could_not_run() {
     let tmp = tempfile::tempdir().unwrap();
