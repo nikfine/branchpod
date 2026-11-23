@@ -11,9 +11,11 @@
 //! Recording the allocation in the pod's ledger is the caller's job (`bp up`); `bp down` releases it.
 
 use std::collections::BTreeMap;
+use std::fs::TryLockError;
 use std::fs::{self, File, OpenOptions};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::fsutil;
 
 pub const REGISTRY_VERSION: u32 = 1;
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Owner {
@@ -40,6 +43,7 @@ struct RegistryFile {
 pub struct Registry {
     file: PathBuf,
     lock: PathBuf,
+    lock_timeout: Duration,
 }
 
 impl Registry {
@@ -47,13 +51,17 @@ impl Registry {
         Registry {
             file: home.join("ports.json"),
             lock: home.join("ports.lock"),
+            lock_timeout: LOCK_TIMEOUT,
         }
     }
 
     /// Allocates a port for `(pod, name)` from the inclusive `range`.
     ///
-    /// An existing registration of the same owner inside the range is kept if the port is still
-    /// bindable; otherwise it is dropped and a new port is chosen.
+    /// An existing registration of the same owner inside the range is returned as is, without a
+    /// bind check: the owner's own service may be listening on it (a repeated `bp up`), and
+    /// moving it would point templates at a port nothing serves. Whether such a port was taken by
+    /// a foreign process while the pod was down is for the caller to decide from the pod state;
+    /// it can `release` and allocate again. Only new candidates are bind-checked.
     pub fn allocate(&self, pod: &str, name: &str, range: [u16; 2]) -> Result<u16> {
         self.allocate_with(pod, name, range, is_free)
     }
@@ -81,9 +89,10 @@ impl Registry {
             .find(|(_, o)| **o == owner)
             .map(|(p, _)| *p);
         if let Some(port) = previous {
-            if (first..=last).contains(&port) && is_free(port) {
+            if (first..=last).contains(&port) {
                 return Ok(port);
             }
+            // The range changed in the config: the old registration no longer applies.
             reg.ports.remove(&port);
         }
 
@@ -99,7 +108,7 @@ impl Registry {
             return Ok(port);
         }
 
-        // Keep a dropped stale registration dropped even when allocation fails.
+        // Keep a registration outside the range dropped even when allocation fails.
         if previous.is_some() {
             self.save(&reg)?;
         }
@@ -140,11 +149,24 @@ impl Registry {
         Ok(ports)
     }
 
+    /// The port currently registered to `(pod, name)`, if any.
+    pub fn registered(&self, pod: &str, name: &str) -> Result<Option<u16>> {
+        let _lock = self.lock()?;
+        Ok(self
+            .load()?
+            .ports
+            .iter()
+            .find(|(_, o)| o.pod == pod && o.name == name)
+            .map(|(p, _)| *p))
+    }
+
     pub fn list(&self) -> Result<BTreeMap<u16, Owner>> {
         let _lock = self.lock()?;
         Ok(self.load()?.ports)
     }
 
+    /// Takes the registry lock, waiting up to `lock_timeout` so that one hung `bp` cannot block
+    /// every other invocation forever.
     fn lock(&self) -> Result<File> {
         if let Some(dir) = self.lock.parent() {
             fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -155,10 +177,25 @@ impl Registry {
             .write(true)
             .open(&self.lock)
             .with_context(|| format!("cannot open {}", self.lock.display()))?;
-        file.lock()
-            .with_context(|| format!("cannot lock {}", self.lock.display()))?;
-        // Unlocked when the handle is dropped.
-        Ok(file)
+        let deadline = Instant::now() + self.lock_timeout;
+        loop {
+            match file.try_lock() {
+                // Unlocked when the handle is dropped.
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(TryLockError::WouldBlock) => bail!(
+                    "the port registry is locked by another bp process ({} for {}s); \
+                     if no bp is running, the lock is held by a hung process",
+                    self.lock.display(),
+                    self.lock_timeout.as_secs_f32()
+                ),
+                Err(TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("cannot lock {}", self.lock.display()));
+                }
+            }
+        }
     }
 
     fn load(&self) -> Result<RegistryFile> {
@@ -174,8 +211,10 @@ impl Registry {
                 return Err(e).with_context(|| format!("cannot read {}", self.file.display()));
             }
         };
-        let mut reg: RegistryFile = serde_json::from_slice(&bytes)
-            .with_context(|| format!("cannot parse {}", self.file.display()))?;
+        let mut reg: RegistryFile = match serde_json::from_slice(&bytes) {
+            Ok(reg) => reg,
+            Err(e) => return self.recover(&e),
+        };
         if reg.v > REGISTRY_VERSION {
             bail!(
                 "{} was written by a newer branchpod (v{})",
@@ -186,6 +225,26 @@ impl Registry {
         // Older formats are upgraded on the next save.
         reg.v = REGISTRY_VERSION;
         Ok(reg)
+    }
+
+    /// A damaged registry must not block `up`, `down` and `gc` until someone deletes it by hand.
+    /// It is set aside for inspection and replaced by an empty one: running services stay safe
+    /// because every new candidate is bind-checked, and pods re-register on their next `up`.
+    fn recover(&self, error: &serde_json::Error) -> Result<RegistryFile> {
+        let mut aside = self.file.as_os_str().to_owned();
+        aside.push(".corrupt");
+        let aside = PathBuf::from(aside);
+        fs::rename(&self.file, &aside)
+            .with_context(|| format!("cannot move damaged {} aside", self.file.display()))?;
+        eprintln!(
+            "bp: warning: {} was damaged ({error}); moved to {} and starting with an empty registry",
+            self.file.display(),
+            aside.display()
+        );
+        Ok(RegistryFile {
+            v: REGISTRY_VERSION,
+            ports: BTreeMap::new(),
+        })
     }
 
     fn save(&self, reg: &RegistryFile) -> Result<()> {
@@ -207,7 +266,10 @@ fn preferred_offset(pod: &str, name: &str) -> u32 {
 ///
 /// Both are needed: a dev server usually binds loopback while a container runtime publishes on the
 /// wildcard address, and on some systems binding one succeeds while the other is taken. Ports
-/// reserved by the OS (e.g. Windows excluded port ranges) fail to bind and count as busy.
+/// reserved by the OS (e.g. Windows excluded port ranges) fail the IPv4 bind and count as busy.
+///
+/// Not detected: a listener on one specific non-loopback address (e.g. `192.168.1.10:<port>`) on
+/// Windows, where binding the wildcard address still succeeds next to it.
 pub fn is_free(port: u16) -> bool {
     let v4 = [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED];
     if !v4
@@ -216,15 +278,16 @@ pub fn is_free(port: u16) -> bool {
     {
         return false;
     }
-    // IPv6 may be disabled; only an address that exists can prove the port busy.
+    // IPv6 may be disabled or unsupported, which surfaces as various errors depending on the
+    // platform (address not available, address family not supported). Only "in use" proves busy.
     [Ipv6Addr::LOCALHOST, Ipv6Addr::UNSPECIFIED]
         .iter()
-        .all(
-            |ip| match TcpListener::bind(SocketAddr::from((*ip, port))) {
-                Ok(_) => true,
-                Err(e) => e.kind() == std::io::ErrorKind::AddrNotAvailable,
-            },
-        )
+        .all(|ip| {
+            !matches!(
+                TcpListener::bind(SocketAddr::from((*ip, port))),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+            )
+        })
 }
 
 #[cfg(test)]
@@ -284,17 +347,32 @@ mod tests {
     }
 
     #[test]
-    fn busy_ports_are_skipped_and_stale_registrations_replaced() {
+    fn owner_keeps_its_port_while_its_service_listens() {
         let (_dir, reg) = registry();
         let first = reg
             .allocate_with("p", "web", [20000, 20003], |_| true)
             .unwrap();
-        // Someone else took the port meanwhile: a new one is chosen, the old entry is gone.
-        let second = reg
+        // A repeated `up`: the port is busy because our own service listens on it.
+        let again = reg
             .allocate_with("p", "web", [20000, 20003], |p| p != first)
             .unwrap();
-        assert_ne!(first, second);
-        assert_eq!(reg.list().unwrap().len(), 1);
+        assert_eq!(first, again);
+        assert_eq!(reg.registered("p", "web").unwrap(), Some(first));
+        assert_eq!(reg.registered("p", "vite").unwrap(), None);
+    }
+
+    #[test]
+    fn busy_ports_are_skipped_and_out_of_range_registrations_replaced() {
+        let (_dir, reg) = registry();
+        let first = reg
+            .allocate_with("q", "web", [20000, 20003], |_| true)
+            .unwrap();
+        // A new owner never gets a busy or registered port.
+        let other = reg
+            .allocate_with("p", "web", [20000, 20003], |port| port != 20001)
+            .unwrap();
+        assert!(other != first && other != 20001);
+        reg.release("q", "web").unwrap();
         // A changed range drops a registration outside it.
         let third = reg
             .allocate_with("p", "web", [20010, 20010], |_| true)
@@ -348,11 +426,44 @@ mod tests {
         if busy == u16::MAX {
             return;
         }
-        // The range holds the busy port and one more; the busy one must never be returned.
+        // The range holds the busy port and one more; the busy one must never be returned,
+        // whether or not the neighbour happens to be free on this machine.
         let got = reg.allocate("p", "web", [busy, busy + 1]);
-        if let Ok(port) = got {
-            assert_eq!(port, busy + 1);
-        }
+        assert!(!matches!(got, Ok(port) if port == busy), "got {got:?}");
+    }
+
+    #[test]
+    fn damaged_registry_is_set_aside() {
+        let (dir, reg) = registry();
+        fs::write(dir.path().join("ports.json"), b"").unwrap();
+        assert_eq!(reg.release("p", "web").unwrap(), None);
+        assert!(dir.path().join("ports.json.corrupt").exists());
+        assert!(
+            reg.allocate_with("p", "web", [20000, 20001], |_| true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn lock_times_out_instead_of_hanging() {
+        let (dir, reg) = registry();
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join("ports.lock"))
+            .unwrap();
+        holder.lock().unwrap();
+        let reg = Registry {
+            lock_timeout: Duration::from_millis(100),
+            ..reg
+        };
+        let started = Instant::now();
+        let err = reg.list().unwrap_err();
+        assert!(format!("{err:#}").contains("locked by another bp"));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(holder);
+        assert!(reg.list().is_ok());
     }
 
     #[test]
