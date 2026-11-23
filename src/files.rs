@@ -1051,6 +1051,25 @@ mod tests {
     }
 
     #[test]
+    fn template_escapes_literal_braces() {
+        let t = tree();
+        write(
+            &t.main.join("fmt.json"),
+            "{\"format\":\"{{{{.Names}} {{port.web}}\",\"x\":{\"y\":{\"z\":{}}}}\n",
+        );
+        let mut s = template("fmt.json");
+        s.replace = vec![Replace {
+            find: "\"x\"".into(),
+            with: "\"{{{{x}}\"".into(),
+        }];
+        up(&t, &s);
+        assert_eq!(
+            fs::read_to_string(t.wt.join("fmt.json")).unwrap(),
+            "{\"format\":\"{{.Names}} 8003\",\"{{x}}\":{\"y\":{\"z\":{}}}}\n"
+        );
+    }
+
+    #[test]
     fn template_without_vars_keeps_braces() {
         let t = tree();
         write(

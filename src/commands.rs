@@ -395,6 +395,64 @@ mod tests {
     }
 
     #[test]
+    fn go_template_arguments_pass_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let create = strings(&[
+            "docker",
+            "inspect",
+            "-f",
+            "{{{{.Config.Image}}",
+            "{{{{command.app.stdout}}",
+            "bp-{{pod.id}}",
+        ]);
+        let destroy = strings(&["docker", "rm", "-f", "--filter", "{{{{command.app.stdout}}"]);
+        let plan = plan(&spec("app", create, Some(destroy)), dir.path(), &vars()).unwrap();
+        assert_eq!(
+            plan.record.create,
+            strings(&[
+                "docker",
+                "inspect",
+                "-f",
+                "{{.Config.Image}}",
+                "{{command.app.stdout}}",
+                "bp-feature-x-1a2b3c4d",
+            ])
+        );
+        // An escaped reference to its own output is not one: `destroy` is known at intent time.
+        assert_eq!(
+            plan.record.destroy.unwrap(),
+            strings(&["docker", "rm", "-f", "--filter", "{{command.app.stdout}}"])
+        );
+
+        let err = super::plan(
+            &spec(
+                "app",
+                strings(&["docker", "inspect", "-f", "{{.Id}}"]),
+                None,
+            ),
+            dir.path(),
+            &vars(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("literal"), "{err:#}");
+    }
+
+    #[test]
+    fn literal_braces_survive_deferred_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        fs::write(&out, "abc123\n").unwrap();
+        let destroy = strings(&["docker", "rm", "{{{{.Id}}={{command.app.stdout}}"]);
+        let plan = plan(&spec("app", cat(&out), Some(destroy)), dir.path(), &vars()).unwrap();
+        assert!(plan.record.destroy_unresolved.is_some());
+        let record = create(&plan).unwrap().record;
+        assert_eq!(
+            record.destroy.unwrap(),
+            strings(&["docker", "rm", "{{.Id}}=abc123"])
+        );
+    }
+
+    #[test]
     fn several_lines_are_kept_unless_destroy_needs_them() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out.txt");
