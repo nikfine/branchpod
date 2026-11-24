@@ -42,7 +42,8 @@ fn setup(base: &Path, home: &Path) -> Setup {
     fs::write(main.join("url.txt"), "pod {{pod.id}}").unwrap();
     fs::write(main.join("branchpod.local.toml"), CONFIG).unwrap();
     Setup {
-        home: home.to_path_buf(),
+        // As `bp` spells it: the build directory may be given with `/` on Windows.
+        home: dunce::canonicalize(home).unwrap(),
         worktree,
     }
 }

@@ -510,7 +510,7 @@ fn remove_inner(
         saved.discard_unfinished(target)?;
         match fs::symlink_metadata(target) {
             Ok(_) => kept.push(target.clone()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if saved::is_absent(&e) => {}
             Err(e) => {
                 return Err(e).with_context(|| format!("cannot read {}", target.display()));
             }

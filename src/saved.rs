@@ -45,7 +45,7 @@ impl Saved {
         for n in 1.. {
             let target = self.pod.join(&run).join(relative);
             match fs::symlink_metadata(&target) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(target),
+                Err(e) if is_absent(&e) => return Ok(target),
                 Ok(_) => run = format!("{}-{n}", self.run),
                 Err(e) => {
                     return Err(e).with_context(|| format!("cannot read {}", target.display()));
@@ -108,8 +108,12 @@ impl Saved {
             return Ok(());
         }
         let part = part(target);
-        fsutil::remove_file_if_exists(&part)
-            .with_context(|| format!("cannot remove {}", part.display()))
+        match fsutil::remove_file_if_exists(&part) {
+            Err(e) if !is_absent(&e) => {
+                Err(e).with_context(|| format!("cannot remove {}", part.display()))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The directories above `target`, each closed to other users (edited copies may hold secrets).
@@ -127,6 +131,15 @@ impl Saved {
         }
         Ok(())
     }
+}
+
+/// Whether `e` says that there is nothing at a path. On Unix, a file in place of one of its
+/// directories is an error of its own; on Windows it is not.
+pub(crate) fn is_absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 /// Whether `path` consists of names only: not empty, relative, and no `..`.
