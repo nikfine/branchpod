@@ -499,7 +499,7 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::test_support::{TREE_ENV, tree};
-    use crate::test_support::{fail, launcher, long_running};
+    use crate::test_support::{fail, launcher, long_running, read_log, wait_for_log};
 
     struct Running {
         _tmp: tempfile::TempDir,
@@ -542,27 +542,6 @@ mod tests {
         };
         let data = request(&r.endpoint, &Request::Start(start))?;
         Ok(serde_json::from_value(data)?)
-    }
-
-    /// Lossy: `cmd` writes in the OEM code page.
-    fn read_log(path: &Path) -> String {
-        fs::read(path)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
-    }
-
-    fn wait_for_log(path: &Path, text: &str) {
-        for _ in 0..400 {
-            if read_log(path).contains(text) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!(
-            "{} never contained {text:?}: {:?}",
-            path.display(),
-            read_log(path)
-        );
     }
 
     #[test]
@@ -818,7 +797,18 @@ mod tests {
         let r = running();
         proc::kill(r.process).unwrap();
         assert!(proc::wait_gone(r.process, Duration::from_secs(5)));
-        let err = request(&r.endpoint, &Request::Status).unwrap_err();
+        // On Unix a killed process can count as gone while its files are still open: on Linux while
+        // any thread but the first is exiting, on macOS (by the kernel source) in any case. Until
+        // they are closed connecting works, and the channel breaks. An answer is never right.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = loop {
+            let err = request(&r.endpoint, &Request::Status).unwrap_err();
+            let broken = !is_unreachable(&err) && !is_answer(&err);
+            if !(cfg!(unix) && broken && Instant::now() < deadline) {
+                break err;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         // On Unix the socket file of a killed supervisor stays: connecting is refused.
         assert!(is_unreachable(&err), "{err:#}");
     }

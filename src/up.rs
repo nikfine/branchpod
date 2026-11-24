@@ -462,7 +462,7 @@ fn listing(resources: &[ResourceState]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{fail, git_ok, launcher, long_running, reap_pod};
+    use crate::test_support::{fail, git_ok, launcher, long_running, reap_pod, wait_for_log};
     use std::fs;
 
     struct Repo {
@@ -840,13 +840,7 @@ mod tests {
 
         let meta = r.store.find_by_worktree(&r.linked).unwrap().unwrap();
         let log = services::log_path(&r.store.pod_dir(&meta.id), "web");
-        for _ in 0..400 {
-            if fs::read_to_string(&log).is_ok_and(|s| s.contains("web-up")) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        assert!(fs::read_to_string(&log).unwrap().contains("web-up"));
+        wait_for_log(&log, "web-up");
 
         let teardown = crate::down::teardown(&r.store, &meta).unwrap();
         assert!(teardown.is_clean(), "{teardown:?}");
@@ -879,6 +873,9 @@ mod tests {
         let _reaper = reap_pod(&r.store, &pod::pod_id(&r.linked));
         result.unwrap();
         let (sup, web) = (process(Kind::Supervisor), process(Kind::Service));
+        // From then on the service writes nothing, so on Unix it outlives the supervisor.
+        let pod_dir = r.store.pod_dir(&pod::pod_id(&r.linked));
+        wait_for_log(&services::log_path(&pod_dir, "web"), "web-up");
         // `down` right after it, without waiting for anything to be gone.
         crate::proc::kill(sup).unwrap();
         down();

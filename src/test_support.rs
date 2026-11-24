@@ -147,3 +147,24 @@ pub(crate) fn long_running(marker: &str) -> Vec<String> {
         ]
     }
 }
+
+/// Lossy: `cmd` writes in the OEM code page.
+pub(crate) fn read_log(path: &Path) -> String {
+    std::fs::read(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn wait_for_log(path: &Path, text: &str) {
+    for _ in 0..400 {
+        if read_log(path).contains(text) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "{} never contained {text:?}: {:?}",
+        path.display(),
+        read_log(path)
+    );
+}
