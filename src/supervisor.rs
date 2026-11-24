@@ -219,6 +219,12 @@ impl Launcher {
         }
     }
 
+    /// What it starts for `endpoint`.
+    #[cfg(all(test, unix))]
+    fn program(&self, endpoint: &str) -> Program {
+        (self.build)(endpoint)
+    }
+
     /// Fails if it is already clear that a supervisor would be killed together with the caller.
     /// For before anything is created; the supervisor checks again, and more precisely.
     pub(crate) fn preflight(&self) -> Result<()> {
@@ -481,6 +487,7 @@ fn prepare(endpoint: &str, check: TetherCheck) -> Result<(Server, ProcId, Option
     // Before `contain`: what we are in now is what the caller left us in.
     let warning = check.judge(proc::own_tether)?;
     proc::contain().context("cannot tie services to the supervisor")?;
+    proc::collect_exits().context("cannot collect the exit status of services")?;
     let server = Server::bind(endpoint)?;
     let me = proc::identify(std::process::id()).context("cannot identify own process")?;
     Ok((server, me, warning))
@@ -732,6 +739,37 @@ mod tests {
         let process = start(&r, "web", long_running("web")).unwrap();
         proc::kill(process).unwrap();
         assert_eq!(ended(&r, "web").exit, Exit::Signal(libc::SIGKILL));
+    }
+
+    /// As `nohup`-like wrappers and some daemons leave it to what they start.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_is_noticed_although_the_caller_ignores_sigchld() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let endpoint = control::new_endpoint("test").unwrap();
+        let ignoring = Launcher::unchecked(|endpoint| {
+            let program = launcher().program(endpoint);
+            let script = "trap '' CHLD; exec \"$0\" \"$@\"";
+            let mut args = vec!["-c".into(), script.into(), program.exe.into_os_string()];
+            args.extend(program.args);
+            Program {
+                exe: "/bin/sh".into(),
+                args,
+            }
+        });
+        let process = ignoring
+            .launch(&endpoint, &dir, &dir.join("supervisor.log"))
+            .unwrap()
+            .process;
+        let r = Running {
+            _tmp: tmp,
+            dir,
+            endpoint,
+            process,
+        };
+        start(&r, "short", short_running(3)).unwrap();
+        assert_eq!(ended(&r, "short").exit, Exit::Code(3));
     }
 
     #[test]

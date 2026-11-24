@@ -69,6 +69,16 @@ impl LeaderExit {
     }
 }
 
+/// `SIGCHLD` may be ignored, which survives `exec`: the system then reaps our children, and their
+/// status is lost.
+pub(crate) fn collect_exits() -> io::Result<()> {
+    // SAFETY: plain system call; no handler is installed.
+    if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Not yet: #15 (Linux), #16 (macOS).
 pub(crate) fn contain() -> io::Result<()> {
     Ok(())

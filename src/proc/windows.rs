@@ -139,6 +139,11 @@ impl LeaderExit {
     }
 }
 
+/// Always possible.
+pub(crate) fn collect_exits() -> io::Result<()> {
+    Ok(())
+}
+
 /// Puts this process into a job of its own. The only handle to it is ours, is not inherited and
 /// is never closed: the system closes it when we end, and then kills what is in the job. The job
 /// does not allow breakaway.

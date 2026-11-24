@@ -102,6 +102,12 @@ impl LeaderExit {
     }
 }
 
+/// Makes sure that the exit status of what this process starts can be collected, whatever the caller
+/// left us with. For the supervisor, before it starts anything.
+pub(crate) fn collect_exits() -> io::Result<()> {
+    sys::collect_exits()
+}
+
 /// Ties whatever this process starts from now on to its own life, where the platform can: on
 /// Windows they are killed when it ends, however it ends.
 pub(crate) fn contain() -> io::Result<()> {
