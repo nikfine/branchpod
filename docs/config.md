@@ -233,8 +233,8 @@ A long-running process. All services of a pod run under one supervisor process, 
 | `cwd` | string | the root | Working directory, relative to the root of the worktree. Same rules as a file path: not a template, stays inside. It must exist when the service starts. Use `/`. |
 | `env` | table of strings | `{}` | Added to the environment of `up`. Variables are substituted in the values. Not recorded. |
 
-`up` returns once the process exists, not once it is ready. A service that exits is not restarted. Standard input is
-closed; stdout and stderr go to one log, shown by `branchpod logs <name>`, which keeps about 30 MB.
+`up` returns once the process exists, not once it is ready. A service that exits is not restarted; `status`
+shows it. Standard input is closed; stdout and stderr go to one log, shown by `branchpod logs <name>`, which keeps about 30 MB.
 
 `down` stops a service with what it started. On Windows that is the whole process tree, at once. On macOS and Linux
 it is the process group, with `SIGTERM`, then `SIGKILL` after 10 seconds: a process that left the group (`setsid`)

@@ -29,7 +29,7 @@ service = [{ name = "web", run = ["your-dev-server", "--port", "{{port.web}}"] }
 ```
 
 - `branchpod up ../feature` creates everything the config describes.
-- `branchpod status ../feature` shows what is recorded.
+- `branchpod status ../feature` shows what is there, whether it still runs, and what to do if not.
 - `branchpod logs web ../feature` prints the output of a service.
 - `branchpod down ../feature` removes everything that was created.
 

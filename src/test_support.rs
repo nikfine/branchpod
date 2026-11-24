@@ -152,6 +152,17 @@ pub(crate) fn long_running(marker: &str) -> Vec<String> {
     }
 }
 
+/// Runs for a few seconds, prints a line and exits with `code`.
+pub(crate) fn short_running(code: i32) -> Vec<String> {
+    if cfg!(windows) {
+        let script = format!("ping -n 4 127.0.0.1 > nul& echo last words& exit {code}");
+        vec!["cmd".into(), "/d".into(), "/c".into(), script]
+    } else {
+        let script = format!("sleep 3; echo last words; exit {code}");
+        vec!["sh".into(), "-c".into(), script]
+    }
+}
+
 /// Lossy: `cmd` writes in the OEM code page.
 pub(crate) fn read_log(path: &Path) -> String {
     std::fs::read(path)

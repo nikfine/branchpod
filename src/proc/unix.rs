@@ -22,6 +22,10 @@ impl Tree {
         &mut self.0
     }
 
+    pub(crate) fn leader_exit(&self) -> io::Result<LeaderExit> {
+        Ok(LeaderExit(self.0.id()))
+    }
+
     /// Once the leader is reaped its pid may be reused, so what is left of its tree is then
     /// stopped by its recorded identity, never by the bare pid.
     pub(crate) fn stop(&mut self, leader: ProcId, grace: Duration) -> io::Result<()> {
@@ -31,6 +35,48 @@ impl Tree {
             stop_tree(&mut self.0, grace)
         }
     }
+}
+
+/// A pid of a child of ours.
+pub(crate) struct LeaderExit(u32);
+
+impl LeaderExit {
+    /// Leaves the child a zombie (`WNOWAIT`), so this does not race with who reaps it: that one
+    /// gets the status, and if it came first there is no such child any more. Should the pid be
+    /// reused for another child just then, this waits for that one, which harms nobody.
+    pub(crate) fn wait(self) -> io::Result<()> {
+        loop {
+            // SAFETY: plain data for which zeroes are valid, filled in by the call.
+            let done = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                libc::waitid(
+                    libc::P_PID,
+                    self.0 as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if done == 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::ECHILD) => return Ok(()),
+                _ => return Err(e),
+            }
+        }
+    }
+}
+
+/// `SIGCHLD` may be ignored, which survives `exec`: the system then reaps our children, and their
+/// status is lost.
+pub(crate) fn collect_exits() -> io::Result<()> {
+    // SAFETY: plain system call; no handler is installed.
+    if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Not yet: #15 (Linux), #16 (macOS).

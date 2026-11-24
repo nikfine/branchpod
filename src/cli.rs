@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::ledger::{Kind, ResourceState, Status};
 use crate::logs::read;
 use crate::proc::{self, ProcId};
-use crate::{config, console, down, fsutil, pod, services, supervisor, up, worktree};
+use crate::{config, console, down, fsutil, pod, services, status, supervisor, up, worktree};
 
 /// Version of the `--json` output. Part of the public API: bump on breaking changes.
 const JSON_SCHEMA: u32 = 1;
@@ -20,6 +20,11 @@ const JSON_SCHEMA: u32 = 1;
 /// Exit code of `bp down` when resources are left behind. 1 means teardown could not run at all;
 /// 2 is taken by usage errors.
 const EXIT_LEFTOVERS: u8 = 3;
+
+/// Exit codes of `bp status` when the pod is not healthy. Two, because what to do differs: take a
+/// degraded pod down, but wait for whoever works on a busy one.
+const EXIT_DEGRADED: u8 = 4;
+const EXIT_BUSY: u8 = 5;
 
 /// `bp config`.
 pub fn config(path: Option<&OsStr>, json: bool) -> Result<ExitCode> {
@@ -64,25 +69,78 @@ pub fn up(path: Option<&OsStr>) -> Result<ExitCode> {
 pub fn status(path: Option<&OsStr>, json: bool) -> Result<ExitCode> {
     let store = pod::Store::open()?;
     let (target, meta) = find_pod(&store, path)?;
-    let resources = match &meta {
-        Some(m) => store.resources(&m.id)?,
-        None => Vec::new(),
+    let report = match meta {
+        Some(meta) => status::look(
+            &store.pod_dir(&meta.id),
+            || read_pod(&store, &meta.id),
+            |sure| at_work(&store, &meta.id, sure),
+        )?,
+        None => None,
+    };
+    let Some(report) = report else {
+        if json {
+            let out = json!({
+                "schema": JSON_SCHEMA, "pod": null, "resources": [], "health": null,
+            });
+            print_out(&serde_json::to_string_pretty(&out)?)?;
+        } else {
+            print_out(&format!("no pod for {}", target.display()))?;
+        }
+        return Ok(ExitCode::SUCCESS);
     };
     if json {
-        let out = json!({ "schema": JSON_SCHEMA, "pod": meta, "resources": resources });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        let out = json!({
+            "schema": JSON_SCHEMA,
+            "pod": report.pod,
+            "resources": report.resources,
+            "health": report.health,
+        });
+        print_out(&serde_json::to_string_pretty(&out)?)?;
     } else {
-        match &meta {
-            None => println!("no pod for {}", target.display()),
-            Some(m) => {
-                println!("pod {} ({})", m.id, m.worktree.display());
-                for r in &resources {
-                    println!("  {:<10} {:<24} {}", r.kind, r.name, r.status);
-                }
-            }
-        }
+        print_out(report.text(supervisor::now_ms()).trim_end())?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(match report.health.state {
+        status::Health::Healthy => ExitCode::SUCCESS,
+        status::Health::Degraded => ExitCode::from(EXIT_DEGRADED),
+        status::Health::Busy => ExitCode::from(EXIT_BUSY),
+    })
+}
+
+/// Prints `text` and a newline. Whoever does not want to read all of it (`| head`) need not.
+fn print_out(text: &str) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    match writeln!(out, "{text}").and_then(|()| out.flush()) {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+/// The `bp` that works on the pod, if any. Its record is enough to look closer; without one a free
+/// lock is taken for a moment only to be `sure`.
+fn at_work(store: &pod::Store, id: &str, sure: bool) -> Option<String> {
+    let holder = store.holder(id);
+    if !(sure || holder.is_some()) || !store.is_pod_locked(id) {
+        return None;
+    }
+    Some(holder.map_or_else(|| "another bp process".to_owned(), |h| h.to_string()))
+}
+
+/// What is recorded about pod `id`; `None` if it is torn down.
+fn read_pod(store: &pod::Store, id: &str) -> Result<Option<status::Recorded>> {
+    let Some(meta) = store.meta(id)? else {
+        return Ok(None);
+    };
+    let resources = read_resources(store, &meta)?;
+    // Not the pod that `meta` says any more: its state has just been removed.
+    if resources.is_empty() && !is_there(store, &meta) {
+        return Ok(None);
+    }
+    Ok(Some(status::Recorded { meta, resources }))
+}
+
+/// Whether the pod still exists.
+fn is_there(store: &pod::Store, meta: &pod::PodMeta) -> bool {
+    store.pod_dir(&meta.id).join("pod.json").exists()
 }
 
 /// `bp down`.
@@ -210,7 +268,7 @@ fn print_logs(
             .map(|r| r.name.as_str())
             .collect();
         if known.is_empty() {
-            if !store.pod_dir(&meta.id).join("pod.json").exists() {
+            if !is_there(&store, &meta) {
                 bail!("no pod for {}", target.display());
             }
             bail!("pod {} has no services", meta.id);
@@ -302,7 +360,7 @@ fn read_resources(store: &pod::Store, meta: &pod::PodMeta) -> Result<Vec<Resourc
     match fsutil::retry_any(|| store.resources(&meta.id)) {
         Ok(resources) => Ok(resources),
         // Read in the middle of the removal of the pod's state.
-        Err(_) if !store.pod_dir(&meta.id).join("pod.json").exists() => Ok(Vec::new()),
+        Err(_) if !is_there(store, meta) => Ok(Vec::new()),
         Err(e) => Err(e),
     }
 }
@@ -491,6 +549,22 @@ mod tests {
             await_record("web", reads(answers), || false).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn a_pod_without_resources_is_still_a_pod() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = pod::Store::at(dir.path().to_path_buf());
+        assert!(read_pod(&store, "p").unwrap().is_none());
+        let meta = json!({ "v": 1, "id": "p", "worktree": "/wt", "unfinished": "up" });
+        let meta = serde_json::from_value(meta).unwrap();
+        store.write_meta(&meta).unwrap();
+        let pod = read_pod(&store, "p").unwrap().unwrap();
+        assert_eq!((pod.meta, pod.resources), (meta, vec![]));
+        // Its removal was interrupted before the last file.
+        std::fs::write(store.ledger_path("p"), "").unwrap();
+        std::fs::remove_file(store.pod_dir("p").join("pod.json")).unwrap();
+        assert!(read_pod(&store, "p").unwrap().is_none());
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //!
 //! A service's stdout and stderr are one pipe, which the supervisor reads into the service's log
 //! file ([`crate::logs::pump`]); should the supervisor die, the service fails to write. Services are
-//! not restarted; one that exits keeps its exit status until it is stopped.
+//! not restarted; one that exits keeps its exit status, and when that was, until it is stopped.
 //!
 //! The protocol is internal (the same binary on both ends) and carries a version anyway, so that a
 //! supervisor left running by an older `bp` is detected rather than misread.
@@ -19,7 +19,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -28,7 +31,7 @@ use serde_json::Value;
 use crate::commands;
 use crate::control::{self, Conn, Server};
 use crate::logs::pump::Pump;
-use crate::proc::{self, ProcId, Program, Tether, Tree};
+use crate::proc::{self, LeaderExit, ProcId, Program, Tether, Tree};
 
 /// How long a stopped service gets to exit before it is killed.
 pub(crate) const GRACE: Duration = Duration::from_secs(10);
@@ -89,8 +92,50 @@ pub(crate) struct ServiceStatus {
     pub(crate) name: String,
     pub(crate) process: ProcId,
     /// `None` while it runs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ended: Option<Ended>,
+    /// Set instead of `ended` by a supervisor of an older version: text of the platform.
+    #[serde(default, skip_serializing)]
     pub(crate) exit: Option<String>,
+}
+
+/// How and when a service exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Ended {
+    pub(crate) exit: Exit,
+    /// Milliseconds since the Unix epoch.
+    pub(crate) at_ms: u64,
+}
+
+/// How a process exited: `{"code": 1}` or `{"signal": 9}`. Part of the public `--json` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Exit {
+    /// On Windows the code as a signed number: an NTSTATUS such as 0xc000013a is negative.
+    Code(i32),
+    /// Unix only.
+    Signal(i32),
+}
+
+impl From<ExitStatus> for Exit {
+    fn from(status: ExitStatus) -> Exit {
+        #[cfg(unix)]
+        if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+            return Exit::Signal(signal);
+        }
+        // A process that has exited without a signal has a code.
+        Exit::Code(status.code().unwrap_or_default())
+    }
+}
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Exit::Code(code) if *code < 0 => write!(f, "code {code}, {code:#010x}"),
+            Exit::Code(code) => write!(f, "code {code}"),
+            Exit::Signal(signal) => write!(f, "signal {signal}"),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,6 +217,12 @@ impl Launcher {
             build: Box::new(build),
             check: TetherCheck::Off,
         }
+    }
+
+    /// What it starts for `endpoint`.
+    #[cfg(all(test, unix))]
+    fn program(&self, endpoint: &str) -> Program {
+        (self.build)(endpoint)
     }
 
     /// Fails if it is already clear that a supervisor would be killed together with the caller.
@@ -262,6 +313,41 @@ pub(crate) fn request(endpoint: &str, request: &Request) -> Result<Value> {
     }
 }
 
+/// Asks the supervisor at `endpoint` for its services and gives up with [`NoAnswer`] after `limit`.
+///
+/// The whole request runs on a thread of its own that is left behind then: a supervisor that hangs
+/// can block connecting (a full backlog, no free pipe instance) and writing as well as reading, and
+/// not all of these can be given a time limit. For a process that is about to end.
+pub(crate) fn services_within(endpoint: &str, limit: Duration) -> Result<Vec<ServiceStatus>> {
+    let (sender, receiver) = sync_channel(1);
+    let endpoint = endpoint.to_owned();
+    thread::Builder::new()
+        .name("status request".into())
+        .spawn(move || {
+            let _ = sender.send(request(&endpoint, &Request::Status));
+        })
+        .context("cannot start a thread")?;
+    match receiver.recv_timeout(limit) {
+        Ok(answer) => {
+            serde_json::from_value(answer?).context("unexpected answer from the supervisor")
+        }
+        Err(RecvTimeoutError::Timeout) => Err(NoAnswer(limit).into()),
+        Err(RecvTimeoutError::Disconnected) => bail!("the request was not completed"),
+    }
+}
+
+/// The supervisor did not answer in time.
+#[derive(Debug)]
+pub(crate) struct NoAnswer(Duration);
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no answer within {:?}", self.0)
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
 /// A running supervisor answered that it could not do what it was asked.
 #[derive(Debug)]
 struct Refused(String);
@@ -288,22 +374,57 @@ pub(crate) fn is_unreachable(error: &anyhow::Error) -> bool {
 struct Service {
     tree: Tree,
     process: ProcId,
-    exit: Option<ExitStatus>,
+    ended: Option<Ended>,
+    /// When it exited, in milliseconds since the Unix epoch: set as soon as that happens.
+    ended_at: Arc<OnceLock<u64>>,
     pump: Pump,
 }
 
 impl Service {
-    fn exit(&mut self) -> Option<ExitStatus> {
-        if self.exit.is_none() {
-            self.exit = self.tree.child().try_wait().ok().flatten();
+    fn ended(&mut self) -> Option<Ended> {
+        if self.ended.is_none()
+            && let Ok(Some(status)) = self.tree.child().try_wait()
+        {
+            self.ended = Some(Ended {
+                exit: status.into(),
+                // Not noted yet if it exited just now.
+                at_ms: *self.ended_at.get_or_init(now_ms),
+            });
         }
-        self.exit
+        self.ended
     }
 
     /// Stops its process tree, also what is left of it once the service process has exited.
     fn stop(&mut self) -> io::Result<()> {
         self.tree.stop(self.process, GRACE)
     }
+}
+
+/// Starts noting when `exit` happens. Should that fail, the time is when somebody asks.
+fn watch(name: &str, exit: io::Result<LeaderExit>) -> Arc<OnceLock<u64>> {
+    let at = Arc::new(OnceLock::new());
+    let noted = Arc::clone(&at);
+    let watching = exit.and_then(|exit| {
+        thread::Builder::new()
+            .name("service exit".into())
+            .spawn(move || {
+                if exit.wait().is_ok() {
+                    let _ = noted.set(now_ms());
+                }
+            })
+    });
+    if let Err(e) = watching {
+        eprintln!("bp supervise: cannot wait for service {name:?} to exit: {e}");
+    }
+    at
+}
+
+/// Now, in milliseconds since the Unix epoch.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The supervisor process: listens on `endpoint` and serves requests until `shutdown`.
@@ -366,6 +487,7 @@ fn prepare(endpoint: &str, check: TetherCheck) -> Result<(Server, ProcId, Option
     // Before `contain`: what we are in now is what the caller left us in.
     let warning = check.judge(proc::own_tether)?;
     proc::contain().context("cannot tie services to the supervisor")?;
+    proc::collect_exits().context("cannot collect the exit status of services")?;
     let server = Server::bind(endpoint)?;
     let me = proc::identify(std::process::id()).context("cannot identify own process")?;
     Ok((server, me, warning))
@@ -414,7 +536,8 @@ fn handle(conn: &Conn, services: &mut BTreeMap<String, Service>) -> Result<(Valu
                 .map(|(name, s)| ServiceStatus {
                     name: name.clone(),
                     process: s.process,
-                    exit: s.exit().map(|status| status.to_string()),
+                    ended: s.ended(),
+                    exit: None,
                 })
                 .collect();
             Ok((serde_json::to_value(list)?, false))
@@ -445,7 +568,7 @@ fn handle(conn: &Conn, services: &mut BTreeMap<String, Service>) -> Result<(Valu
 
 fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Result<ProcId> {
     if let Some(service) = services.get_mut(&start.name)
-        && service.exit().is_none()
+        && service.ended().is_none()
     {
         bail!("service {:?} is already running", start.name);
     }
@@ -477,12 +600,14 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
             start.log.display()
         );
     };
+    let ended_at = watch(&start.name, tree.leader_exit());
     services.insert(
         start.name.clone(),
         Service {
             tree,
             process,
-            exit: None,
+            ended: None,
+            ended_at,
             pump,
         },
     );
@@ -494,7 +619,9 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::test_support::{TREE_ENV, tree};
-    use crate::test_support::{fail, launcher, long_running, read_log, wait_for_log};
+    use crate::test_support::{
+        fail, launcher, long_running, read_log, short_running, wait_for_log,
+    };
 
     struct Running {
         _tmp: tempfile::TempDir,
@@ -550,10 +677,9 @@ mod tests {
         let err = format!("{:#}", start(&r, "web", long_running("x")).unwrap_err());
         assert!(err.contains("already running"), "{err}");
 
-        let status: Vec<ServiceStatus> =
-            serde_json::from_value(request(&r.endpoint, &Request::Status).unwrap()).unwrap();
+        let status = statuses(&r);
         assert_eq!(status.len(), 1);
-        assert_eq!((status[0].process, status[0].exit.as_deref()), (web, None));
+        assert_eq!((status[0].process, status[0].ended), (web, None));
 
         request(&r.endpoint, &Request::Stop { name: "web".into() }).unwrap();
         assert!(proc::wait_gone(web, Duration::from_secs(5)));
@@ -564,6 +690,124 @@ mod tests {
         assert!(proc::wait_gone(r.process, EXIT_WAIT));
         let err = request(&r.endpoint, &Request::Status).unwrap_err();
         assert!(is_unreachable(&err), "{err:#}");
+    }
+
+    fn statuses(r: &Running) -> Vec<ServiceStatus> {
+        services_within(&r.endpoint, Duration::from_secs(10)).unwrap()
+    }
+
+    /// Waits until `name` is reported to have exited.
+    fn ended(r: &Running, name: &str) -> Ended {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let service = statuses(r).into_iter().find(|s| s.name == name).unwrap();
+            if let Some(ended) = service.ended {
+                return ended;
+            }
+            assert!(Instant::now() < deadline, "still running");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn an_exit_is_noted_when_it_happens_not_when_somebody_asks() {
+        let r = running();
+        let before = now_ms();
+        // Long enough not to be a start that failed.
+        let process = start(&r, "short", short_running(3)).unwrap();
+        assert!(proc::wait_gone(process, Duration::from_secs(10)));
+        // A margin: the process can be gone a moment before its exit is noted.
+        let gone = now_ms() + 500;
+        std::thread::sleep(Duration::from_secs(2));
+        let first = ended(&r, "short");
+        assert_eq!(first.exit, Exit::Code(3));
+        assert!(
+            (before..=gone).contains(&first.at_ms),
+            "{before} {} {gone}",
+            first.at_ms
+        );
+        assert_eq!(ended(&r, "short"), first);
+        // It is not running any more, so another one may take its name.
+        start(&r, "short", long_running("again")).unwrap();
+        assert_eq!(statuses(&r)[0].ended, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_service_that_was_killed_ended_with_a_signal() {
+        let r = running();
+        let process = start(&r, "web", long_running("web")).unwrap();
+        proc::kill(process).unwrap();
+        assert_eq!(ended(&r, "web").exit, Exit::Signal(libc::SIGKILL));
+    }
+
+    /// As `nohup`-like wrappers and some daemons leave it to what they start.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_is_noticed_although_the_caller_ignores_sigchld() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let endpoint = control::new_endpoint("test").unwrap();
+        let ignoring = Launcher::unchecked(|endpoint| {
+            let program = launcher().program(endpoint);
+            let script = "trap '' CHLD; exec \"$0\" \"$@\"";
+            let mut args = vec!["-c".into(), script.into(), program.exe.into_os_string()];
+            args.extend(program.args);
+            Program {
+                exe: "/bin/sh".into(),
+                args,
+            }
+        });
+        let process = ignoring
+            .launch(&endpoint, &dir, &dir.join("supervisor.log"))
+            .unwrap()
+            .process;
+        let r = Running {
+            _tmp: tmp,
+            dir,
+            endpoint,
+            process,
+        };
+        start(&r, "short", short_running(3)).unwrap();
+        assert_eq!(ended(&r, "short").exit, Exit::Code(3));
+    }
+
+    #[test]
+    fn an_answer_of_an_older_supervisor_is_understood() {
+        let old = r#"[{ "name": "a", "process": { "pid": 1, "start": 2 }, "exit": null },
+                      { "name": "b", "process": { "pid": 3, "start": 4 }, "exit": "exit code: 1" }]"#;
+        let old: Vec<ServiceStatus> = serde_json::from_str(old).unwrap();
+        assert_eq!((old[0].ended, old[0].exit.as_deref()), (None, None));
+        assert_eq!(
+            (old[1].ended, old[1].exit.as_deref()),
+            (None, Some("exit code: 1"))
+        );
+    }
+
+    #[test]
+    fn exits_are_structured() {
+        let json = |exit| serde_json::to_string(&exit).unwrap();
+        assert_eq!(json(Exit::Code(1)), r#"{"code":1}"#);
+        assert_eq!(json(Exit::Signal(9)), r#"{"signal":9}"#);
+        assert_eq!(Exit::Code(3).to_string(), "code 3");
+        assert_eq!(
+            Exit::Code(0xc000_013a_u32 as i32).to_string(),
+            "code -1073741510, 0xc000013a"
+        );
+    }
+
+    /// Nobody is ever served. On Windows the second one cannot even connect.
+    #[test]
+    fn a_supervisor_that_hangs_is_given_up_on() {
+        let endpoint = control::new_endpoint("test").unwrap();
+        let server = Server::bind(&endpoint).unwrap();
+        for _ in 0..3 {
+            let started = Instant::now();
+            let err = services_within(&endpoint, Duration::from_millis(300)).unwrap_err();
+            assert!(err.downcast_ref::<NoAnswer>().is_some(), "{err:#}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        drop(server);
     }
 
     #[test]

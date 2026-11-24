@@ -25,6 +25,7 @@ mod ports;
 mod proc;
 mod saved;
 mod services;
+mod status;
 mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;

@@ -71,6 +71,31 @@ pub(crate) struct PodMeta {
     pub(crate) worktree: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) main_checkout: Option<PathBuf>,
+    /// Set while `bp up` or `bp down` changes the pod; still set afterwards if it failed or was
+    /// interrupted. The ledger does not tell: what `up` rejects while planning is not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unfinished: Option<Unfinished>,
+}
+
+/// What a pod is in the middle of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Unfinished {
+    Up,
+    Down,
+    /// Written by a newer version. Without it such a pod, and with it every list of pods, could not
+    /// be read.
+    #[serde(other)]
+    Other,
+}
+
+impl PodMeta {
+    pub(crate) fn with(&self, unfinished: Option<Unfinished>) -> PodMeta {
+        PodMeta {
+            unfinished,
+            ..self.clone()
+        }
+    }
 }
 
 /// The `bp` home: `$BRANCHPOD_HOME`, or the platform's local data directory. [`Store::open`] makes
@@ -130,6 +155,19 @@ impl Store {
             .with_context(|| format!("cannot write {}", path.display()))
     }
 
+    /// `None` when there is no pod `id` (any more).
+    pub(crate) fn meta(&self, id: &str) -> Result<Option<PodMeta>> {
+        let path = self.pod_dir(id).join("pod.json");
+        let bytes = match crate::fsutil::retry(|| fs::read(&path)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("cannot parse {}", path.display()))
+    }
+
     pub(crate) fn list(&self) -> Result<Vec<PodMeta>> {
         let dir = self.home.join("pods");
         let entries = match fs::read_dir(&dir) {
@@ -140,7 +178,8 @@ impl Store {
         let mut pods = Vec::new();
         for entry in entries {
             let path = entry?.path().join("pod.json");
-            if let Ok(bytes) = fs::read(&path) {
+            // Being replaced, it may not open for a moment on Windows.
+            if let Ok(bytes) = crate::fsutil::retry(|| fs::read(&path)) {
                 let meta: PodMeta = serde_json::from_slice(&bytes)
                     .with_context(|| format!("cannot parse {}", path.display()))?;
                 pods.push(meta);
@@ -244,6 +283,7 @@ mod tests {
             id: pod_id(&worktree),
             worktree: worktree.clone(),
             main_checkout: None,
+            unfinished: None,
         };
         store.write_meta(&meta).unwrap();
 
@@ -252,5 +292,31 @@ mod tests {
             store.find_by_worktree(&dir.path().join("other")).unwrap(),
             None
         );
+    }
+
+    /// Written by older versions, and read by them: no field is required or refused.
+    #[test]
+    fn only_a_pod_that_is_unfinished_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().to_path_buf());
+        assert_eq!(store.meta("p").unwrap(), None);
+        let meta: PodMeta =
+            serde_json::from_str(r#"{ "v": 1, "id": "p", "worktree": "/wt", "later": 1 }"#)
+                .unwrap();
+        assert_eq!(meta.unfinished, None);
+        let newer = r#"{ "v": 1, "id": "p", "worktree": "/wt", "unfinished": "gc" }"#;
+        let newer: PodMeta = serde_json::from_str(newer).unwrap();
+        assert_eq!(newer.unfinished, Some(Unfinished::Other));
+        store
+            .write_meta(&meta.with(Some(Unfinished::Down)))
+            .unwrap();
+        let text = fs::read_to_string(store.pod_dir("p").join("pod.json")).unwrap();
+        assert!(text.contains(r#""unfinished": "down""#), "{text}");
+        let read = store.meta("p").unwrap().unwrap();
+        assert_eq!(read.unfinished, Some(Unfinished::Down));
+        store.write_meta(&read.with(None)).unwrap();
+        let text = fs::read_to_string(store.pod_dir("p").join("pod.json")).unwrap();
+        assert!(!text.contains("unfinished"), "{text}");
+        assert_eq!(store.meta("p").unwrap(), Some(meta));
     }
 }
