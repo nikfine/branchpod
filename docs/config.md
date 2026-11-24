@@ -1,7 +1,7 @@
 # Configuration
 
 The reference of `branchpod.toml` and `branchpod.local.toml`. A first example is in the
-[README](../README.md#quick-start).
+[getting started guide](getting-started.md).
 
 - [Files and layering](#files-and-layering)
 - [Example](#example)
@@ -11,7 +11,8 @@ The reference of `branchpod.toml` and `branchpod.local.toml`. A first example is
 - [Order](#order)
 - [Errors](#errors)
 
-`branchpod config` prints the effective configuration of a worktree, with its variables not rendered.
+`branchpod config` prints the effective configuration of a worktree. Variables are neither rendered nor checked; `up`
+checks them.
 
 ## Files and layering
 
@@ -21,8 +22,8 @@ The reference of `branchpod.toml` and `branchpod.local.toml`. A first example is
 | `branchpod.local.toml` | the root of the main checkout | git-ignored: personal overrides |
 
 A `branchpod.local.toml` inside a linked worktree is never read. Without a main checkout (a bare repository, a
-separate git dir such as a submodule's) only `branchpod.toml` is read. In the main checkout itself both files come
-from the same directory.
+separate git dir such as a submodule's) only `branchpod.toml` is read, `up` fails if there is a `[[file]]` rule other
+than `ignore`, and `{{main}}` is not available. In the main checkout itself both files come from the same directory.
 
 The local file is layered on top of the project file:
 
@@ -92,6 +93,13 @@ range = [9001, 9020]
 
 ## Keys
 
+| Section | Creates | `down` |
+|---|---|---|
+| `[port.<name>]` | a port from a range, as `{{port.<name>}}` | releases it |
+| `[[file]]` | a file or directory from the main checkout: `copy`, `reflink`, `link`, `template` | removes it |
+| `[[command]]` | whatever the `create` command creates | runs `destroy` |
+| `[[service]]` | a long-running process | stops it, see [below](#service) |
+
 Unknown keys are errors. Names of ports, commands and services match `[a-z][a-z0-9_-]*`, at most 64 characters.
 
 ### `version`
@@ -134,19 +142,25 @@ A file or directory carried over from the main checkout into the worktree.
 
 **Paths** are relative and stay inside: no absolute path, `..` or `:`. `/` and `\` both separate. They are not
 templates: variables are not substituted. A destination may be listed once, and case does not make it another one.
+Rules must not overlap (`a` and `a/b.txt`): whether `up` fails depends on their order and on the source.
 
 **`replace`** rules run after the substitution, in order, each on the result of the one before. `find` is literal
 text and must occur, otherwise it is an error: the source has changed. Every occurrence is replaced. Variables are
 substituted in `with` (also with `vars = false`) but not in `find`.
 
 **Nothing is overwritten.** An existing destination is an error, and nothing is created through a link. Missing
-parent directories are created. In a copied directory, links are recreated as links. With any rule other than
-`ignore`, `up` refuses to run in the main checkout, as every destination is its own source there.
+parent directories are created. In a copied directory, links are recreated as links. Have git ignore the destination,
+or it shows up as untracked. A pattern with a trailing slash (`node_modules/`) matches directories only, not the
+symlink that `link` makes on macOS and Linux: write `node_modules`.
+
+With any rule other than `ignore`, `up` refuses to run in the main checkout, as every destination is its own source
+there.
 
 **Teardown** removes the destination if it is still a file, directory or link as created, and leaves it in place
-(exit code 3) otherwise. Contents are not compared: an edited copy is deleted, and a copied directory goes with all
-that was put into it. A link is removed as a link, never what it points to. Created parent directories are removed
-if they are empty.
+(exit code 3) otherwise, as it does with what is in use on Windows. Contents are not compared: an edited copy is
+deleted, and a copied directory goes with all that was put into it. A file that **you** put at a recorded path, in a
+new worktree at the same place, is deleted as well: run `down` before a path is used again. A link is removed as a
+link, never what it points to. Created parent directories are removed if they are empty.
 
 ### `[[command]]`
 
@@ -163,8 +177,8 @@ Anything created by one command and removed by another: a container, a volume, a
 **How they run.** Without a shell: no pipes, `&&` or `$VAR`. Standard input is closed, the environment is that of
 `up` or `down`. An exit code other than 0 is a failure, and the end of stderr is shown. There is no time limit.
 
-- `create` runs in the root of the worktree. `destroy` too while it exists, otherwise in the state directory: have
-  it use absolute paths, such as `{{main}}`.
+- `create` runs in the root of the worktree. `destroy` too while it exists, otherwise in the
+  [state directory](commands.md#state): have it use absolute paths, such as `{{main}}`.
 - A bare program name is searched on `PATH`. A relative one with a directory (`./scripts/up.sh`) is taken from the
   working directory. On Windows a `.cmd` or `.bat` script is named with its extension (`npx.cmd`), which other
   systems do not have: call the program behind it if the config is to work everywhere.
@@ -216,8 +230,11 @@ A long-running process. All services of a pod run under one supervisor process, 
 | `env` | table of strings | `{}` | Added to the environment of `up`. Variables are substituted in the values. Not recorded. |
 
 `up` returns once the process exists, not once it is ready. A service that exits is not restarted. Standard input is
-closed; stdout and stderr go to one log, shown by `branchpod logs <name>`, which keeps about 30 MB. `down` stops the
-whole process tree: on macOS and Linux with `SIGTERM`, then `SIGKILL` after 10 seconds; on Windows at once.
+closed; stdout and stderr go to one log, shown by `branchpod logs <name>`, which keeps about 30 MB.
+
+`down` stops a service with what it started. On Windows that is the whole process tree, at once. On macOS and Linux
+it is the process group, with `SIGTERM`, then `SIGKILL` after 10 seconds: a process that left the group (`setsid`)
+survives.
 
 ## Variables
 
@@ -231,9 +248,9 @@ whole process tree: on macOS and Linux with `SIGTERM`, then `SIGKILL` after 10 s
 | `{{command.<name>.stdout}}` | Output of an earlier command. |
 | `{{command.<name>.file}}` | File with the output of an earlier command that has `output = "file"`. |
 
-Spaces inside the braces are allowed. A reference to an unknown name is an error, and so is one to a name without a
-value: `branch` on a detached HEAD, `main` without a main checkout, a path that is not UTF-8. A value is not
-substituted again.
+Spaces inside the braces are allowed. A reference to an unknown name is an error, never an empty string, and so is
+one to a name without a value: `branch` on a detached HEAD, `main` without a main checkout, a path that is not
+UTF-8. A value is not substituted again.
 
 | Where | Available |
 |---|---|
@@ -285,13 +302,17 @@ does not stop the others.
 |---|---|
 | `no configuration: neither ... nor ... exists` | There is no `branchpod.toml` in the worktree and no `branchpod.local.toml` in the main checkout. |
 | `is the whole configuration here ... so it must set` | There is only a local file, and it has no `version`. |
+| `no branchpod.toml in` | No main checkout, so only the project file counts, and it is missing. |
+| `did not contain valid UTF-8` | The configuration file is not UTF-8 (`>` in PowerShell 5.1 writes UTF-16). |
 | `unsupported config version` | `version` is not `1`. |
 | `unknown field` | A misspelt key, or one that this build does not know. |
 | `path must be relative`, `path must not contain` | A path that could leave the worktree or the main checkout. |
 | `is listed twice`, `is defined twice` | Two rules for one destination, or two commands or services with one name. |
 | `source ... does not exist` | Missing in the main checkout. Set `optional = true` if it may be. |
 | `already exists; bp does not overwrite` | The destination is there: committed to git, or created by another tool. |
+| `there is no main checkout` | A file rule or `{{main}}` in a bare repository or with a separate git dir. |
 | `is the main checkout` | `up` ran there with file rules. Run it in a linked worktree. |
+| `is not UTF-8 text` | The source of a template is not UTF-8. |
 | `replace rule ... matches nothing` | The source no longer contains the text of `find`. |
 | `unknown variable` | Misspelt, or not available in this place. With a hint at `{{{{` it is probably another tool's template. |
 | `variable ... is not available` | A known name without a value here; the message says why. |
@@ -299,9 +320,10 @@ does not stop the others.
 | `unterminated` | `{{` without `}}`. |
 | `spans several lines or contains a NUL character` | A value used in `destroy` that is more than an id. |
 | `printed nothing`, `printed several lines` | Output that `destroy` needs, or that goes to a file, cannot be used. |
+| `output is not valid UTF-8` | Output of a command without `output = "file"`. |
 | `no free port` | Every port of the range is taken. |
 | `program not found` | Not on `PATH`, or a Windows script without its extension. |
-| `already has resources recorded` | The pod is up, or an earlier `up` failed. Run `down` first. |
+| `already has resources recorded` | The pod is up, or an earlier `up` failed: run `down` first. If the worktree is a new one at a path used before, `down` deletes the files at the recorded paths, even those that are yours: move them away first. |
 | `looks like an unexpanded variable` | The caller passed `%NAME%` or `$NAME` as the path. |
 
-All of them exit with code 1. The other codes are in the [README](../README.md#commands).
+All of them exit with code 1. The other codes are in the [command reference](commands.md).
