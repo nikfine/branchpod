@@ -84,8 +84,8 @@ impl Pod {
     }
 
     /// `bp up` in nested jobs with these limits, outermost first. Its output goes to a file, not
-    /// to a pipe: the wrapper hands `bp` more than one copy of its standard handles, and the
-    /// supervisor may keep one, so that the end of a pipe would not come before its own end.
+    /// to a pipe: the supervisor inherits whatever other inheritable handles `bp` has (#76), and
+    /// with one of them on the pipe, its end would come only with the supervisor's.
     fn up_in(&self, jobs: &[u32]) -> (i32, String) {
         let jobs: Vec<String> = jobs.iter().map(u32::to_string).collect();
         let path = self.home.with_file_name("up.log");

@@ -257,8 +257,25 @@ pub(crate) fn request(endpoint: &str, request: &Request) -> Result<Value> {
     }
     match reply.body {
         Reply::Ok { data } => Ok(data),
-        Reply::Error { message } => Err(anyhow!(message)),
+        Reply::Error { message } => Err(Refused(message).into()),
     }
+}
+
+/// A running supervisor answered that it could not do what it was asked.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Whether `error` is an answer of a running supervisor, not a failure to get one.
+pub(crate) fn is_answer(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Refused>().is_some()
 }
 
 /// Whether `error` means that nothing listens on the supervisor's endpoint.

@@ -127,9 +127,9 @@ pub(crate) fn kill(id: ProcId) -> io::Result<()> {
 
 /// Spawns `cmd` detached from the caller, to outlive it: its own session (Unix); no console
 /// window, its own process group and, where the caller's Job Object allows it, outside that job
-/// (Windows; [`Tether`] tells where it does not). The caller's own standard handles are not
-/// inherited, so a caller waiting for the end of our output (an IDE hook) is not kept waiting by
-/// the detached process.
+/// (Windows; [`Tether`] tells where it does not). Our own standard handles are not inherited,
+/// so that a caller waiting for the end of our output (an IDE hook) is not kept waiting by the
+/// detached process. On Windows any other inheritable handle we have still is (#76).
 pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
     sys::spawn_detached(cmd)
 }

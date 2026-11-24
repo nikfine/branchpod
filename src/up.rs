@@ -124,10 +124,6 @@ pub(crate) fn up(
         }
     }
 
-    if !config.service.is_empty() {
-        launcher.preflight().context("cannot run services")?;
-    }
-
     let id = pod::pod_id(&wt.root);
     let _lock = store.lock_pod(&id, "up", on_wait)?;
 
@@ -143,6 +139,9 @@ pub(crate) fn up(
 
     let mut vars = builtin_vars(&id, wt);
     check(config, wt, main, &vars, &store.pod_dir(&id))?;
+    if !config.service.is_empty() {
+        launcher.preflight().context("cannot run services")?;
+    }
 
     let meta = PodMeta {
         v: META_VERSION,

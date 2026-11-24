@@ -63,8 +63,10 @@ impl Tree {
             .assign(child.as_raw_handle())
             .and_then(|()| resume(child.id()));
         if let Err(e) = started {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Not killed, it stays suspended: waiting for it would never end.
+            if child.kill().is_ok() {
+                let _ = child.wait();
+            }
             return Err(e);
         }
         Ok(Tree { child, job })
@@ -74,21 +76,22 @@ impl Tree {
         &mut self.child
     }
 
-    /// Waits for every process, not only for the job to count none: it stops counting one
-    /// before that process is gone.
+    /// Waits for the processes themselves, not only for the job to count none: it stops counting
+    /// one before that process is gone. One that appears in neither list (created after the first
+    /// and no longer counted by the second, or not to be opened) is only waited for by the count.
     pub(crate) fn stop(&mut self, _leader: ProcId, grace: Duration) -> io::Result<()> {
         let deadline = Instant::now() + grace;
         let left = || deadline.saturating_duration_since(Instant::now());
         loop {
-            let processes = self.job.processes()?;
+            let mut processes = self.job.processes()?;
             self.job.terminate()?;
+            processes.extend(self.job.processes()?);
             let mut alive = 0;
             for process in &processes {
                 if !process.exited_within(left()) {
                     alive += 1;
                 }
             }
-            // One that was being created, or could not be opened, is still counted here.
             let active = self.job.active()?;
             if alive == 0 && active == 0 {
                 break;
@@ -257,12 +260,20 @@ impl Job {
                 }
                 result => result?,
             }
+            let list = buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
             // SAFETY: the call filled in the structure, with this many ids after its header.
-            let ids = unsafe {
-                let list = buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+            let (ids, assigned) = unsafe {
                 let n = (*list).NumberOfProcessIdsInList as usize;
-                std::slice::from_raw_parts((&raw const (*list).ProcessIdList).cast::<usize>(), n)
+                let first = (&raw const (*list).ProcessIdList).cast::<usize>();
+                (
+                    std::slice::from_raw_parts(first, n),
+                    (*list).NumberOfAssignedProcesses as usize,
+                )
             };
+            if ids.len() < assigned && capacity < assigned {
+                capacity = assigned * 2;
+                continue;
+            }
             return Ok(ids
                 .iter()
                 .filter_map(|&pid| Process::open(pid as u32, 0).ok().flatten())
@@ -553,5 +564,28 @@ mod tests {
         child.wait().unwrap();
         stop_recorded_tree(id, Duration::from_secs(10)).unwrap();
         kill(id).unwrap();
+    }
+
+    #[test]
+    fn a_job_with_many_processes_is_listed_whole() {
+        let job = Job::new().unwrap();
+        let mut children: Vec<Child> = (0..70)
+            .map(|_| {
+                Command::new("ping")
+                    .args(["-n", "300", "127.0.0.1"])
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in &children {
+            job.assign(child.as_raw_handle()).unwrap();
+        }
+        let listed = job.processes().unwrap().len();
+        job.terminate().unwrap();
+        for child in &mut children {
+            child.wait().unwrap();
+        }
+        assert_eq!(listed, children.len());
     }
 }

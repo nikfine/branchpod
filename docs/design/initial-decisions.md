@@ -114,9 +114,10 @@ One supervisor process per worktree, no global daemon; control over a local sock
 - **Start.** `bp up` starts it after the commands, only when the config has services, as the hidden
   `bp supervise <endpoint>` of the same binary, detached from the caller: its own session (Unix); no
   console window, its own process group and, when the caller's Job Object allows it, outside that job
-  (Windows; "The caller's Job Object" below is about when it does not). It inherits none of the
-  caller's standard handles: an IDE hook waiting for the end of `bp`'s output must not wait for the
-  supervisor. Its working directory is the `bp` home, never the worktree or the pod directory, which
+  (Windows; "The caller's Job Object" below is about when it does not). `bp`'s
+  standard handles are not inherited: an IDE hook waiting for the end of `bp`'s output must not wait for
+  the supervisor. Known gap on Windows (#76): other inheritable handles of `bp` still are, and some callers
+  leave it one on their output; those do wait. Its working directory is the `bp` home, never the worktree or the pod directory, which
   Windows could then not remove.
 - **Readiness.** The supervisor prints one line once it listens (or why it cannot) and `bp up` reads it.
   No time limit: if the supervisor dies first, the pipe closes and `up` fails.
@@ -195,9 +196,11 @@ One supervisor process per worktree, no global daemon; control over a local sock
   service and its children ("access denied"): nothing that a service starts may outlive it. The exception
   is what others start on its behalf, such as a process created through WMI (`Win32_Process.Create`), which
   is [not in the job](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects); `bp` neither
-  sees nor stops it. A caller's job with UI restrictions cannot be
-  [nested into](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject):
-  services do not start there.
+  sees nor stops it.
+- A caller's job with UI restrictions: nesting into it works on Windows 11 (tried). Microsoft's pages disagree
+  on it ([nested jobs](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs),
+  [AssignProcessToJobObject](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject));
+  other versions are not checked. Where it does not work, the supervisor does not start and says so.
 
 ## Git-ignored files
 

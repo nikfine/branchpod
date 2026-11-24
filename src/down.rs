@@ -184,10 +184,15 @@ fn stop_service(
 /// one that is being killed can outlive it for a moment, and then breaks: that counts only if the
 /// recorded process is gone, too.
 fn is_gone(supervisor: &supervisor::Record, error: &anyhow::Error) -> bool {
-    supervisor::is_unreachable(error)
-        || supervisor
-            .process
-            .is_some_and(|process| proc::wait_gone(process, DYING_WAIT))
+    if supervisor::is_unreachable(error) {
+        return true;
+    }
+    if supervisor::is_answer(error) {
+        return false;
+    }
+    supervisor
+        .process
+        .is_some_and(|process| proc::wait_gone(process, DYING_WAIT))
 }
 
 /// Shuts the supervisor down (it stops whatever still runs) and waits for it to exit; kills it if
