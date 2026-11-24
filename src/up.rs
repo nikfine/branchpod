@@ -842,7 +842,7 @@ mod tests {
         let log = services::log_path(&r.store.pod_dir(&meta.id), "web");
         wait_for_log(&log, "web-up");
 
-        let teardown = crate::down::teardown(&r.store, &meta).unwrap();
+        let teardown = crate::down::teardown(&r.store, &meta, |_, _| ()).unwrap();
         assert!(teardown.is_clean(), "{teardown:?}");
         let order: Vec<&str> = teardown.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(order, ["web", "supervisor", "web"]);
@@ -865,7 +865,7 @@ mod tests {
         };
         let down = || {
             let meta = r.store.find_by_worktree(&r.linked).unwrap().unwrap();
-            let teardown = crate::down::teardown(&r.store, &meta).unwrap();
+            let teardown = crate::down::teardown(&r.store, &meta, |_, _| ()).unwrap();
             assert!(teardown.is_clean(), "{teardown:?}");
         };
 
@@ -912,7 +912,7 @@ mod tests {
         assert!(format!("{err:#}").contains("program not found"), "{err:#}");
 
         let meta = r.store.find_by_worktree(&r.linked).unwrap().unwrap();
-        let teardown = crate::down::teardown(&r.store, &meta).unwrap();
+        let teardown = crate::down::teardown(&r.store, &meta, |_, _| ()).unwrap();
         assert!(teardown.is_clean(), "{teardown:?}");
     }
 

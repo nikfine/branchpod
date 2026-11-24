@@ -300,19 +300,24 @@ shown as `saved`, its new path printed on stderr, and the exit code stays `0`.
   that matters in a rule of its own.
 - **Keeping.** The new path is recorded in the ledger (`moved`) before the file is moved. On the same volume
   that is a rename. Otherwise the file is copied under another name, flushed, renamed, and the original
-  removed unless it was written to meanwhile. Nothing in `saved` is ever overwritten. The run that finishes
-  after an interruption reports the path again.
+  removed unless it was written to meanwhile. Nothing in `saved` is ever overwritten.
+- **Telling.** The path is printed as soon as the file is kept and before the ledger counts it as destroyed, so
+  a run that is killed is made up for by the next one. The run that leaves nothing behind prints once more
+  what earlier runs of this teardown kept: their output may have been lost.
 - If the file cannot be kept (a full disk, a file in use), it stays and the exit code is `3`; a later `down`
   tries again. To give the edit up, delete the file.
 - An unchanged file is looked at again (size, modification time) right before each attempt to remove it. What
   is left is the moment in between.
+- A template whose `up` was interrupted while writing it differs from what was to be written, so it is kept, too.
 - A record without a fingerprint (from an older `bp`, or a copy that was interrupted) is removed as before,
   whatever its content. An older `bp` ignores the fingerprint and deletes edited copies.
-- **Secrets.** Contents are never printed. The fingerprint stays in the ledger and is left out of
-  `bp status --json`: the hash of a short secret gives it away. The directories in `saved` have mode 0700 on
-  Unix and inherit the permissions of the `bp` home on Windows. A file moved within a volume keeps its own
-  permissions, on Windows also those it inherited in the worktree (tried on NTFS); a copy from another
-  volume gets the mode of the file on Unix and the permissions of `saved` on Windows.
+- **Secrets.** Contents are never printed. The fingerprint stays in the ledger and is left out of `bp status
+  --json`: the hash of a short secret gives it away. (A `bp` from before the fingerprint prints all of a
+  newer record, hash included.) The ledger has mode 0600 on Unix, for the same reason. The directories in
+  `saved` have mode 0700 on Unix and inherit the permissions of the `bp` home on Windows. A file moved
+  within a volume keeps its own permissions, on Windows also those it inherited in the worktree (tried on
+  NTFS); a copy from another volume gets the mode of the file on Unix and the permissions of `saved` on
+  Windows.
 - `down` never cleans `saved` up, not even by age: that would be the loss of the edits put off. It is a task
   for `gc` (#20).
 

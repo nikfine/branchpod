@@ -2,9 +2,8 @@
 //!
 //! `saved/<pod id>/<time of the teardown>/<path in the worktree>` in the `bp` home, outside the pod's
 //! state, which goes with the pod. Nothing here is ever overwritten or removed by teardown, except
-//! for an unfinished copy of its own.
+//! for `saved/<pod id>/unfinished`, the copy an interrupted run was writing.
 
-use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -13,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::{fsutil, inuse};
+
+const UNFINISHED: &str = "unfinished";
 
 /// Where one run of teardown keeps the edited copies of a pod.
 pub(crate) struct Saved {
@@ -70,18 +71,23 @@ impl Saved {
     ) -> Result<()> {
         self.create_parents(target)?;
         match fsutil::retry(|| rename(from, target)) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // It has been moved: too late to fail.
+                let _ = fsutil::sync_parent(target);
+                return Ok(());
+            }
             Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
             Err(e) => return Err(inuse::error(from, e)),
         }
 
         // Another volume: a complete copy on disk first, only then the original goes.
         let before = Stamp::of(&fs::symlink_metadata(from)?);
-        let part = part(target);
-        fsutil::remove_file_if_exists(&part)?;
-        let copied = copy(from, &part).and_then(|()| fsutil::retry(|| fs::rename(&part, target)));
+        let unfinished = self.unfinished();
+        fsutil::remove_file_if_exists(&unfinished)?;
+        let copied = copy(from, &unfinished)
+            .and_then(|()| fsutil::retry(|| fs::rename(&unfinished, target)));
         if let Err(e) = copied {
-            let _ = fsutil::remove_file_if_exists(&part);
+            let _ = fsutil::remove_file_if_exists(&unfinished);
             return Err(e).with_context(|| format!("cannot copy it to {}", target.display()));
         }
         fsutil::sync_parent(target)?;
@@ -99,21 +105,21 @@ impl Saved {
 
     /// Whether `target`, which comes from the ledger, is a path [`Saved::choose`] could have given.
     pub(crate) fn contains(&self, target: &Path) -> bool {
-        target.strip_prefix(&self.pod).is_ok_and(is_plain)
+        target
+            .strip_prefix(&self.pod)
+            .is_ok_and(|relative| is_plain(relative) && relative.components().count() > 1)
     }
 
-    /// Removes what an interrupted [`Saved::take`] to `target` left unfinished.
-    pub(crate) fn discard_unfinished(&self, target: &Path) -> Result<()> {
-        if !self.contains(target) {
-            return Ok(());
-        }
-        let part = part(target);
-        match fsutil::remove_file_if_exists(&part) {
-            Err(e) if !is_absent(&e) => {
-                Err(e).with_context(|| format!("cannot remove {}", part.display()))
-            }
-            _ => Ok(()),
-        }
+    /// The copy being written, one at a time: the caller of teardown holds the pod lock. Never the
+    /// name of a run, so nothing that is kept can be there.
+    fn unfinished(&self) -> PathBuf {
+        self.pod.join(UNFINISHED)
+    }
+
+    /// Removes what an interrupted run left unfinished, as far as possible: not being able to is no
+    /// reason to leave anything else behind.
+    pub(crate) fn discard_unfinished(&self) {
+        let _ = fsutil::remove_file_if_exists(&self.unfinished());
     }
 
     /// The directories above `target`, each closed to other users (edited copies may hold secrets).
@@ -127,6 +133,7 @@ impl Saved {
         for component in relative.parent().into_iter().flat_map(Path::components) {
             dir.push(component);
             fsutil::create_private_dir(&dir)
+                .and_then(|()| fsutil::sync_parent(&dir))
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
         Ok(())
@@ -146,13 +153,6 @@ pub(crate) fn is_absent(e: &io::Error) -> bool {
 fn is_plain(path: &Path) -> bool {
     path.components().next().is_some()
         && path.components().all(|c| matches!(c, Component::Normal(_)))
-}
-
-/// The name under which a copy to `target` is written until it is complete.
-fn part(target: &Path) -> PathBuf {
-    let mut name = target.file_name().map(OsString::from).unwrap_or_default();
-    name.push(".bp-part");
-    target.with_file_name(name)
 }
 
 /// Copies `from` to the new file `to`, on disk when it returns, with the permissions of `from`.
@@ -264,7 +264,7 @@ mod tests {
         let target = s.saved.choose(Path::new(".env")).unwrap();
         // An earlier run was interrupted while it copied.
         s.saved.create_parents(&target).unwrap();
-        fs::write(part(&target), "edi").unwrap();
+        fs::write(s.saved.unfinished(), "edi").unwrap();
         let mut permissions = fs::metadata(&s.file).unwrap().permissions();
         permissions.set_readonly(true);
         fs::set_permissions(&s.file, permissions.clone()).unwrap();
@@ -275,8 +275,7 @@ mod tests {
         assert!(!s.file.exists());
         assert_eq!(text(&target), "edited");
         assert_eq!(fs::metadata(&target).unwrap().permissions(), permissions);
-        let dir = target.parent().unwrap();
-        assert_eq!(fs::read_dir(dir).unwrap().count(), 1, "nothing unfinished");
+        assert!(!s.saved.unfinished().exists());
     }
 
     #[test]
@@ -293,8 +292,8 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("cannot copy"), "{err:#}");
         assert_eq!(text(&s.file), "edited");
-        let dir = target.parent().unwrap();
-        assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
+        assert!(!target.exists());
+        assert!(!s.saved.unfinished().exists());
     }
 
     #[test]
@@ -351,24 +350,32 @@ mod tests {
         assert_eq!(text(&s.file), "edited once more");
     }
 
+    /// Whatever the files are called, an unfinished copy is none of those kept.
     #[test]
-    fn only_names_of_our_own_are_discarded() {
+    fn an_unfinished_copy_is_discarded_and_nothing_else() {
         let s = setup();
-        let foreign = s.file.with_file_name("x.bp-part");
-        fs::write(&foreign, "not ours").unwrap();
-        let outside = s.saved.pod.join("..").join("..").join("..").join("x");
-        for recorded in [s.file.with_file_name("x"), outside] {
-            s.saved.discard_unfinished(&recorded).unwrap();
+        let mut kept = Vec::new();
+        for name in ["unfinished", ".env", ".env.bp-part", &"n".repeat(250)] {
+            fs::write(&s.file, name).unwrap();
+            let target = s.saved.choose(Path::new(name)).unwrap();
+            s.saved
+                .take_with(&s.file, &target, other_volume, copy)
+                .unwrap();
+            assert!(s.saved.contains(&target));
+            kept.push((target, name.to_owned()));
         }
-        assert!(foreign.exists());
+        fs::write(s.saved.unfinished(), "edi").unwrap();
+        for _ in 0..2 {
+            s.saved.discard_unfinished();
+            assert!(!s.saved.unfinished().exists());
+        }
+        for (target, name) in kept {
+            assert_eq!(text(&target), name);
+        }
 
-        let target = s.saved.choose(Path::new(".env")).unwrap();
-        s.saved.create_parents(&target).unwrap();
-        fs::write(part(&target), "edi").unwrap();
-        s.saved.discard_unfinished(&target).unwrap();
-        assert!(!part(&target).exists());
-        // Already gone, its directory too.
-        fs::remove_dir_all(&s.saved.pod).unwrap();
-        s.saved.discard_unfinished(&target).unwrap();
+        assert!(!s.saved.contains(&s.saved.unfinished()));
+        assert!(!s.saved.contains(&s.file));
+        let outside = s.saved.pod.join("1").join("..").join("..").join("x");
+        assert!(!s.saved.contains(&outside));
     }
 }

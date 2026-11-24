@@ -479,22 +479,31 @@ fn symlink_error(e: io::Error) -> anyhow::Error {
 /// reported with the processes holding the path, when the OS can tell.
 ///
 /// A single file that was edited is moved to `saved`, its new path recorded through `on_moved` in the
-/// same way; if it cannot be moved it stays, which is an error. Returns where this or an earlier,
-/// interrupted attempt kept the file.
+/// same way; if it cannot be moved it stays, which is an error. `kept` becomes the paths where this or
+/// an earlier attempt kept the file, also when there is an error.
 pub(crate) fn remove(
     record: &Record,
     saved: &Saved,
+    kept: &mut Vec<PathBuf>,
     on_moved: impl FnOnce(&Record) -> Result<()>,
-) -> Result<Vec<PathBuf>> {
-    remove_inner(record, saved, on_moved)
+) -> Result<()> {
+    remove_inner(record, saved, kept, on_moved)
         .with_context(|| format!("cannot remove {}", record.path.display()))
+}
+
+/// Where earlier attempts kept the file of `record`.
+pub(crate) fn kept_files(record: &Record, saved: &Saved) -> Vec<PathBuf> {
+    let exists = |target: &&PathBuf| fs::symlink_metadata(target).is_ok();
+    let recorded = record.saved.iter().filter(|t| saved.contains(t));
+    recorded.filter(exists).cloned().collect()
 }
 
 fn remove_inner(
     record: &Record,
     saved: &Saved,
+    kept: &mut Vec<PathBuf>,
     on_moved: impl FnOnce(&Record) -> Result<()>,
-) -> Result<Vec<PathBuf>> {
+) -> Result<()> {
     let path = &record.path;
     let inside = |p: &Path| p.starts_with(&record.root) && p != record.root;
     let trash_inside = record
@@ -505,25 +514,14 @@ fn remove_inner(
         bail!("refusing to touch a path outside {}", record.root.display());
     }
 
-    let mut kept = Vec::new();
-    for target in &record.saved {
-        saved.discard_unfinished(target)?;
-        match fs::symlink_metadata(target) {
-            Ok(_) => kept.push(target.clone()),
-            Err(e) if saved::is_absent(&e) => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("cannot read {}", target.display()));
-            }
-        }
-    }
-
+    *kept = kept_files(record, saved);
     if parents_are_real_dirs(&record.root, path)? {
         // A delete interrupted after the move; the trash shares the parents of `path`.
         if let Some(trash) = &record.trash {
             remove_trash(trash)?;
         }
         match fs::symlink_metadata(path) {
-            Ok(meta) => remove_entry(record, &meta, saved, &mut kept, on_moved)?,
+            Ok(meta) => remove_entry(record, &meta, saved, kept, on_moved)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -546,7 +544,7 @@ fn remove_inner(
             }
         }
     }
-    Ok(kept)
+    Ok(())
 }
 
 fn remove_entry(
@@ -617,8 +615,9 @@ fn remove_file(
     }
 
     // Recorded by an earlier attempt that did not get to use it.
-    let unused = record.saved.iter().find(|t| !kept.contains(t));
-    let target = match unused.filter(|t| saved.contains(t)) {
+    let absent = |t: &&PathBuf| fs::symlink_metadata(t).is_err_and(|e| saved::is_absent(&e));
+    let recorded = record.saved.iter().filter(|t| saved.contains(t));
+    let target = match { recorded }.find(absent) {
         Some(target) => target.clone(),
         None => {
             let target = saved.choose(path.strip_prefix(&record.root)?)?;
@@ -850,7 +849,7 @@ mod tests {
 
     /// Removes without a ledger: the trash location is not recorded anywhere.
     fn rm(record: &Record) -> Result<()> {
-        remove(record, &saved(record), |_| Ok(())).map(drop)
+        remove(record, &saved(record), &mut Vec::new(), |_| Ok(()))
     }
 
     /// Edited files go next to the worktree.
@@ -1104,7 +1103,7 @@ mod tests {
         write(&t.main.join("vendor/pkg/a.txt"), "a");
         let record = up(&t, &spec("vendor", FileMode::Copy));
         let mut recorded = None;
-        remove(&record, &saved(&record), |moved| {
+        remove(&record, &saved(&record), &mut Vec::new(), |moved| {
             // Recorded before anything is moved.
             assert!(record.path.join("pkg/a.txt").exists());
             let trash = moved.trash.as_deref().expect("trash name");
@@ -1148,7 +1147,7 @@ mod tests {
     }
 
     fn rm_with(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) {
-        remove(record, &saved(record), on_moved).unwrap();
+        remove(record, &saved(record), &mut Vec::new(), on_moved).unwrap();
     }
 
     #[test]
@@ -1156,7 +1155,8 @@ mod tests {
         let t = tree();
         write(&t.main.join("vendor/a.txt"), "a");
         let record = up(&t, &spec("vendor", FileMode::Copy));
-        let err = remove(&record, &saved(&record), |_| bail!("disk full")).unwrap_err();
+        let full = |_: &Record| bail!("disk full");
+        let err = remove(&record, &saved(&record), &mut Vec::new(), full).unwrap_err();
         assert!(format!("{err:#}").contains("disk full"), "{err:#}");
         assert!(t.wt.join("vendor/a.txt").exists());
         assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 1);
@@ -1243,14 +1243,15 @@ mod tests {
     /// Moves go into the record, as `bp down` does with the ledger.
     fn rm_recorded(record: &mut Record) -> Result<Vec<PathBuf>> {
         let mut recorded = None;
-        let result = remove(record, &saved(record), |moved| {
+        let mut kept = Vec::new();
+        let result = remove(record, &saved(record), &mut kept, |moved| {
             recorded = Some(moved.clone());
             Ok(())
         });
         if let Some(moved) = recorded {
             *record = moved;
         }
-        result
+        result.map(|()| kept)
     }
 
     #[test]
@@ -1427,13 +1428,70 @@ mod tests {
         assert_eq!(texts, ["A=2\n", "A=3\n"]);
 
         // Crashed while copying, and then the user deleted the file.
-        let (mut record, target) = edited();
+        let (mut record, _) = edited();
         fs::remove_file(t.wt.join(".env")).unwrap();
-        let mut part = target.clone().into_os_string();
-        part.push(".bp-part");
-        write(Path::new(&part), "A=");
         assert!(rm_recorded(&mut record).unwrap().is_empty());
-        assert!(!Path::new(&part).exists());
+    }
+
+    /// The look right before the removal compares with the one the decision was made on.
+    #[test]
+    fn a_file_touched_since_the_decision_is_kept() {
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let record = up(&t, &spec(".env", FileMode::Copy));
+        let path = t.wt.join(".env");
+        let seen = fs::symlink_metadata(&path).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(UNIX_EPOCH).unwrap();
+        drop(file);
+        let mut kept = Vec::new();
+        remove_file(&record, &seen, &saved(&record), &mut kept, |_| Ok(())).unwrap();
+        assert_eq!(kept_text(&record, &kept), "A=1\n");
+    }
+
+    /// A damaged record: nothing is taken for kept, or put, outside the place for it.
+    #[test]
+    fn recorded_places_of_others_are_ignored() {
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let path = t.wt.join(".env");
+        let home = t.wt.with_file_name("home");
+        let foreign = [
+            path.clone(),
+            t.wt.join("elsewhere"),
+            home.join("saved").join("other-pod").join("1").join(".env"),
+            home.join("pods").join("x"),
+        ];
+        for place in foreign {
+            let mut record = up(&t, &spec(".env", FileMode::Copy));
+            fs::write(&path, "A=2\n").unwrap();
+            record.saved = vec![place.clone()];
+            let kept = rm_recorded(&mut record).unwrap();
+            assert_eq!(kept_text(&record, &kept), "A=2\n");
+            assert!(!place.exists(), "{}", place.display());
+        }
+    }
+
+    /// The error is about something else: where the file went must not get lost with it.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_file_is_told_also_when_its_directory_cannot_be_removed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let t = tree();
+        write(&t.main.join("conf/.env"), "A=1\n");
+        let record = up(&t, &spec("conf/.env", FileMode::Copy));
+        fs::write(t.wt.join("conf/.env"), "A=2\n").unwrap();
+        let open = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(t.wt.join("conf"))
+            .unwrap();
+        let mut kept = Vec::new();
+        remove(&record, &saved(&record), &mut kept, |_| Ok(())).unwrap_err();
+        drop(open);
+        assert_eq!(kept_text(&record, &kept), "A=2\n");
     }
 
     #[test]
@@ -1443,7 +1501,8 @@ mod tests {
         let mut record = up(&t, &spec(".env", FileMode::Copy));
         fs::write(t.wt.join(".env"), "A=2\n").unwrap();
 
-        let err = remove(&record, &saved(&record), |_| bail!("disk full")).unwrap_err();
+        let full = |_: &Record| bail!("disk full");
+        let err = remove(&record, &saved(&record), &mut Vec::new(), full).unwrap_err();
         assert!(format!("{err:#}").contains("disk full"), "{err:#}");
         assert_eq!(files_in(&t.wt.with_file_name("home")), 0);
 
