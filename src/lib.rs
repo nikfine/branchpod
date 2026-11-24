@@ -1,8 +1,11 @@
 //! Internals of branchpod (`bp`): a resource runtime for git worktrees.
 //!
-//! Not a public API. The library exists so that the binary stays thin and integration tests can call
-//! the code directly; anything in it may change in any release. The contract of `bp` is its `--json`
+//! Not a public API: anything here may change in any release. The contract of `bp` is its `--json`
 //! output and event schema.
+//!
+//! The library keeps the binary thin and lets integration tests call the code directly. Only `cli` is
+//! public so far; other items become public once such a test needs them. `cli::up` starts the current
+//! executable as the supervisor, so only the `bp` binary may call it: a test would start itself.
 
 #[doc(hidden)]
 pub mod cli;
