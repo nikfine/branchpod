@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::pod::Store;
 use crate::proc::{self, ProcId};
-use crate::supervisor::{self, Launcher};
+use crate::supervisor::{self, Launcher, TetherCheck};
 
 /// Runs `git` in `dir`; it must succeed.
 pub(crate) fn git_ok(dir: &Path, args: &[&str]) {
@@ -36,7 +36,7 @@ const ENDPOINT_ENV: &str = "BP_TEST_SUPERVISOR_ENDPOINT";
 /// Starts supervisors as this test binary re-running [`supervisor_process`].
 pub(crate) fn launcher() -> Launcher {
     let exe = std::env::current_exe().unwrap();
-    Launcher::new(move |endpoint| {
+    Launcher::unchecked(move |endpoint| {
         let mut cmd = Command::new(&exe);
         cmd.args([
             "--exact",
@@ -81,7 +81,51 @@ pub(crate) fn reap_pod(store: &Store, id: &str) -> Reaper {
 #[ignore = "the supervisor process of other tests, which start it themselves"]
 fn supervisor_process() {
     if let Some(endpoint) = std::env::var_os(ENDPOINT_ENV) {
-        supervisor::serve(endpoint.to_str().unwrap()).unwrap();
+        supervisor::serve(endpoint.to_str().unwrap(), TetherCheck::Off).unwrap();
+    }
+}
+
+/// Name of the env var that makes [`tree_process`] run; its value is `wait` or `exit`.
+#[cfg(windows)]
+pub(crate) const TREE_ENV: &str = "BP_TEST_TREE";
+
+/// A service with a child of its own, printed as `child <pid> started`: this test binary re-running
+/// [`tree_process`]. [`TREE_ENV`] must be set for it.
+#[cfg(windows)]
+pub(crate) fn tree() -> Vec<String> {
+    let exe = std::env::current_exe().unwrap();
+    let mut run = vec![exe.to_str().unwrap().to_owned()];
+    run.extend(
+        [
+            "--exact",
+            "test_support::tree_process",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .map(str::to_owned),
+    );
+    run
+}
+
+/// Not a test by itself: a service that starts a child, and waits for it or exits at once.
+#[cfg(windows)]
+#[test]
+#[ignore = "a service of other tests, which start it themselves"]
+#[allow(clippy::zombie_processes)] // Leaving the child behind is what `exit` is for.
+fn tree_process() {
+    let Some(mode) = std::env::var_os(TREE_ENV) else {
+        return;
+    };
+    let run = long_running("grandchild");
+    let mut child = Command::new(&run[0])
+        .args(&run[1..])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    println!("child {} started", child.id());
+    if mode == "wait" {
+        child.wait().unwrap();
     }
 }
 

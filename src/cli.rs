@@ -49,6 +49,9 @@ pub fn up(path: Option<&OsStr>) -> Result<ExitCode> {
     for item in &report.items {
         println!("  {:<10} {:<24} {}", item.kind, item.name, item.detail);
     }
+    for warning in &report.warnings {
+        eprintln!("bp: warning: {warning}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -130,7 +133,7 @@ pub fn down(path: Option<&OsStr>) -> Result<ExitCode> {
 
 /// `bp supervise`: the supervisor process of a pod.
 pub fn supervise(endpoint: &str) -> Result<ExitCode> {
-    supervisor::serve(endpoint)?;
+    supervisor::serve(endpoint, supervisor::TetherCheck::On)?;
     Ok(ExitCode::SUCCESS)
 }
 

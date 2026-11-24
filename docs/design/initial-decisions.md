@@ -114,9 +114,10 @@ One supervisor process per worktree, no global daemon; control over a local sock
 - **Start.** `bp up` starts it after the commands, only when the config has services, as the hidden
   `bp supervise <endpoint>` of the same binary, detached from the caller: its own session (Unix); no
   console window, its own process group and, when the caller's Job Object allows it, outside that job
-  (Windows). It inherits none of the caller's standard handles: an IDE hook waiting for the end of
-  `bp`'s output must not wait for the supervisor. Its working directory is the `bp` home, never the
-  worktree or the pod directory, which Windows could then not remove.
+  (Windows; "The caller's Job Object" below is about when it does not). It inherits none of the
+  caller's standard handles: an IDE hook waiting for the end of `bp`'s output must not wait for the
+  supervisor. Its working directory is the `bp` home, never the worktree or the pod directory, which
+  Windows could then not remove.
 - **Readiness.** The supervisor prints one line once it listens (or why it cannot) and `bp up` reads it.
   No time limit: if the supervisor dies first, the pipe closes and `up` fails.
 - **Control.** One JSON line per request and per answer, one connection per request, versioned:
@@ -140,19 +141,63 @@ One supervisor process per worktree, no global daemon; control over a local sock
   so output keeps flowing if the supervisor dies. Rotation and `bp logs` are #17. The environment is
   passed to the supervisor but not recorded (it may hold secrets).
 - **Stop.** `bp down` asks the supervisor to stop each service, then to shut down, and waits for it to
-  exit (killing it after 10 s). A stopped service gets `SIGTERM` to its group and 10 s before `SIGKILL`.
-  When nothing listens on the supervisor's endpoint, a service's tree is stopped by its recorded leader: on Unix
+  exit (killing it after 10 s). A stopped service gets `SIGTERM` to its group and 10 s before `SIGKILL`
+  (Unix); on Windows its job is terminated at once, and 10 s is the limit for all of it to be gone.
+  When nothing listens on the supervisor's endpoint (or the channel breaks, as it does when the
+  supervisor is being killed, and its recorded process is gone), a service's tree is stopped by its recorded leader: on Unix
   `killpg(pid)` unless the pid now belongs to another process (a pid is not reused while a group with
   that id exists, so a group whose leader is gone is still ours). A service that never reported its
   pid was known only to that supervisor and is considered gone with it (it is, once the platform
   measures below tie services to the supervisor's life).
-- Windows: Job Object with `KILL_ON_JOB_CLOSE` (#14). Until then only the service process itself is
-  terminated; its children outlive it.
+- Windows: Job Objects, see "Services on Windows".
 - Linux: own process group + `PR_SET_PDEATHSIG` (#15); cgroups via `systemd-run --user --scope` when
   available.
 - macOS: process group + kqueue (#16); if the supervisor is SIGKILLed, `gc` finishes the group.
 - Known limitation: while a supervisor runs, Windows keeps the `bp` executable in use, so replacing it
   in place (an upgrade) may fail until the pods with services are down.
+
+### Services on Windows
+
+- **Two levels of Job Objects**, all with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The supervisor puts itself
+  into a job of its own before it listens; every service gets a job nested in it. Only the supervisor has
+  handles to them, not inherited, so when it ends, killed or not, the system closes them and kills the
+  trees. Nested jobs need Windows 8 / Server 2012, below our floor
+  ([nested jobs](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs)). That the handle
+  of a killed process counts as closed is not spelled out there; the tests check it.
+- **No gap at the start.** A service is created suspended, put into its job and then resumed. It is born in
+  the supervisor's job, so a supervisor killed in between takes it along. `std` gives no stable handle to
+  the main thread: it is found in a thread snapshot (Toolhelp). Rejected: calling `CreateProcessW` ourselves
+  with `PROC_THREAD_ATTRIBUTE_JOB_LIST` (it would replace the program lookup and argument quoting of `std`).
+  If the service cannot be put into its job it is killed and the start fails.
+- **Stop** terminates the service's job (there is no request to exit first) and waits for every process that
+  was in it, also when the service process itself exited before. The job's count of active processes alone
+  is not enough: it can reach zero before the processes are gone and their files free. What has not exited
+  after 10 s is an error: the service stays recorded and the pod is not clean.
+- **`bp down` without a supervisor.** The trees are already being killed, but not necessarily gone. `down`
+  waits for the recorded leader; a leader that refuses to be terminated ("access denied", as a process
+  being terminated does) counts as gone only once it has exited. The rest of the tree is not recorded: the
+  retries of file removal cover the moment it takes.
+- **The caller's Job Object.** A supervisor that stays in a job that kills it on close dies with the IDE hook
+  that ran `bp up`, after the pod was reported as up.
+  - A job with `KILL_ON_JOB_CLOSE` that does not allow breakaway (`BREAKAWAY_OK` or `SILENT_BREAKAWAY_OK`):
+    `bp up` fails and says what to do. Checked twice: by `bp up` before anything is created (only if the
+    config has services), and by the supervisor, which alone knows where it ended up. Breaking away moves up
+    the chain of jobs only to the first one that forbids it, so a start with `CREATE_BREAKAWAY_FROM_JOB` can
+    succeed and still end in a job that kills.
+  - A job without `KILL_ON_JOB_CLOSE` that does not allow breakaway: `bp up` goes on and warns on stderr.
+    Refusing would rule out places where everything runs in some job.
+  - Known gap: a process can query only
+    [its innermost job](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject).
+    An outer job that kills behind an inner one that does not gets the warning, not the error.
+  - There is no switch to skip the check. Tests of the library do without it in code; `cargo run` and
+    `cargo test` run programs in exactly such a job, see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+- **Accepted limitations.** Our jobs do not allow breakaway, so `CREATE_BREAKAWAY_FROM_JOB` fails in a
+  service and its children ("access denied"): nothing that a service starts may outlive it. The exception
+  is what others start on its behalf, such as a process created through WMI (`Win32_Process.Create`), which
+  is [not in the job](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects); `bp` neither
+  sees nor stops it. A caller's job with UI restrictions cannot be
+  [nested into](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject):
+  services do not start there.
 
 ## Git-ignored files
 

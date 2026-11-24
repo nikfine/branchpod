@@ -16,9 +16,9 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::commands;
 use crate::control::{self, Conn, Server};
-use crate::proc::{self, ProcId};
+use crate::proc::{self, ProcId, Tether, Tree};
 
 /// How long a stopped service gets to exit before it is killed.
 pub(crate) const GRACE: Duration = Duration::from_secs(10);
@@ -113,33 +113,86 @@ struct Ready {
     process: Option<ProcId>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    warning: Option<String>,
 }
 
 /// Builds the command that runs a supervisor for an endpoint: `bp supervise <endpoint>`, or the
 /// test binary re-running itself in tests.
-pub(crate) struct Launcher(Box<dyn Fn(&str) -> Command + Send + Sync>);
+pub(crate) struct Launcher {
+    build: Box<dyn Fn(&str) -> Command + Send + Sync>,
+    check: TetherCheck,
+}
+
+/// Whether a supervisor that would not outlive the caller is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TetherCheck {
+    On,
+    /// Tests run under whatever job the test runner has, and their supervisors need not outlive
+    /// them.
+    #[cfg(test)]
+    Off,
+}
+
+impl TetherCheck {
+    /// Fails if the tether kills; otherwise returns what to warn about.
+    fn judge(self, tether: impl FnOnce() -> io::Result<Tether>) -> Result<Option<String>> {
+        match self {
+            #[cfg(test)]
+            TetherCheck::Off => Ok(None),
+            TetherCheck::On => match tether().context("cannot tell what may end it")? {
+                Tether::Free => Ok(None),
+                Tether::Unclear(why) => Ok(Some(why.to_owned())),
+                Tether::Kills(why) => Err(anyhow!(why)),
+            },
+        }
+    }
+}
+
+/// A supervisor that listens.
+#[derive(Debug)]
+pub(crate) struct Launched {
+    pub(crate) process: ProcId,
+    /// For the user: it may not outlive the caller.
+    pub(crate) warning: Option<String>,
+}
 
 impl Launcher {
-    pub(crate) fn new(build: impl Fn(&str) -> Command + Send + Sync + 'static) -> Launcher {
-        Launcher(Box::new(build))
+    /// Starts supervisors that do not check whether they outlive the caller; they must run
+    /// [`serve`] with [`TetherCheck::Off`] too.
+    #[cfg(test)]
+    pub(crate) fn unchecked(build: impl Fn(&str) -> Command + Send + Sync + 'static) -> Launcher {
+        Launcher {
+            build: Box::new(build),
+            check: TetherCheck::Off,
+        }
+    }
+
+    /// Fails if it is already clear that a supervisor would be killed together with the caller.
+    /// For before anything is created; the supervisor checks again, and more precisely.
+    pub(crate) fn preflight(&self) -> Result<()> {
+        self.check.judge(proc::detached_tether).map(drop)
     }
 
     /// `bp supervise <endpoint>` with this very binary.
     pub(crate) fn current_exe() -> Result<Launcher> {
         let exe = std::env::current_exe().context("cannot locate the bp binary")?;
-        Ok(Launcher::new(move |endpoint| {
-            let mut cmd = Command::new(&exe);
-            cmd.arg("supervise").arg(endpoint);
-            cmd
-        }))
+        Ok(Launcher {
+            build: Box::new(move |endpoint| {
+                let mut cmd = Command::new(&exe);
+                cmd.arg("supervise").arg(endpoint);
+                cmd
+            }),
+            check: TetherCheck::On,
+        })
     }
 
     /// Starts a supervisor listening on `endpoint`, with `cwd` as its working directory and its
     /// own diagnostics in `log`, and waits until it listens. It is not waited for afterwards: it
     /// outlives us.
-    pub(crate) fn launch(&self, endpoint: &str, cwd: &Path, log: &Path) -> Result<ProcId> {
+    pub(crate) fn launch(&self, endpoint: &str, cwd: &Path, log: &Path) -> Result<Launched> {
         let log = open_log(log)?;
-        let mut cmd = (self.0)(endpoint);
+        let mut cmd = (self.build)(endpoint);
         cmd.current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -161,7 +214,10 @@ impl Launcher {
             let ready: Ready = serde_json::from_str(text.trim())
                 .with_context(|| format!("unexpected answer from the supervisor: {text:?}"))?;
             return match (ready.process, ready.error) {
-                (Some(process), None) if process.pid == child.id() => Ok(process),
+                (Some(process), None) if process.pid == child.id() => Ok(Launched {
+                    process,
+                    warning: ready.warning,
+                }),
                 (_, Some(error)) => Err(anyhow!("the supervisor cannot start: {error}")),
                 _ => bail!("unexpected answer from the supervisor: {text:?}"),
             };
@@ -212,7 +268,7 @@ pub(crate) fn is_unreachable(error: &anyhow::Error) -> bool {
 
 /// A running service, as the supervisor holds it.
 struct Service {
-    child: Child,
+    tree: Tree,
     process: ProcId,
     exit: Option<ExitStatus>,
 }
@@ -220,44 +276,37 @@ struct Service {
 impl Service {
     fn exit(&mut self) -> Option<ExitStatus> {
         if self.exit.is_none() {
-            self.exit = self.child.try_wait().ok().flatten();
+            self.exit = self.tree.child().try_wait().ok().flatten();
         }
         self.exit
     }
 
-    /// Stops its process tree. Once the service process is reaped its pid may be reused, so
-    /// what is left of its tree is then stopped by its recorded identity, never by the bare pid.
-    fn stop(&mut self) -> std::io::Result<()> {
-        if self.exit().is_some() {
-            proc::stop_recorded_tree(self.process, GRACE)
-        } else {
-            proc::stop_tree(&mut self.child, GRACE)
-        }
+    /// Stops its process tree, also what is left of it once the service process has exited.
+    fn stop(&mut self) -> io::Result<()> {
+        self.tree.stop(self.process, GRACE)
     }
 }
 
 /// The supervisor process: listens on `endpoint` and serves requests until `shutdown`.
-pub(crate) fn serve(endpoint: &str) -> Result<()> {
-    let mut server = match Server::bind(endpoint) {
-        Ok(server) => server,
+pub(crate) fn serve(endpoint: &str, check: TetherCheck) -> Result<()> {
+    let mut server = match prepare(endpoint, check) {
+        Ok((server, process, warning)) => {
+            announce(&Ready {
+                process: Some(process),
+                error: None,
+                warning,
+            });
+            server
+        }
         Err(e) => {
             announce(&Ready {
                 process: None,
                 error: Some(format!("{e:#}")),
+                warning: None,
             });
             return Err(e);
         }
     };
-    let me = proc::identify(std::process::id());
-    announce(&Ready {
-        process: me,
-        error: me
-            .is_none()
-            .then(|| "cannot identify own process".to_owned()),
-    });
-    if me.is_none() {
-        bail!("cannot identify own process");
-    }
 
     let mut services: BTreeMap<String, Service> = BTreeMap::new();
     loop {
@@ -291,6 +340,16 @@ pub(crate) fn serve(endpoint: &str) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+/// Everything that can keep a supervisor from starting; also what to warn about.
+fn prepare(endpoint: &str, check: TetherCheck) -> Result<(Server, ProcId, Option<String>)> {
+    // Before `contain`: what we are in now is what the caller left us in.
+    let warning = check.judge(proc::own_tether)?;
+    proc::contain().context("cannot tie services to the supervisor")?;
+    let server = Server::bind(endpoint)?;
+    let me = proc::identify(std::process::id()).context("cannot identify own process")?;
+    Ok((server, me, warning))
 }
 
 fn announce(ready: &Ready) {
@@ -379,11 +438,10 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    proc::new_tree(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| commands::spawn_error(program, e))?;
-    let Some(process) = proc::identify(child.id()) else {
+    let mut tree = Tree::spawn(&mut cmd).map_err(|e| commands::spawn_error(program, e))?;
+    let Some(process) = proc::identify(tree.child().id()) else {
         // Exited at once (a zombie has no identity): a start that failed.
-        let status = child.wait()?;
+        let status = tree.child().wait()?;
         bail!(
             "{program} exited at once with {status}; see {}",
             start.log.display()
@@ -392,7 +450,7 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
     services.insert(
         start.name.clone(),
         Service {
-            child,
+            tree,
             process,
             exit: None,
         },
@@ -403,6 +461,8 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::test_support::{TREE_ENV, tree};
     use crate::test_support::{fail, launcher, long_running};
 
     struct Running {
@@ -425,7 +485,8 @@ mod tests {
         let endpoint = control::new_endpoint("test").unwrap();
         let process = launcher()
             .launch(&endpoint, &dir, &dir.join("supervisor.log"))
-            .unwrap();
+            .unwrap()
+            .process;
         Running {
             _tmp: tmp,
             dir,
@@ -556,6 +617,85 @@ mod tests {
         )
         .unwrap();
         assert!(proc::wait_gone(child, Duration::from_secs(5)));
+    }
+
+    /// Starts a service that has a child; both.
+    #[cfg(windows)]
+    fn start_tree(r: &Running, mode: &str) -> (ProcId, ProcId) {
+        let log = r.dir.join("logs/tree.log");
+        let start = Start {
+            name: "tree".into(),
+            run: tree(),
+            cwd: r.dir.clone(),
+            env: BTreeMap::from([(TREE_ENV.into(), mode.into())]),
+            log: log.clone(),
+        };
+        let data = request(&r.endpoint, &Request::Start(start)).unwrap();
+        wait_for_log(&log, " started");
+        let text = read_log(&log);
+        let (_, text) = text.split_once("child ").unwrap();
+        let pid = text.split_once(' ').unwrap().0.parse().unwrap();
+        (
+            serde_json::from_value(data).unwrap(),
+            proc::identify(pid).expect("the child runs"),
+        )
+    }
+
+    #[cfg(windows)]
+    fn stop_tree(r: &Running) {
+        let stop = Request::Stop {
+            name: "tree".into(),
+        };
+        request(&r.endpoint, &stop).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_service_stops_its_children() {
+        let r = running();
+        let (leader, child) = start_tree(&r, "wait");
+        stop_tree(&r);
+        // The answer came after all of it was gone.
+        assert!(proc::wait_gone(leader, Duration::ZERO));
+        assert!(proc::wait_gone(child, Duration::ZERO));
+        assert!(proc::is_running(r.process));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_service_that_exited_stops_its_children() {
+        let r = running();
+        let (leader, child) = start_tree(&r, "exit");
+        assert!(proc::wait_gone(leader, Duration::from_secs(10)));
+        assert!(proc::is_running(child));
+        stop_tree(&r);
+        assert!(proc::wait_gone(child, Duration::ZERO));
+        assert!(proc::is_running(r.process));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_killed_supervisor_takes_its_services_along() {
+        let r = running();
+        let (leader, child) = start_tree(&r, "wait");
+        proc::kill(r.process).unwrap();
+        assert!(proc::wait_gone(leader, Duration::from_secs(10)));
+        assert!(proc::wait_gone(child, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_tether_that_kills_is_refused_and_an_unclear_one_reported() {
+        let judge = |tether| TetherCheck::On.judge(|| Ok(tether));
+        assert_eq!(judge(Tether::Free).unwrap(), None);
+        assert_eq!(judge(Tether::Unclear("hm")).unwrap().as_deref(), Some("hm"));
+        let err = judge(Tether::Kills("why")).unwrap_err();
+        assert_eq!(format!("{err:#}"), "why");
+        // Not knowing is not a reason to start.
+        assert!(
+            TetherCheck::On
+                .judge(|| Err(io::Error::other("x")))
+                .is_err()
+        );
     }
 
     #[test]

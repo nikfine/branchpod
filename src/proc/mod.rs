@@ -8,9 +8,9 @@
 //!
 //! - Unix: the service leads its own process group; stopping sends `SIGTERM` to the group, waits
 //!   up to a grace period and then sends `SIGKILL`.
-//! - Windows: the service gets its own process group (console control events). Only the service
-//!   process itself is terminated for now; its children survive it until services run in a Job
-//!   Object (#14).
+//! - Windows: the service runs in a Job Object of its own, nested in the supervisor's
+//!   ([`contain`]); both kill what is in them when the supervisor is gone, however it ended.
+//!   Stopping terminates the job at once and waits until nothing runs in it.
 
 use std::io;
 use std::process::{Child, Command};
@@ -60,20 +60,62 @@ pub(crate) fn wait_gone(id: ProcId, limit: Duration) -> bool {
     true
 }
 
-/// Sets `cmd` up to start a new process tree that [`stop_tree`] stops as a whole.
-pub(crate) fn new_tree(cmd: &mut Command) {
-    sys::new_tree(cmd);
+/// A process tree started by us. On Windows dropping it kills what is left of it.
+pub(crate) struct Tree(sys::Tree);
+
+impl Tree {
+    /// Starts `cmd` as the leader of a new tree.
+    pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Tree> {
+        sys::Tree::spawn(cmd).map(Tree)
+    }
+
+    /// The leader.
+    pub(crate) fn child(&mut self) -> &mut Child {
+        self.0.child()
+    }
+
+    /// Stops the tree, whether or not its leader has exited already, and reaps the leader. On
+    /// Unix it is asked to exit and killed after `grace`; on Windows it is killed at once, and
+    /// `grace` limits the wait for all of it to be gone. `leader` is the leader's identity: its
+    /// pid may have been reused.
+    pub(crate) fn stop(&mut self, leader: ProcId, grace: Duration) -> io::Result<()> {
+        self.0.stop(leader, grace)
+    }
 }
 
-/// Stops the tree of `child`, started with [`new_tree`]: asks it to exit, waits up to `grace`,
-/// then kills it. The child is reaped.
-pub(crate) fn stop_tree(child: &mut Child, grace: Duration) -> io::Result<()> {
-    sys::stop_tree(child, grace)
+/// Ties whatever this process starts from now on to its own life, where the platform can: on
+/// Windows they are killed when it ends, however it ends.
+pub(crate) fn contain() -> io::Result<()> {
+    sys::contain()
+}
+
+/// What may end a process of ours together with the caller, against our will.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) enum Tether {
+    /// Nothing that can be seen.
+    Free,
+    /// Nothing is set to, but something could: the text says what.
+    Unclear(&'static str),
+    /// It will be killed: the text says why, and what to do.
+    Kills(&'static str),
+}
+
+/// The tether of a process started with [`spawn_detached`] now, as far as it can be told
+/// beforehand; the process itself knows better ([`own_tether`]).
+pub(crate) fn detached_tether() -> io::Result<Tether> {
+    sys::detached_tether()
+}
+
+/// The tether of this process. Meaningless after [`contain`].
+pub(crate) fn own_tether() -> io::Result<Tether> {
+    sys::own_tether()
 }
 
 /// Stops a tree that is not our child, known by its recorded leader: the supervisor that started
 /// it is gone or does not answer. Nothing happens if the leader's pid now belongs to another
-/// process.
+/// process. On Windows only the leader is stopped and waited for: the rest dies with the
+/// supervisor.
 pub(crate) fn stop_recorded_tree(leader: ProcId, grace: Duration) -> io::Result<()> {
     sys::stop_recorded_tree(leader, grace)
 }
@@ -85,8 +127,9 @@ pub(crate) fn kill(id: ProcId) -> io::Result<()> {
 
 /// Spawns `cmd` detached from the caller, to outlive it: its own session (Unix); no console
 /// window, its own process group and, where the caller's Job Object allows it, outside that job
-/// (Windows). The caller's own standard handles are not inherited, so a caller waiting for the end
-/// of our output (an IDE hook) is not kept waiting by the detached process.
+/// (Windows; [`Tether`] tells where it does not). The caller's own standard handles are not
+/// inherited, so a caller waiting for the end of our output (an IDE hook) is not kept waiting by
+/// the detached process.
 pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
     sys::spawn_detached(cmd)
 }
