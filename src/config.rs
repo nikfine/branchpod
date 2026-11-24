@@ -128,7 +128,7 @@ pub(crate) struct Replace {
     /// Text to find, taken literally (no `{{var}}`). It is matched against the rendered text, so
     /// a source `{{{{x}}` is found as `{{x}}`.
     pub(crate) find: String,
-    /// Replacement; may contain `{{var}}` references.
+    /// Replacement; may contain `{{var}}` references, also with `vars = false`.
     pub(crate) with: String,
 }
 
