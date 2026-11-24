@@ -18,6 +18,7 @@
 //! Recording in the ledger is the caller's job (`bp up` / `bp down`).
 
 use std::fmt;
+use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -119,12 +120,30 @@ fn file_var(name: &str) -> String {
     format!("command.{name}.file")
 }
 
+fn outputs_dir(pod_dir: &Path) -> PathBuf {
+    pod_dir.join("outputs")
+}
+
+/// Removes the output files of an earlier `up`, whatever its commands were called. The caller has
+/// made sure that nothing is left whose `destroy` may read them.
+pub(crate) fn remove_outputs(pod_dir: &Path) -> Result<()> {
+    let dir = outputs_dir(pod_dir);
+    match fsutil::retry(|| fs::remove_dir_all(&dir)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e).with_context(|| {
+            format!(
+                "cannot remove the command output of an earlier `bp up` in {}",
+                dir.display()
+            )
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Where the output of command `name` goes with `output = "file"`, in the pod directory `pod_dir`.
 fn output_path(pod_dir: &Path, name: &str) -> Result<String> {
     // The `bp` home may be given as a relative path, and the commands run elsewhere.
-    let path = std::path::absolute(pod_dir)
+    let path = std::path::absolute(outputs_dir(pod_dir))
         .with_context(|| format!("cannot resolve {}", pod_dir.display()))?
-        .join("outputs")
         .join(name);
     match path.to_str() {
         Some(text) => Ok(text.to_owned()),
@@ -293,14 +312,11 @@ fn create_inner(plan: &Plan) -> Result<Output> {
 }
 
 fn create_file(plan: &Plan, file: &Path) -> Result<Output> {
-    // Before the command runs: a failure here leaves nothing behind, and a file of an earlier pod
-    // in the same place is never taken for this one's output.
+    // Before the command runs: a failure here leaves nothing behind.
     if let Some(dir) = file.parent() {
         fsutil::create_private_dir(dir)
             .with_context(|| format!("cannot create {}", dir.display()))?;
     }
-    fsutil::remove_file_if_exists(file)
-        .with_context(|| format!("cannot remove {}", file.display()))?;
 
     // From here on errors must not show stdout.
     let run = run(&plan.record.create, &plan.cwd)?;
@@ -317,15 +333,10 @@ fn create_file(plan: &Plan, file: &Path) -> Result<Output> {
     })
 }
 
-/// Whether there is nothing but whitespace, with or without a UTF-8 byte order mark: what
-/// [`decode_stdout`] calls empty, for output that need not be text. Tools end even an empty result
-/// with a line break.
+/// Whether output is what [`decode_stdout`] makes an empty string. Tools end even an empty result
+/// with a line break. Output that is not UTF-8 is not blank.
 fn is_blank(bytes: &[u8]) -> bool {
-    bytes
-        .strip_prefix(b"\xef\xbb\xbf")
-        .unwrap_or(bytes)
-        .iter()
-        .all(u8::is_ascii_whitespace)
+    std::str::from_utf8(bytes).is_ok_and(|text| trim(text).is_empty())
 }
 
 /// Runs the recorded `destroy` in `cwd`: the worktree root while it exists, otherwise any
@@ -426,8 +437,7 @@ pub(crate) fn spawn_error(program: &str, e: io::Error) -> anyhow::Error {
     anyhow::Error::new(e).context(format!("cannot run {program}"))
 }
 
-/// UTF-8, with a leading byte order mark dropped (Windows PowerShell writes one) and surrounding
-/// whitespace, including the trailing newline, trimmed.
+/// UTF-8, see [`trim`].
 fn decode_stdout(bytes: Vec<u8>) -> Result<String> {
     let text = String::from_utf8(bytes).map_err(|e| {
         anyhow::anyhow!(
@@ -435,15 +445,19 @@ fn decode_stdout(bytes: Vec<u8>) -> Result<String> {
             e.utf8_error().valid_up_to()
         )
     })?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    Ok(text.trim().to_owned())
+    Ok(trim(&text).to_owned())
+}
+
+/// Without a leading byte order mark (Windows PowerShell writes one) and surrounding whitespace,
+/// including the trailing newline.
+fn trim(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text).trim()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::fail;
-    use std::fs;
 
     /// With the working directory as the pod's state directory, which only `output = "file"` uses.
     fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
@@ -1050,11 +1064,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out.txt");
         let file = dir.path().join("outputs").join("env");
-        fs::create_dir(dir.path().join("outputs")).unwrap();
-        for blank in ["", "\r\n \n", "\u{feff}\r\n"] {
+        // Blank means what it means for `stdout`.
+        for blank in ["", "\r\n \n", "\u{feff}\r\n", "\u{b}\u{a0}\n"] {
+            assert_eq!(decode_stdout(blank.into()).unwrap(), "");
             fs::write(&out, blank).unwrap();
-            // Left by an earlier pod: it must not pass for the output of this one.
-            fs::write(&file, "stale").unwrap();
             let spec = file_spec("env", cat(&out), None);
             let err = create(&plan(&spec, dir.path(), &vars()).unwrap()).unwrap_err();
             let err = format!("{err:#}");
@@ -1064,6 +1077,7 @@ mod tests {
             );
             assert!(!file.exists());
         }
+        assert!(!is_blank(b"\xa0\n"), "not UTF-8");
     }
 
     #[test]

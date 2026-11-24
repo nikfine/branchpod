@@ -277,6 +277,9 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
   `{{command.<name>.stdout}}` is then unavailable, with an error that says so.
 - Blank output (nothing, or only a byte order mark and whitespace) fails the step: an empty env file would
   be taken for a real one. Whitespace counts because tools end even an empty result with a line break.
+- An env file has one variable per line, so the example does not carry values with line breaks (PEM, JSON)
+  over: each further line is taken for a variable of its own, or rejected. Docker then quotes the line, or
+  its part before `=`, on stderr, which shows in the error of `bp up`, the ledger and `bp status --json`.
 - The output may hold secrets, so it is nowhere but in the file: not in the ledger, `bp status --json`, what
   `bp up` prints, or an error. The run log (#9) must not get the stdout of such a command either. stderr is
   not part of the output and is quoted in errors as for any command, as is the stderr of a command that
@@ -285,8 +288,10 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
   that mounts the file and runs as another user cannot read it. On Windows both inherit the permissions
   of the `bp` home; the default one is in the user's profile.
 - The path is known before `create` runs, so the intent has it and `destroy` is always rendered into the
-  intent, also when it references the file. Before `create` runs, a file left there earlier is removed, so
-  an existing file is this command's output. The file is written atomically.
+  intent, also when it references the file. The file is written atomically.
+- `bp up` on a pod with nothing left to destroy starts by removing the whole `outputs` directory, which an
+  earlier `down` may have failed to remove: its files may hold secrets, under names the config no longer
+  has, and must not pass for new output. If it cannot be removed, `up` fails.
 - After an interruption before the file was written, or a failed `create`, `bp down` still runs `destroy`
   but the file does not exist. `destroy` should therefore find the resource by its name or label, not need
   the file.
