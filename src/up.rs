@@ -151,8 +151,9 @@ pub(crate) fn up(
         id: id.clone(),
         worktree: wt.root.clone(),
         main_checkout: wt.main_checkout.clone(),
+        unfinished: None,
     };
-    store.write_meta(&meta)?;
+    store.write_meta(&meta.with(Some(pod::Unfinished::Up)))?;
 
     let mut journal = Journal {
         ledger: Ledger::open(&store.ledger_path(&id))?,
@@ -172,7 +173,7 @@ pub(crate) fn up(
         &mut items,
         &mut warnings,
     );
-    match result {
+    match result.and_then(|()| store.write_meta(&meta)) {
         Ok(()) => Ok(Report {
             pod: meta,
             items,
@@ -416,7 +417,7 @@ fn builtin_vars(id: &str, wt: &Worktree) -> Vars {
 /// `path` quoted for the user's shell, for a command to copy from a message: single quotes on
 /// Unix (nothing expands inside them), double quotes on Windows (`cmd.exe` knows no others;
 /// PowerShell takes both).
-fn quote(path: &Path) -> String {
+pub(crate) fn quote(path: &Path) -> String {
     let text = path.display().to_string();
     if cfg!(windows) {
         format!("\"{text}\"")

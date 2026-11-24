@@ -45,7 +45,8 @@ struct Pod {
     _tmp: tempfile::TempDir,
     home: PathBuf,
     worktree: PathBuf,
-    /// Killed on drop: one that its supervisor no longer knows outlives it on Unix.
+    /// A service that may outlive its supervisor (Unix), for as long as it is known to run. Killed on
+    /// drop.
     orphan: Option<u64>,
 }
 
@@ -256,12 +257,12 @@ fn a_service_that_exited_degrades_the_pod() {
         health["problems"],
         json!([{ "kind": "service", "name": "web", "state": "exited" }])
     );
-    assert!(health["hint"].as_str().unwrap().contains("`bp down`"));
+    assert!(health["hint"].as_str().unwrap().contains("`bp down "));
 
     let (code, out) = pod.text();
     assert_eq!(code, DEGRADED);
     assert!(out.contains("exited (code 3) "), "{out}");
-    assert!(out.contains("\ndegraded: run `bp down`"), "{out}");
+    assert!(out.contains("\ndegraded: run `bp down "), "{out}");
     assert!(out.ends_with("\n  | last words\n"), "{out}");
 }
 
@@ -271,7 +272,7 @@ fn a_killed_supervisor_degrades_the_pod() {
     pod.wait_for_log("started");
     let (_, status) = pod.json();
     let service = pid(resource(&status, "service"));
-    pod.orphan = Some(service);
+    pod.orphan = cfg!(unix).then_some(service);
     kill(pid(resource(&status, "supervisor")));
 
     if cfg!(unix) {
@@ -281,6 +282,7 @@ fn a_killed_supervisor_degrades_the_pod() {
         assert_eq!(resource(&status, "supervisor")["runtime"]["state"], "gone");
         assert!(pod.text().1.contains("orphaned"));
         kill(service);
+        pod.orphan = None; // its pid is free from now on
     }
     let (code, status) = pod.wait_for("gone");
     assert_eq!(code, DEGRADED);
@@ -290,7 +292,13 @@ fn a_killed_supervisor_degrades_the_pod() {
         resource(&status, "service")["runtime"]["log"]["tail"],
         json!(["started"])
     );
-    assert_eq!(status["health"]["hint"], "run `bp down`, then `bp up`");
+    // The caller may be in another worktree.
+    let hint = status["health"]["hint"].as_str().unwrap();
+    let path = pod.worktree.to_str().unwrap();
+    assert!(
+        hint.starts_with("run `bp down ") && hint.matches(path).count() == 2,
+        "{hint}"
+    );
     let (code, out) = pod.text();
     assert_eq!(code, DEGRADED);
     assert!(out.contains("\n  | started\n"), "{out}");
@@ -325,8 +333,24 @@ fn a_pod_that_is_worked_on_is_busy() {
     assert_eq!(code, BUSY);
     assert!(out.contains("\nbusy: bp down (pid 5"), "{out}");
 
+    // Its record may be missing. A pod that looks healthy is not looked at closer, one that does not
+    // is.
+    fs::remove_file(&holder).unwrap();
+    assert_eq!(pod.json().0, HEALTHY);
+    let meta = pod.home.join("pods").join(&id).join("pod.json");
+    let good = fs::read_to_string(&meta).unwrap();
+    let unfinished = good.replacen('{', r#"{ "unfinished": "up","#, 1);
+    fs::write(&meta, &unfinished).unwrap();
+    let (code, status) = pod.json();
+    assert_eq!((code, &status["pod"]["unfinished"]), (BUSY, &json!("up")));
+    let hint = status["health"]["hint"].as_str().unwrap();
+    assert!(hint.starts_with("another bp process"), "{hint}");
+
     // The record of one that crashed does not make the pod busy.
     drop(lock);
+    fs::write(&holder, record.to_string()).unwrap();
+    assert_eq!(pod.json().0, DEGRADED);
+    fs::write(&meta, good).unwrap();
     assert_eq!(pod.json().0, HEALTHY);
     fs::remove_file(holder).unwrap();
 }
@@ -343,4 +367,146 @@ fn no_pod_is_not_a_failure() {
     let (code, out) = pod.text();
     assert_eq!(code, 0);
     assert!(out.starts_with("no pod for "), "{out}");
+}
+
+/// The service is rejected while planning, so that the ledger does not know it: `{{command.env.stdout}}`
+/// is known to be empty only once the command has run.
+#[test]
+fn a_pod_whose_up_failed_is_degraded_whatever_is_recorded() {
+    let pod = Pod::new();
+    let nothing = if cfg!(windows) {
+        ["cmd", "/d", "/c", "rem"].as_slice()
+    } else {
+        &["true"]
+    };
+    let config = format!(
+        "version = 1\n[[command]]\nname = \"env\"\ncreate = {}\n\
+         [[command]]\nname = \"app\"\ncreate = [\"x\", \"{{{{command.env.stdout}}}}\"]\n",
+        json!(nothing)
+    );
+    fs::write(pod.worktree.join("branchpod.toml"), config).unwrap();
+    let up = pod.bp(&["up".as_ref(), pod.worktree.as_os_str()]);
+    assert_eq!(up.status.code(), Some(1), "{}", text(&up.stderr));
+
+    let (code, status) = pod.json();
+    assert_eq!(code, DEGRADED, "{status:#}");
+    assert_eq!(resource(&status, "command")["status"], "live");
+    assert_eq!(status["pod"]["unfinished"], "up");
+    assert_eq!(status["health"]["problems"], json!([]));
+    let (code, out) = pod.text();
+    assert_eq!(code, DEGRADED);
+    assert!(
+        out.contains("\ndegraded: `bp up` did not finish; run `bp down "),
+        "{out}"
+    );
+
+    // Finished with another configuration.
+    let down = pod.bp(&["down".as_ref(), pod.worktree.as_os_str()]);
+    assert!(down.status.success(), "{}", text(&down.stderr));
+    fs::write(pod.worktree.join("branchpod.toml"), "version = 1\n").unwrap();
+    let up = pod.bp(&["up".as_ref(), pod.worktree.as_os_str()]);
+    assert!(up.status.success(), "{}", text(&up.stderr));
+    let (code, status) = pod.json();
+    assert_eq!(
+        (code, &status["pod"]["unfinished"]),
+        (HEALTHY, &Value::Null)
+    );
+}
+
+/// The file link goes first, so what is left of the pod looks fine.
+#[test]
+fn a_pod_whose_down_was_killed_is_degraded() {
+    let pod = Pod::new();
+    let main = pod.worktree.with_file_name("main");
+    let git = |dir: &PathBuf, args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output();
+        let out = out.unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+    };
+    fs::remove_dir_all(&pod.worktree).unwrap();
+    fs::create_dir_all(main.join("vendor")).unwrap();
+    git(&main, &["init", "-q"]);
+    let author = ["-c", "user.name=t", "-c", "user.email=t@example.com"];
+    let commit = ["commit", "-q", "--allow-empty", "-m", "x"];
+    git(&main, &[&author[..], &commit].concat());
+    git(
+        &main,
+        &["worktree", "add", "-q", pod.worktree.to_str().unwrap()],
+    );
+
+    // Waits for a file in the worktree, so that nothing is left running.
+    let (create, destroy) = if cfg!(windows) {
+        let wait =
+            "for /L %i in (1,1,60) do @(if exist go (exit 0) else ping -n 2 127.0.0.1 > nul)";
+        (
+            ["cmd", "/d", "/c", "rem"].to_vec(),
+            ["cmd", "/d", "/c", wait].to_vec(),
+        )
+    } else {
+        let wait = "until [ -e go ]; do sleep 0.1; done";
+        (vec!["true"], ["sh", "-c", wait].to_vec())
+    };
+    let config = format!(
+        "version = 1\n[[file]]\npath = \"vendor\"\nmode = \"link\"\n\
+         [[command]]\nname = \"app\"\ncreate = {}\ndestroy = {}\n",
+        json!(create),
+        json!(destroy)
+    );
+    fs::write(pod.worktree.join("branchpod.toml"), config).unwrap();
+    let up = pod.bp(&["up".as_ref(), pod.worktree.as_os_str()]);
+    assert!(up.status.success(), "{}", text(&up.stderr));
+    assert_eq!(pod.json().0, HEALTHY);
+
+    let mut down = Command::new(env!("CARGO_BIN_EXE_branchpod"))
+        .arg("down")
+        .arg(&pod.worktree)
+        .env("BRANCHPOD_HOME", &pod.home)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fs::symlink_metadata(pod.worktree.join("vendor")).is_ok() {
+        assert!(Instant::now() < deadline, "the link is still there");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Recorded, too.
+    while resource(&pod.json().1, "file")["status"] != "destroyed" {
+        assert!(Instant::now() < deadline, "the link is still recorded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(pod.json().0, BUSY);
+    down.kill().unwrap();
+    down.wait().unwrap();
+
+    let (code, status) = pod.json();
+    assert_eq!(code, DEGRADED, "{status:#}");
+    assert_eq!(resource(&status, "command")["status"], "live");
+    let hint = status["health"]["hint"].as_str().unwrap();
+    assert!(hint.starts_with("`bp down` did not finish; run"), "{hint}");
+
+    // And the hint is right.
+    fs::write(pod.worktree.join("go"), "").unwrap();
+    let down = pod.bp(&["down".as_ref(), pod.worktree.as_os_str()]);
+    assert!(down.status.success(), "{}", text(&down.stderr));
+    assert_eq!(pod.json().1["pod"], Value::Null);
+}
+
+#[test]
+fn a_reader_that_has_seen_enough_does_not_change_the_exit_code() {
+    let pod = Pod::up(&quiet());
+    for args in [&["status"][..], &["status", "--json"]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_branchpod"))
+            .args(args)
+            .arg(&pod.worktree)
+            .env("BRANCHPOD_HOME", &pod.home)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(HEALTHY));
+        assert_eq!(text(&out.stderr), "");
+    }
 }

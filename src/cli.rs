@@ -69,20 +69,15 @@ pub fn up(path: Option<&OsStr>) -> Result<ExitCode> {
 pub fn status(path: Option<&OsStr>, json: bool) -> Result<ExitCode> {
     let store = pod::Store::open()?;
     let (target, meta) = find_pod(&store, path)?;
-    let found = match meta {
+    let report = match meta {
         Some(meta) => status::look(
             &store.pod_dir(&meta.id),
-            || {
-                let resources = read_resources(&store, &meta)?;
-                let torn_down = resources.is_empty() && !is_there(&store, &meta);
-                Ok((!torn_down).then_some(resources))
-            },
+            || read_pod(&store, &meta.id),
             |sure| at_work(&store, &meta.id, sure),
-        )?
-        .map(|report| (meta, report)),
+        )?,
         None => None,
     };
-    let Some((meta, report)) = found else {
+    let Some(report) = report else {
         if json {
             let out = json!({
                 "schema": JSON_SCHEMA, "pod": null, "resources": [], "health": null,
@@ -96,13 +91,13 @@ pub fn status(path: Option<&OsStr>, json: bool) -> Result<ExitCode> {
     if json {
         let out = json!({
             "schema": JSON_SCHEMA,
-            "pod": meta,
+            "pod": report.pod,
             "resources": report.resources,
             "health": report.health,
         });
         print_out(&serde_json::to_string_pretty(&out)?)?;
     } else {
-        print_out(report.text(&meta, supervisor::now_ms()).trim_end())?;
+        print_out(report.text(supervisor::now_ms()).trim_end())?;
     }
     Ok(match report.health.state {
         status::Health::Healthy => ExitCode::SUCCESS,
@@ -128,6 +123,19 @@ fn at_work(store: &pod::Store, id: &str, sure: bool) -> Option<String> {
         return None;
     }
     Some(holder.map_or_else(|| "another bp process".to_owned(), |h| h.to_string()))
+}
+
+/// What is recorded about pod `id`; `None` if it is torn down.
+fn read_pod(store: &pod::Store, id: &str) -> Result<Option<status::Recorded>> {
+    let Some(meta) = store.meta(id)? else {
+        return Ok(None);
+    };
+    let resources = read_resources(store, &meta)?;
+    // Not the pod that `meta` says any more: its state has just been removed.
+    if resources.is_empty() && !is_there(store, &meta) {
+        return Ok(None);
+    }
+    Ok(Some(status::Recorded { meta, resources }))
 }
 
 /// Whether the pod still exists.
@@ -541,6 +549,22 @@ mod tests {
             await_record("web", reads(answers), || false).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn a_pod_without_resources_is_still_a_pod() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = pod::Store::at(dir.path().to_path_buf());
+        assert!(read_pod(&store, "p").unwrap().is_none());
+        let meta = json!({ "v": 1, "id": "p", "worktree": "/wt", "unfinished": "up" });
+        let meta = serde_json::from_value(meta).unwrap();
+        store.write_meta(&meta).unwrap();
+        let pod = read_pod(&store, "p").unwrap().unwrap();
+        assert_eq!((pod.meta, pod.resources), (meta, vec![]));
+        // Its removal was interrupted before the last file.
+        std::fs::write(store.ledger_path("p"), "").unwrap();
+        std::fs::remove_file(store.pod_dir("p").join("pod.json")).unwrap();
+        assert!(read_pod(&store, "p").unwrap().is_none());
     }
 
     #[test]

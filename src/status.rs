@@ -17,10 +17,10 @@ use serde::Serialize;
 
 use crate::ledger::{Kind, ResourceState, Status};
 use crate::logs::read::Snapshot;
-use crate::pod::PodMeta;
+use crate::pod::{PodMeta, Unfinished};
 use crate::proc::{self, ProcId};
 use crate::supervisor::{self, Exit, ServiceStatus};
-use crate::{down, services};
+use crate::{down, services, up};
 
 /// How long the supervisor gets to answer. Whoever asks for the status wants to know that it hangs.
 const ANSWER_WAIT: Duration = Duration::from_secs(3);
@@ -127,6 +127,7 @@ pub(crate) enum Health {
 #[derive(Debug, Serialize)]
 pub(crate) struct Summary {
     pub(crate) state: Health,
+    /// Empty also when all that is wrong is that the pod is `unfinished`.
     problems: Vec<Problem>,
     /// What to do next.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,19 +150,27 @@ enum Is {
     Status(Status),
 }
 
+/// What is recorded about a pod.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Recorded {
+    pub(crate) meta: PodMeta,
+    pub(crate) resources: Vec<ResourceState>,
+}
+
 /// The status of a pod.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct Report {
+    pub(crate) pod: PodMeta,
     pub(crate) resources: Vec<View>,
     pub(crate) health: Summary,
 }
 
-/// Looks at a pod whose state is in `pod_dir`. `None` if it is torn down meanwhile. `read` reads its
-/// ledger, with `None` for a pod that is gone. `at_work` names the `bp up` or `bp down` that runs, if
+/// Looks at a pod whose state is in `pod_dir`. `None` if it is torn down meanwhile. `read` reads
+/// what is recorded, with `None` for a pod that is gone. `at_work` names the `bp up` or `bp down` that runs, if
 /// any; it is asked to make sure (`true`) if it matters.
 pub(crate) fn look(
     pod_dir: &Path,
-    read: impl Fn() -> Result<Option<Vec<ResourceState>>>,
+    read: impl Fn() -> Result<Option<Recorded>>,
     at_work: impl Fn(bool) -> Option<String>,
 ) -> Result<Option<Report>> {
     look_with(pod_dir, read, at_work, observe)
@@ -169,43 +178,39 @@ pub(crate) fn look(
 
 fn look_with(
     pod_dir: &Path,
-    read: impl Fn() -> Result<Option<Vec<ResourceState>>>,
+    read: impl Fn() -> Result<Option<Recorded>>,
     at_work: impl Fn(bool) -> Option<String>,
     observe: impl Fn(Option<&supervisor::Record>) -> Supervisor,
 ) -> Result<Option<Report>> {
-    let Some(mut resources) = read()? else {
+    let Some(mut recorded) = read()? else {
         return Ok(None);
     };
     for attempt in 1.. {
-        let record = supervisor_record(&resources);
+        let record = supervisor_record(&recorded.resources);
         let supervisor = observe(record.as_ref());
-        let mut views = assess(&resources, &supervisor, proc::is_running);
+        let mut views = assess(&recorded.resources, &supervisor, proc::is_running);
         let problems = problems(&views);
-        let work = at_work(!problems.is_empty());
-        if work.is_none() && !problems.is_empty() && attempt < LOOKS {
+        let good = problems.is_empty() && recorded.meta.unfinished.is_none();
+        let work = at_work(!good);
+        if work.is_none() && !good && attempt < LOOKS {
             let Some(now) = read()? else {
                 return Ok(None);
             };
-            if now != resources {
-                resources = now;
+            if now != recorded {
+                recorded = now;
                 continue;
             }
         }
         add_logs(&mut views, pod_dir);
+        let pod = recorded.meta;
+        let hang = hang(&supervisor, record.and_then(|r| r.process));
         let (state, hint) = match work {
-            Some(work) => (
-                Health::Busy,
-                Some(format!(
-                    "{work} is at work; wait for it to end, then run `bp status` again"
-                )),
-            ),
-            None if problems.is_empty() => (Health::Healthy, None),
-            None => (
-                Health::Degraded,
-                Some(hint(&views, &supervisor, record.and_then(|r| r.process))),
-            ),
+            Some(work) => (Health::Busy, Some(busy_hint(&work, &pod, hang))),
+            None if good => (Health::Healthy, None),
+            None => (Health::Degraded, Some(hint(&pod, hang))),
         };
         return Ok(Some(Report {
+            pod,
             resources: views,
             health: Summary {
                 state,
@@ -224,7 +229,7 @@ enum Supervisor {
     Running(Vec<ServiceStatus>),
     Unresponsive {
         error: String,
-        /// Whatever asks it next may wait for it without end.
+        /// It took the request and did not answer: whatever asks it next may wait without end.
         hangs: bool,
     },
     Gone,
@@ -251,15 +256,16 @@ fn observe(record: Option<&supervisor::Record>) -> Supervisor {
         Ok(services) => return Supervisor::Running(services),
         Err(e) => e,
     };
-    let unreachable = supervisor::is_unreachable(&error);
+    let hangs = error.downcast_ref::<supervisor::NoAnswer>().is_some();
     match record.process {
-        None if unreachable => return Supervisor::NotStarted,
+        None if supervisor::is_unreachable(&error) => return Supervisor::NotStarted,
         None => {}
         // One that is being killed stops answering before it is gone.
         Some(process) => {
-            let wait = match error.downcast_ref::<supervisor::NoAnswer>() {
-                Some(_) => Duration::ZERO,
-                None => down::DYING_WAIT,
+            let wait = if hangs {
+                Duration::ZERO
+            } else {
+                down::DYING_WAIT
             };
             if proc::wait_gone(process, wait) {
                 return Supervisor::Gone;
@@ -268,7 +274,7 @@ fn observe(record: Option<&supervisor::Record>) -> Supervisor {
     }
     Supervisor::Unresponsive {
         error: format!("{error:#}"),
-        hangs: !unreachable,
+        hangs,
     }
 }
 
@@ -318,16 +324,11 @@ fn service_runtime(
             };
         }
     };
-    let Some(process) = record.process else {
-        return Runtime {
-            error: resource.error.clone(),
-            ..State::NotStarted.into()
-        };
-    };
+    // Without a recorded process (`bp up` was interrupted) any of that name is the one.
     if let Supervisor::Running(services) = supervisor
         && let Some(service) = services
             .iter()
-            .find(|s| s.name == resource.name && s.process == process)
+            .find(|s| s.name == resource.name && record.process.is_none_or(|p| p == s.process))
     {
         return match (service.ended, &service.exit) {
             (Some(ended), _) => Runtime {
@@ -339,6 +340,9 @@ fn service_runtime(
             (None, None) => State::Running.into(),
         };
     }
+    let Some(process) = record.process else {
+        return State::NotStarted.into();
+    };
     match supervisor {
         _ if !alive(process) => State::Gone.into(),
         Supervisor::Unresponsive { .. } => State::Running.into(),
@@ -347,21 +351,15 @@ fn service_runtime(
 }
 
 fn problems(views: &[View]) -> Vec<Problem> {
-    // Those destroyed before anything else was recorded are of an earlier run, whose state `bp down`
-    // could not remove. After that they are a sign of a `bp down` that did not finish.
-    let first = views
-        .iter()
-        .position(|v| v.resource.status != Status::Destroyed)
-        .unwrap_or(0);
     views
         .iter()
-        .enumerate()
-        .filter_map(|(i, view)| {
+        .filter_map(|view| {
             let r = &view.resource;
             let is = match (&view.runtime, r.status) {
                 (Some(runtime), _) if runtime.state != State::Running => Is::State(runtime.state),
-                (_, Status::Live) => return None,
-                (_, Status::Destroyed) if i < first => return None,
+                // Destroyed ones may be of an earlier run. A `bp down` that did not finish is told
+                // by the pod itself.
+                (_, Status::Live | Status::Destroyed) => return None,
                 (_, status) => Is::Status(status),
             };
             Some(Problem {
@@ -373,23 +371,45 @@ fn problems(views: &[View]) -> Vec<Problem> {
         .collect()
 }
 
-/// The next step for a pod that is degraded. Two commands, not `a && b`, which not every shell has.
-fn hint(views: &[View], supervisor: &Supervisor, process: Option<ProcId>) -> String {
-    if let Supervisor::Unresponsive { hangs: true, .. } = supervisor {
-        // `bp down` waits for its answer, however long that takes.
-        let which = match process {
-            Some(process) => format!("process {}", process.pid),
-            None => "its process".to_owned(),
-        };
-        return format!(
-            "the supervisor does not answer; if that does not change, end {which}, then run \
-             `bp down` and `bp up`"
-        );
+/// What to do about a supervisor that hangs: `bp down` waits for its answer, however long that takes.
+fn hang(supervisor: &Supervisor, process: Option<ProcId>) -> Option<String> {
+    let Supervisor::Unresponsive { hangs: true, .. } = supervisor else {
+        return None;
+    };
+    let which = match process {
+        Some(process) => format!("process {}", process.pid),
+        None => "its process".to_owned(),
+    };
+    Some(format!(
+        "the supervisor does not answer; if that does not change, end {which}"
+    ))
+}
+
+/// The next step for a pod that is degraded. With the path: the caller may be in another worktree.
+/// Two commands, not `a && b`, which not every shell has.
+fn hint(pod: &PodMeta, hang: Option<String>) -> String {
+    let path = up::quote(&pod.worktree);
+    let (reason, again) = match pod.unfinished {
+        Some(Unfinished::Up) => ("`bp up` did not finish; ", ""),
+        Some(Unfinished::Down) => ("`bp down` did not finish; ", " again"),
+        None => ("", ""),
+    };
+    let steps = format!("run `bp down {path}`{again}, then `bp up {path}`");
+    match hang {
+        Some(hang) => format!("{hang}, then {steps}"),
+        None => format!("{reason}{steps}"),
     }
-    if views.iter().all(|v| v.resource.status == Status::Destroyed) {
-        return "the pod was torn down; run `bp up` to bring it up again".to_owned();
+}
+
+/// The same for a pod that `work` is at.
+fn busy_hint(work: &str, pod: &PodMeta, hang: Option<String>) -> String {
+    let path = up::quote(&pod.worktree);
+    let wait = format!("{work} is at work; wait for it to end, then run `bp status {path}` again");
+    match hang {
+        // It may be the very thing that is waited for.
+        Some(hang) => format!("{wait}; {hang}"),
+        None => wait,
     }
-    "run `bp down`, then `bp up`".to_owned()
 }
 
 fn add_logs(views: &mut [View], pod_dir: &Path) {
@@ -447,7 +467,7 @@ fn last_lines(mut bytes: &[u8], more: bool) -> (Vec<String>, bool, bool) {
         bytes = &bytes[cut..];
     }
     let text = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    if text.is_empty() && bytes.is_empty() {
+    if bytes.is_empty() {
         return (Vec::new(), more, false);
     }
     let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
@@ -467,8 +487,8 @@ fn last_lines(mut bytes: &[u8], more: bool) -> (Vec<String>, bool, bool) {
 impl Report {
     /// For people: a line per resource, the summary, and the end of the logs of services that do not
     /// run. `now` is in milliseconds since the Unix epoch.
-    pub(crate) fn text(&self, meta: &PodMeta, now: u64) -> String {
-        let mut out = format!("pod {} ({})\n", meta.id, meta.worktree.display());
+    pub(crate) fn text(&self, now: u64) -> String {
+        let mut out = format!("pod {} ({})\n", self.pod.id, self.pod.worktree.display());
         for view in &self.resources {
             let r = &view.resource;
             let is = describe(view, now);
@@ -503,22 +523,23 @@ impl Report {
 }
 
 fn describe(view: &View, now: u64) -> String {
-    let status = view.resource.status;
-    let Some(runtime) = &view.runtime else {
-        return status.to_string();
+    let resource = &view.resource;
+    let mut error = resource.error.as_ref();
+    let mut text = match (&view.runtime, resource.status) {
+        (None, status) => status.to_string(),
+        (Some(runtime), Status::Live) => runtime.state.as_str().to_owned(),
+        (Some(runtime), status) => format!("{status}, {}", runtime.state.as_str()),
     };
-    let mut text = match status {
-        Status::Live => String::new(),
-        status => format!("{status}, "),
-    };
-    text.push_str(runtime.state.as_str());
-    if let Some(exit) = runtime.exit {
-        let _ = write!(text, " ({exit})");
+    if let Some(runtime) = &view.runtime {
+        if let Some(exit) = runtime.exit {
+            let _ = write!(text, " ({exit})");
+        }
+        if let Some(at) = runtime.exited_at_ms {
+            let _ = write!(text, " {} ago", age(now.saturating_sub(at) / 1000));
+        }
+        error = runtime.error.as_ref().or(error);
     }
-    if let Some(at) = runtime.exited_at_ms {
-        let _ = write!(text, " {} ago", age(now.saturating_sub(at) / 1000));
-    }
-    if let Some(e) = &runtime.error {
+    if let Some(e) = error {
         let _ = write!(text, ": {}", plain(e.lines().next().unwrap_or_default()));
     }
     text
@@ -575,6 +596,23 @@ mod tests {
 
     fn port(status: Status) -> ResourceState {
         resource(Kind::Port, "web", status, Value::Null)
+    }
+
+    fn meta(unfinished: Option<Unfinished>) -> PodMeta {
+        PodMeta {
+            v: 1,
+            id: "p-1".into(),
+            worktree: "/wt".into(),
+            main_checkout: None,
+            unfinished,
+        }
+    }
+
+    fn recorded(resources: Vec<ResourceState>) -> Recorded {
+        Recorded {
+            meta: meta(None),
+            resources,
+        }
     }
 
     fn unresponsive() -> Supervisor {
@@ -646,7 +684,7 @@ mod tests {
         let runtime = |i: usize| views[i].runtime.as_ref().unwrap();
         assert_eq!(runtime(0).state, State::NotStarted);
         assert_eq!(runtime(1).state, State::NotStarted);
-        assert_eq!(runtime(1).error.as_deref(), Some("boom"));
+        assert!(describe(&views[1], 0).ends_with("failed, not started: boom"));
         assert_eq!(runtime(2).state, State::Unknown);
         assert_eq!(
             serde_json::to_value(problems(&views)).unwrap()[0],
@@ -654,8 +692,20 @@ mod tests {
         );
     }
 
+    /// `bp up` was interrupted after the supervisor had started it.
     #[test]
-    fn what_is_not_live_is_a_problem_unless_it_is_of_an_earlier_run() {
+    fn a_service_whose_start_was_not_recorded_is_what_its_supervisor_says() {
+        let views = assess(
+            &[web(Status::Pending, None)],
+            &answer(P, None, None),
+            |_| panic!("no process to look for"),
+        );
+        assert_eq!(views[0].runtime, Some(State::Running.into()));
+        assert_eq!(problems(&views)[0].is, Is::Status(Status::Pending));
+    }
+
+    #[test]
+    fn what_is_neither_live_nor_destroyed_is_a_problem() {
         let found = |statuses: &[Status]| -> Vec<Is> {
             let resources: Vec<_> = statuses.iter().map(|&s| port(s)).collect();
             let views = assess(&resources, &Supervisor::Unknown, |_| true);
@@ -665,8 +715,7 @@ mod tests {
         assert_eq!(found(&[]), []);
         assert_eq!(found(&[Live, Live]), []);
         assert_eq!(found(&[Destroyed, Live]), []);
-        assert_eq!(found(&[Live, Destroyed]), [Is::Status(Destroyed)]);
-        assert_eq!(found(&[Destroyed]), [Is::Status(Destroyed)]);
+        assert_eq!(found(&[Live, Destroyed]), []);
         assert_eq!(
             found(&[Pending, Failed]),
             [Is::Status(Pending), Is::Status(Failed)]
@@ -682,7 +731,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         look_with(
             dir.path(),
-            || Ok(reads.borrow_mut().next().expect("one read too many")),
+            || {
+                let read = reads.borrow_mut().next().expect("one read too many");
+                Ok(read.map(recorded))
+            },
             at_work,
             |_| Supervisor::Gone,
         )
@@ -734,23 +786,85 @@ mod tests {
         assert_eq!(report.unwrap().health.state, Health::Degraded);
     }
 
+    /// Whatever is left looks fine: `up` rejected the next resource before recording it, or `down`
+    /// had only come to the first one.
     #[test]
-    fn the_hint_never_leads_into_a_command_that_hangs() {
-        let views = assess(&[port(Status::Failed)], &Supervisor::Unknown, |_| true);
-        let text = hint(&views, &unresponsive(), Some(P));
-        assert!(text.contains("end process 7"), "{text}");
-        // Nothing listens: `bp down` notices that.
+    fn a_pod_that_is_unfinished_is_degraded() {
+        for (unfinished, resources) in [
+            (Unfinished::Up, vec![]),
+            (Unfinished::Up, vec![port(Status::Live)]),
+            (
+                Unfinished::Down,
+                vec![port(Status::Destroyed), port(Status::Live)],
+            ),
+        ] {
+            let pod = Recorded {
+                meta: meta(Some(unfinished)),
+                resources,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let look = |read: &dyn Fn() -> Recorded, work: Option<&str>| {
+                let at_work = |sure: bool| {
+                    assert!(sure);
+                    work.map(str::to_owned)
+                };
+                look_with(
+                    dir.path(),
+                    || Ok(Some(read())),
+                    at_work,
+                    |_| Supervisor::Gone,
+                )
+                .unwrap()
+                .unwrap()
+                .health
+            };
+            let health = look(&|| pod.clone(), None);
+            assert_eq!(health.state, Health::Degraded);
+            let hint = health.hint.unwrap();
+            let name = format!("`bp {unfinished:?}` did not finish").to_lowercase();
+            assert!(hint.starts_with(&name), "{hint}");
+            assert_eq!(look(&|| pod.clone(), Some("bp")).state, Health::Busy);
+            // It finishes while it is looked at.
+            let first = RefCell::new(Some(pod.clone()));
+            let read = || first.take().unwrap_or(recorded(vec![port(Status::Live)]));
+            let at_work = |_| None;
+            let health = look_with(
+                dir.path(),
+                || Ok(Some(read())),
+                at_work,
+                |_| Supervisor::Gone,
+            );
+            let health = health.unwrap().unwrap().health;
+            assert_eq!(health.state, Health::Healthy);
+        }
+    }
+
+    #[test]
+    fn the_hint_names_the_worktree_and_never_leads_into_a_command_that_hangs() {
+        let path = up::quote(Path::new("/wt"));
+        let steps = format!("run `bp down {path}`, then `bp up {path}`");
+        // Nothing listens: `bp down` notices that. Nor does it wait for one that refuses.
         let cut_off = Supervisor::Unresponsive {
             error: "nothing listens".into(),
             hangs: false,
         };
         for supervisor in [cut_off, Supervisor::Gone] {
-            let text = hint(&views, &supervisor, Some(P));
-            assert_eq!(text, "run `bp down`, then `bp up`");
+            assert_eq!(hang(&supervisor, Some(P)), None);
         }
-        let views = assess(&[port(Status::Destroyed)], &Supervisor::Unknown, |_| true);
-        let text = hint(&views, &Supervisor::Unknown, None);
-        assert!(text.contains("run `bp up`"), "{text}");
+        assert_eq!(hint(&meta(None), None), steps);
+        let hang = hang(&unresponsive(), Some(P));
+        let text = hint(&meta(None), hang.clone());
+        assert!(text.contains("end process 7, then run"), "{text}");
+        assert!(text.ends_with(&steps), "{text}");
+
+        let text = busy_hint("bp down (pid 5)", &meta(None), None);
+        assert!(
+            text.ends_with(&format!("run `bp status {path}` again")),
+            "{text}"
+        );
+        let text = busy_hint("bp down (pid 5)", &meta(None), hang);
+        assert!(text.starts_with("bp down (pid 5)"), "{text}");
+        assert!(text.ends_with("end process 7"), "{text}");
     }
 
     #[test]
@@ -803,9 +917,13 @@ mod tests {
             ..State::Exited.into()
         };
         let view = |resource, runtime| View { resource, runtime };
+        let mut failed = port(Status::Failed);
+        failed.error = Some("no port\nin the range".into());
         let report = Report {
+            pod: meta(None),
             resources: vec![
                 view(port(Status::Live), None),
+                view(failed, None),
                 view(web(Status::Failed, Some(P)), Some(State::Orphaned.into())),
                 view(web(Status::Live, Some(P)), Some(runtime)),
             ],
@@ -815,16 +933,11 @@ mod tests {
                 hint: Some("do it".into()),
             },
         };
-        let meta = PodMeta {
-            v: 1,
-            id: "p-1".into(),
-            worktree: "/wt".into(),
-            main_checkout: None,
-        };
         assert_eq!(
-            report.text(&meta, 126_000),
+            report.text(126_000),
             "pod p-1 (/wt)\n\
              \x20 port       web                      live\n\
+             \x20 port       web                      failed: no port\n\
              \x20 service    web                      failed, orphaned\n\
              \x20 service    web                      exited (code 1) 2m ago\n\
              degraded: do it\n\
@@ -893,7 +1006,7 @@ mod tests {
         fn look(&self) -> Report {
             look(
                 self.tmp.path(),
-                || Ok(Some(self.resources.clone())),
+                || Ok(Some(recorded(self.resources.clone()))),
                 |_| None,
             )
             .unwrap()
@@ -974,9 +1087,13 @@ mod tests {
         // The second one finds the place of the next client taken.
         for _ in 0..2 {
             let started = Instant::now();
-            let report = look(tmp.path(), || Ok(Some(resources.clone())), |_| None)
-                .unwrap()
-                .unwrap();
+            let report = look(
+                tmp.path(),
+                || Ok(Some(recorded(resources.clone()))),
+                |_| None,
+            )
+            .unwrap()
+            .unwrap();
             assert!(started.elapsed() < ANSWER_WAIT + Duration::from_secs(5));
             let runtime = |i: usize| report.resources[i].runtime.as_ref().unwrap();
             assert_eq!(runtime(0).state, State::Unresponsive);
@@ -987,6 +1104,30 @@ mod tests {
             assert!(hint.contains(&format!("end process {}", me.pid)), "{hint}");
         }
         drop(server);
+    }
+
+    /// One of another version, say. `bp down` gets the same answer and does not wait.
+    #[test]
+    fn a_supervisor_that_refuses_does_not_hang() {
+        let endpoint = control::new_endpoint("test").unwrap();
+        let mut server = Server::bind(&endpoint).unwrap();
+        let me = proc::identify(std::process::id()).unwrap();
+        let record = supervisor::Record {
+            endpoint,
+            process: Some(me),
+        };
+        let observer = std::thread::spawn(move || observe(Some(&record)));
+        let conn = server.accept().unwrap();
+        conn.read_line().unwrap();
+        conn.write_line(r#"{"v":1,"result":"error","message":"no"}"#)
+            .unwrap();
+        drop(conn);
+        match observer.join().unwrap() {
+            Supervisor::Unresponsive { error, hangs } => {
+                assert_eq!((&*error, hangs), ("no", false))
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Its endpoint was removed, by whoever cleans up the directory for temporary files, say.

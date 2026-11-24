@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::files::{self, EntryType};
 use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
-use crate::pod::{PodMeta, Store};
+use crate::pod::{PodMeta, Store, Unfinished};
 use crate::saved::Saved;
 use crate::supervisor::{self, Request};
 use crate::{commands, control, ports, proc, services};
@@ -77,6 +77,8 @@ pub(crate) fn teardown(
     let mut steps = Vec::new();
     if !todo.is_empty() {
         let mut ledger = Ledger::open(&store.ledger_path(&meta.id))?;
+        // For `bp status` only: failing to say so is no reason not to tear down.
+        let _ = store.write_meta(&meta.with(Some(Unfinished::Down)));
         for i in todo {
             let r = &resources[i];
             let supervisor = supervisor.as_ref();
@@ -293,6 +295,7 @@ mod tests {
             id: pod::pod_id(&worktree),
             worktree,
             main_checkout: None,
+            unfinished: None,
         };
         store.write_meta(&meta).unwrap();
         Setup {
@@ -419,7 +422,8 @@ mod tests {
         assert_eq!(status("web").status, Status::Destroyed);
         assert_eq!(status("app").status, Status::Failed);
         assert_eq!(status("app").data["destroy"], json!(fail(3, "boom")));
-        assert!(s.store.pod_dir(&s.meta.id).join("pod.json").exists());
+        let meta = s.store.meta(&s.meta.id).unwrap().unwrap();
+        assert_eq!(meta.unfinished, Some(Unfinished::Down));
 
         // The next run visits only what is left.
         let again = s.teardown().unwrap();

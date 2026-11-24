@@ -153,7 +153,8 @@ One supervisor process per worktree, no global daemon; control over a local sock
   (Unix: `waitid` with `WNOWAIT`; Windows: a handle of its own). The thread that serves requests collects it
   when asked, as it also does when stopping, so the two do not race, and on Unix the pid stays taken until
   then. Rejected: waiting and collecting in that thread, which races with `killpg`; polling. The status is
-  data (`{"code": 1}`, `{"signal": 9}`), not the platform's text. The protocol stays at version 1: a `bp`
+  data (`{"code": 1}`, `{"signal": 9}`), not the platform's text. The supervisor resets an ignored `SIGCHLD`,
+  which it may inherit: the system would reap the services and their status would be lost. The protocol stays at version 1: a `bp`
   that refused older supervisors could not take their pods down. Their text is read as "exited".
 - **Services** are not restarted; one that exits keeps its status until it is stopped. Their output goes
   to files through the supervisor, see "Service logs". The environment is passed to the supervisor but
@@ -458,24 +459,30 @@ The ledger says what was created; `bp status` adds what has become of it. It onl
   it does not answer), `gone`, `not_started` (no process recorded). Nothing listening is not enough for
   `gone`: somebody may have removed the socket file. One that stops answering gets a second to be gone.
 - **Service:** what the supervisor says, `running` or `exited` (with `exit`, unless an older supervisor saw
-  it, and `exited_at_ms`). If it does not answer or does not know that process, the recorded process counts:
+  it, and `exited_at_ms`). Without a recorded process (`bp up` was interrupted) the supervisor's service of
+  that name counts. If it does not answer or does not know that process, the recorded process counts:
   `gone` if it does not run (how it ended was known to the supervisor only); otherwise `orphaned`, or
   `running` while the supervisor is merely unresponsive. Besides `not_started` there is `unknown`, for a
   record that cannot be read. `status` stays the status in the ledger.
 - **`health`** of the pod: `healthy`; `degraded` when a process is not `running`, whatever its exit code (there
-  are no one-shot services), or a resource is not live in the ledger; `busy` while `bp up` or `bp down` holds
-  the pod lock, whatever the rest looks like. `problems` lists what is wrong (with `state` for a process,
-  `status` for the rest), `hint` is the next step. Before a pod counts as degraded its ledger is read again:
-  the `bp down` that took it apart may just have ended. Destroyed resources that come before everything else
-  are of an earlier run and are no problem.
+  are no one-shot services), a resource is pending or failed in the ledger, or the pod is `unfinished`; `busy`
+  while `bp up` or `bp down` holds the pod lock, whatever the rest looks like. `problems` lists what is wrong
+  (with `state` for a process, `status` for the rest), `hint` is the next step. Before a pod counts as degraded
+  what is recorded is read again: the `bp down` that took it apart may just have ended.
+- **`unfinished`** (`up` or `down`) in `pod.json` is set by `bp up` before the first resource and by `bp down`
+  before the first step. `up` removes it once everything is up, `down` together with the pod; after a failure
+  or an interruption it stays. The ledger cannot tell: what `up` rejects while planning is not recorded, and
+  destroyed resources may be of an earlier run. An optional field, which older versions ignore; without it a
+  pod counts as finished, also one that an older `bp` was interrupted at.
 - **The pod lock** is touched only if its holder is recorded or the pod would be degraded, so that asking
   often does not make `up` and `down` report that they wait.
 - **Waiting.** The supervisor gets 3 s to answer. Elsewhere clients have no limit, as they cannot do without
   the answer and cannot tell slow work from a hang; here the hang is the answer. Slow work, up to 10 s for
   each service being stopped, happens under the pod lock and is reported as `busy`. The request runs on a
   thread that is left behind, because connecting can hang too (a full backlog, no free pipe instance).
-- **The hint** names two commands, not `a && b`, which Windows PowerShell does not have. For a supervisor that
-  hangs it says to end the process first: `bp down` would wait for its answer.
+- **The hint** names the worktree, as the caller may be in another one, and two commands, not `a && b`, which
+  Windows PowerShell does not have. For a supervisor that took the request and does not answer it says to end
+  that process first, also while the pod is busy: `bp down` waits for the answer.
 - **The end of the log** of a service that is not running: 10 lines, at most 4 KB, also in the text output.
   Bytes that are not UTF-8 are replaced (`lossy`), and in the text control characters too; `bp logs` has the
   bytes. A service may have printed secrets: they are shown like the rest, nothing is masked, and whoever
