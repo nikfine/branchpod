@@ -72,7 +72,8 @@ pub(crate) struct PodMeta {
     pub(crate) main_checkout: Option<PathBuf>,
 }
 
-/// The `bp` home: `$BRANCHPOD_HOME`, or the platform's local data directory.
+/// The `bp` home: `$BRANCHPOD_HOME`, or the platform's local data directory. [`Store::open`] makes
+/// it absolute, so every path derived from it means the same in any working directory.
 pub(crate) struct Store {
     home: PathBuf,
 }
@@ -80,7 +81,10 @@ pub(crate) struct Store {
 impl Store {
     pub(crate) fn open() -> Result<Store> {
         let home = match std::env::var_os(HOME_ENV) {
-            Some(home) if !home.is_empty() => PathBuf::from(home),
+            // Once, here: the supervisor and the commands run in other directories. Not
+            // canonicalized: it need not exist yet, and links in it stay as the user spelled them.
+            Some(home) if !home.is_empty() => std::path::absolute(&home)
+                .with_context(|| format!("cannot resolve {HOME_ENV}={}", home.display()))?,
             _ => directories::ProjectDirs::from("", "", "branchpod")
                 .context("cannot determine the user data directory")?
                 .data_local_dir()
