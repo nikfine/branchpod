@@ -797,13 +797,14 @@ mod tests {
         let r = running();
         proc::kill(r.process).unwrap();
         assert!(proc::wait_gone(r.process, Duration::from_secs(5)));
-        // macOS stops showing an exiting process before it closes its files: until then connecting
-        // works, and the channel breaks. An answer is never right.
+        // On Unix a killed process can count as gone while its files are still open: on Linux while
+        // any thread but the first is exiting, on macOS (by the kernel source) in any case. Until
+        // they are closed connecting works, and the channel breaks. An answer is never right.
         let deadline = Instant::now() + Duration::from_secs(5);
         let err = loop {
             let err = request(&r.endpoint, &Request::Status).unwrap_err();
             let broken = !is_unreachable(&err) && !is_answer(&err);
-            if !(cfg!(target_os = "macos") && broken && Instant::now() < deadline) {
+            if !(cfg!(unix) && broken && Instant::now() < deadline) {
                 break err;
             }
             std::thread::sleep(Duration::from_millis(10));
