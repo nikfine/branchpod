@@ -447,8 +447,9 @@ the Orca plugin catalog).
 - **Ledger** is JSON Lines per pod in the user data directory (`$BRANCHPOD_HOME` overrides it); a torn last
   line is tolerated, corruption elsewhere is reported. Pods are found by their recorded worktree path, so
   a deleted worktree is still found.
-- **A relative `$BRANCHPOD_HOME`** is made absolute once, against the directory `bp` is called from, and not
-  canonicalized: the home need not exist yet. An empty value means "not set".
+- **The home is always absolute.** A relative `$BRANCHPOD_HOME` (or default) is made absolute once, against
+  the directory `bp` is called from, and not canonicalized: the home need not exist yet. An empty value
+  means "not set".
 - **Pod id** is `<slug>-<8 hex of the path hash>`, limited to `[a-z0-9-]` for use in labels.
 - The binary is installed as `branchpod`; `bp` is an optional alias (see "Name").
 

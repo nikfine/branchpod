@@ -3,6 +3,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,10 +39,11 @@ struct Setup {
     worktree: PathBuf,
 }
 
-/// Whatever fails, no supervisor is left running.
+/// Whatever fails, no supervisor is left running. No panic here: while unwinding it would abort the
+/// process, and the other tests could not clean up.
 impl Drop for Setup {
     fn drop(&mut self) {
-        self.bp(HOME.as_ref(), &["down"]);
+        let _ = self.try_bp(HOME.as_ref(), &["down"]);
     }
 }
 
@@ -74,20 +76,24 @@ impl Setup {
 
     /// Runs `bp` in `cwd`: exit code and all it printed. The output goes to a file, not to a pipe:
     /// the supervisor may inherit the pipe (#76), whose end would come only with the supervisor's.
-    fn bp(&self, home: &OsStr, args: &[&str]) -> (i32, String) {
+    fn try_bp(&self, home: &OsStr, args: &[&str]) -> io::Result<(Option<i32>, String)> {
         let path = self.worktree.with_file_name("bp.log");
-        let log = fs::File::create(&path).unwrap();
+        let log = fs::File::create(&path)?;
         let status = Command::new(env!("CARGO_BIN_EXE_branchpod"))
             .args(args)
             .arg(&self.worktree)
             .current_dir(&self.cwd)
             .env("BRANCHPOD_HOME", home)
-            .stdout(log.try_clone().unwrap())
+            .stdout(log.try_clone()?)
             .stderr(log)
-            .status()
-            .unwrap();
-        let out = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
-        (status.code().unwrap(), out)
+            .status()?;
+        let out = String::from_utf8_lossy(&fs::read(&path)?).into_owned();
+        Ok((status.code(), out))
+    }
+
+    fn bp(&self, home: &OsStr, args: &[&str]) -> (i32, String) {
+        let (code, out) = self.try_bp(home, args).unwrap();
+        (code.unwrap(), out)
     }
 }
 
@@ -182,6 +188,8 @@ fn drive_and_root_relative_paths_are_resolved() {
     let (drive, rooted) = cwd.split_at(2);
     assert!(drive.ends_with(':') && rooted.starts_with('\\'), "{cwd}");
     round_trip(&s, format!("{drive}{HOME}").as_ref());
+    // Worked before as well (the supervisor runs on the same drive): kept as a check that resolving
+    // does not break it.
     round_trip(&s, format!("{rooted}\\{HOME}").as_ref());
 }
 

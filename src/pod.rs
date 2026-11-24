@@ -3,6 +3,7 @@
 //! State is kept in the user data directory, not inside the worktree, so it survives the worktree
 //! being deleted behind our back, the case `gc` exists for.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -78,18 +79,29 @@ pub(crate) struct Store {
     home: PathBuf,
 }
 
+/// The home for this value of the variable (an empty one means "not set"), as an absolute path:
+/// the supervisor and the commands run in other directories. The default is not always absolute
+/// either (a relative `$HOME`). Not canonicalized: the home need not exist yet, and links in it
+/// stay as the user spelled them.
+fn resolve_home(
+    var: Option<OsString>,
+    default: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    let home = match var {
+        Some(home) if !home.is_empty() => PathBuf::from(home),
+        _ => default()?,
+    };
+    std::path::absolute(&home)
+        .with_context(|| format!("cannot resolve the bp home {}", home.display()))
+}
+
 impl Store {
     pub(crate) fn open() -> Result<Store> {
-        let home = match std::env::var_os(HOME_ENV) {
-            // Once, here: the supervisor and the commands run in other directories. Not
-            // canonicalized: it need not exist yet, and links in it stay as the user spelled them.
-            Some(home) if !home.is_empty() => std::path::absolute(&home)
-                .with_context(|| format!("cannot resolve {HOME_ENV}={}", home.display()))?,
-            _ => directories::ProjectDirs::from("", "", "branchpod")
-                .context("cannot determine the user data directory")?
-                .data_local_dir()
-                .to_path_buf(),
-        };
+        let home = resolve_home(std::env::var_os(HOME_ENV), || {
+            let dirs = directories::ProjectDirs::from("", "", "branchpod")
+                .context("cannot determine the user data directory")?;
+            Ok(dirs.data_local_dir().to_path_buf())
+        })?;
         Ok(Store { home })
     }
 
@@ -204,6 +216,22 @@ mod tests {
         );
         assert_ne!(a, pod_id(Path::new("/other/My Feature_branch")));
         assert!(pod_id(Path::new("/work/\u{e9}")).starts_with("pod-"));
+    }
+
+    #[test]
+    fn home_is_the_variable_or_the_default_and_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let default = || Ok(PathBuf::from("default"));
+        let home = |var: Option<&str>| resolve_home(var.map(OsString::from), default).unwrap();
+        assert_eq!(home(Some("rel-\u{fc}")), cwd.join("rel-\u{fc}"));
+        // Also when the default is relative.
+        assert_eq!(home(None), cwd.join("default"));
+        assert_eq!(home(Some("")), cwd.join("default"));
+        let absolute = cwd.join("no such directory");
+        assert_eq!(home(absolute.to_str()), absolute);
+        // The default is not needed, so it may fail.
+        assert!(resolve_home(Some("x".into()), || anyhow::bail!("no default")).is_ok());
+        assert!(resolve_home(None, || anyhow::bail!("no default")).is_err());
     }
 
     #[test]
