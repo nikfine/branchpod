@@ -7,6 +7,7 @@ Guidance for AI coding agents (and humans) working on branchpod.
 - Design decisions and scope: [docs/design/initial-decisions.md](docs/design/initial-decisions.md).
   Do not reopen a recorded decision silently — propose a change to that file instead.
 - Work tracking lives in GitHub issues and milestones, not in files in the repository.
+- One worktree per session, set up with `branchpod`: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Branches and pull requests
 
