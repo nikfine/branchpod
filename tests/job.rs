@@ -90,6 +90,14 @@ impl Pod {
     fn up_in(&self, jobs: &[u32]) -> (i32, String) {
         let jobs: Vec<String> = jobs.iter().map(u32::to_string).collect();
         let (mut reader, writer) = std::io::pipe().unwrap();
+        // Not `output()`: should the supervisor hold the pipe, it would never return. Reading
+        // from the start: a full pipe would stop whoever writes to it.
+        let (sender, end) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).unwrap();
+            let _ = sender.send(String::from_utf8_lossy(&out).into_owned());
+        });
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -105,13 +113,6 @@ impl Pod {
             .stderr(writer)
             .status()
             .unwrap();
-        // Not `output()`: should the supervisor hold the pipe, it would never return.
-        let (sender, end) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            reader.read_to_end(&mut out).unwrap();
-            let _ = sender.send(String::from_utf8_lossy(&out).into_owned());
-        });
         let out = end
             .recv_timeout(Duration::from_secs(30))
             .expect("the end of output comes when `bp up` exits");

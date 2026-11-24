@@ -195,6 +195,8 @@ fn ends(program: &str, args: &str) -> String {
     )
     .unwrap();
     let (reader, writer) = std::io::pipe().unwrap();
+    // Reading from the start: a full pipe would stop whoever writes to it.
+    let end = end_of(reader);
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -214,7 +216,7 @@ fn ends(program: &str, args: &str) -> String {
         .stderr(writer)
         .status()
         .unwrap();
-    let out = end_of(reader).recv_timeout(NEVER);
+    let out = end.recv_timeout(NEVER);
     let supervisor = pod.supervisor();
     let running = supervisor.is_some_and(runs);
     let down = pod.down();

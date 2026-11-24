@@ -591,7 +591,8 @@ fn executable(exe: &Path) -> OsString {
     /// Well below `MAX_PATH` (260).
     const LONG: usize = 240;
     let path: Vec<u16> = exe.as_os_str().encode_wide().collect();
-    if path.len() < LONG || starts_with(&path, r"\\?\") {
+    // A device path (`\\.\`) only looks like a UNC path: it is left as it is.
+    if path.len() < LONG || starts_with(&path, r"\\?\") || starts_with(&path, r"\\.\") {
         return exe.as_os_str().to_owned();
     }
     let (prefix, rest) = if starts_with(&path, r"\\") {
@@ -912,10 +913,7 @@ mod tests {
             .map(Result::unwrap)
             .take_while(|line| line != "end")
             .collect();
-        let out = out.join(
-            "
-",
-        );
+        let out = out.join("\n");
         let status = child.wait().unwrap();
         assert!(status.success(), "{status}: {out}");
         (out, fs::read_to_string(log).unwrap())
@@ -1040,6 +1038,8 @@ mod tests {
             executable(&format!(r"\\server\share\{long}")),
             format!(r"\\?\UNC\server\share\{long}")
         );
+        let device = format!(r"\\.\C:\{long}\b.exe");
+        assert_eq!(executable(&device), device);
         let directory = |path: &str| working_directory(Path::new(path)).into_string().unwrap();
         assert_eq!(directory(r"C:\a"), r"C:\a");
         assert_eq!(directory(r"\\?\C:\a"), r"C:\a");

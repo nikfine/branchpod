@@ -75,7 +75,7 @@ impl Setup {
     }
 
     /// Runs `bp` in `cwd`: exit code and all it printed. The output goes to a file, not to a pipe:
-    /// the supervisor may inherit the pipe (#76), whose end would come only with the supervisor's.
+    /// should the supervisor hold the pipe, its end would come only with the supervisor's.
     fn try_bp(&self, home: &OsStr, args: &[&str]) -> io::Result<(Option<i32>, String)> {
         let path = self.worktree.with_file_name("bp.log");
         let log = fs::File::create(&path)?;
