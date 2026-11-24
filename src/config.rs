@@ -110,6 +110,10 @@ fn is_yes(value: &bool) -> bool {
     *value
 }
 
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
 impl FileSpec {
     /// Source path relative to the main checkout.
     pub(crate) fn source(&self) -> &str {
@@ -132,13 +136,27 @@ pub(crate) struct Replace {
     pub(crate) with: String,
 }
 
+/// What becomes of the stdout of a command's `create`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OutputMode {
+    /// Text, recorded in the ledger: `{{command.<name>.stdout}}`.
+    #[default]
+    Stdout,
+    /// Kept byte for byte in a file of the pod's state and recorded nowhere:
+    /// `{{command.<name>.file}}` is its path.
+    File,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommandSpec {
-    /// Referenced as `{{command.<name>.stdout}}` by later resources.
+    /// Referenced as `{{command.<name>.stdout}}` or `{{command.<name>.file}}` by later resources.
     pub(crate) name: String,
     /// Argument array; executed without a shell.
     pub(crate) create: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) output: OutputMode,
     /// Argument array run on teardown; may reference this command's captured output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) destroy: Option<Vec<String>>,
@@ -298,6 +316,15 @@ impl Config {
             if !names.insert(command.name.as_str()) {
                 bail!("command {:?} is defined twice", command.name);
             }
+            // The name becomes a file name, and the same config must mean the same thing on every
+            // platform.
+            if command.output == OutputMode::File && is_device_name(&command.name) {
+                bail!(
+                    "command {:?}: a command with output = \"file\" must not have the name of a \
+                     Windows device",
+                    command.name
+                );
+            }
             check_argv(&command.create)
                 .with_context(|| format!("command.{}.create", command.name))?;
             for (field, argv) in [("destroy", &command.destroy), ("gc", &command.gc)] {
@@ -360,6 +387,16 @@ fn check_name(kind: &str, name: &str) -> Result<()> {
         bail!("{kind} name {name:?} must match [a-z][a-z0-9_-]* (at most 64 characters)");
     }
     Ok(())
+}
+
+/// Names that Windows reserves for devices, in every directory. Windows 11 still opens the null
+/// device for `nul`: output written there would be lost without an error.
+fn is_device_name(name: &str) -> bool {
+    matches!(name, "con" | "prn" | "aux" | "nul")
+        || ["com", "lpt"].iter().any(|device| {
+            name.strip_prefix(device)
+                .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+        })
 }
 
 fn check_argv(argv: &[String]) -> Result<()> {
@@ -520,6 +557,34 @@ mod tests {
             "version = 1\n[[file]]\npath = 'all'\nsource = '.'\nmode = 'copy'\n".to_owned(),
         ] {
             assert!(Config::parse(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn command_output_modes() {
+        let base = "version = 1\n[[command]]\ncreate = ['x']\nname = ";
+        let mode = |text: &str| Config::parse(text).unwrap().command[0].output;
+        assert_eq!(mode(&format!("{base}'env'\n")), OutputMode::Stdout);
+        let stdout = format!("{base}'env'\noutput = 'stdout'\n");
+        assert_eq!(mode(&stdout), OutputMode::Stdout);
+        let file = format!("{base}'env'\noutput = 'file'\n");
+        assert_eq!(mode(&file), OutputMode::File);
+        assert!(Config::parse(&format!("{base}'env'\noutput = 'pipe'\n")).is_err());
+
+        // The default is left out when printed back.
+        let printed = |text: &str| toml::to_string(&Config::parse(text).unwrap()).unwrap();
+        assert!(!printed(&stdout).contains("output"));
+        assert!(printed(&file).contains("output = \"file\""));
+
+        for name in ["nul", "con", "aux", "prn", "com1", "lpt9"] {
+            let text = format!("{base}'{name}'\n");
+            assert!(Config::parse(&text).is_ok(), "{name}");
+            let err = Config::parse(&format!("{text}output = 'file'\n")).unwrap_err();
+            assert!(format!("{err:#}").contains("Windows device"), "{err:#}");
+        }
+        for name in ["com", "com10", "console", "nul-1"] {
+            let text = format!("{base}'{name}'\noutput = 'file'\n");
+            assert!(Config::parse(&text).is_ok(), "{name}");
         }
     }
 

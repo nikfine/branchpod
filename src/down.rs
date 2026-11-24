@@ -419,6 +419,31 @@ mod tests {
     }
 
     #[test]
+    fn an_output_file_whose_creation_was_not_recorded_goes_with_the_pod() {
+        let s = setup(true);
+        let marker = s.tmp.join("container");
+        fs::write(&marker, "").unwrap();
+        let outputs = s.store.pod_dir(&s.meta.id).join("outputs");
+        // Interrupted at some point after the intent: with the file or before it.
+        for (name, destroy) in [("env", delete(&marker)), ("none", vec![])] {
+            let file = outputs.join(name);
+            let mut data = json!({ "create": ["x"], "file": file });
+            if !destroy.is_empty() {
+                fs::create_dir_all(&outputs).unwrap();
+                fs::write(&file, "TOKEN=s3cr3t").unwrap();
+                fs::write(outputs.join("env.tmp"), "TOK").unwrap();
+                data["destroy"] = json!(destroy);
+            }
+            s.record(Kind::Command, name, vec![Event::Intent { data }]);
+        }
+        let report = teardown(&s.store, &s.meta).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(report.steps.len(), 2);
+        assert!(!marker.exists());
+        assert!(!s.store.pod_dir(&s.meta.id).exists());
+    }
+
+    #[test]
     fn an_empty_or_fully_destroyed_ledger_just_removes_the_pod() {
         let s = setup(true);
         s.live(Kind::Port, "web", Value::Null);

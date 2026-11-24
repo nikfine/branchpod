@@ -51,7 +51,7 @@ Lessons from running it on Windows, which the new tool must handle by design:
 | `git` | `git worktree add` (optional thin wrapper) | unlink links, then `git worktree remove`, `prune` | the worktree |
 | `file` | copy / reflink / link / template | delete; links removed **as links** | `.env`, `node_modules` |
 | `port` | allocate from a range, verify by binding | release in the registry | web, dev server |
-| `command` | `create` command, stdout captured into variables | `destroy` with those variables, `gc` query | container, volume, sync session |
+| `command` | `create` command, stdout captured into a variable or a file | `destroy` with those variables, `gc` query | container, volume, sync session |
 | `service` | long-running process under the supervisor | the whole process tree dies | dev server |
 
 Rules:
@@ -84,7 +84,9 @@ Rules:
 - Exit code: `0` nothing is left, `3` resources are left behind (run it again once the cause is fixed),
   `1` teardown could not run (the ledger cannot be read). `2` stays with usage errors.
 - Once nothing is left, the pod's state directory is removed too (`pod.json` last, so an interruption
-  leaves a pod with nothing to tear down); its lock file is kept.
+  leaves a pod with nothing to tear down); its lock file is kept. Files with command output
+  (`output = "file"`) go with it and not earlier: after an exit with code `3` a `destroy` that reads one
+  runs again.
 - Known limitation until `gc` exists: a resource that cannot be undone from the ledger (a command whose
   `destroy` needs output never captured, kinds without teardown yet) keeps `bp down` at exit code `3`;
   there is no way to forget it.
@@ -250,8 +252,59 @@ Rules for file resources:
 - A program given as a relative path with a directory part (`./scripts/up.sh`) is resolved against the
   command's working directory on every platform; Windows would otherwise resolve it against `bp`'s own.
   A bare name is searched on `PATH`.
+- `output = "file"` keeps the output in a file instead, see "Command output in a file".
 - On Windows a `.cmd` / `.bat` program is named with its extension (`npx.cmd`): spawning without a
   shell does not resolve it through `PATHEXT`.
+
+### Command output in a file
+
+For output that other tools read from a file, typically the environment of a base container:
+
+```toml
+[[command]]
+name = "env"
+create = ["docker", "inspect", "--format", "{{{{range .Config.Env}}{{{{println .}}{{{{end}}", "base-app"]
+output = "file"
+
+[[command]]
+name = "app"
+create = ["docker", "run", "-d", "--name", "bp-{{pod.id}}", "--env-file", "{{command.env.file}}", "example/app"]
+destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
+```
+
+- `output = "file"` (the default is `"stdout"`) writes the stdout of `create` to `pods/<id>/outputs/<name>`
+  byte for byte: nothing is decoded or trimmed. `{{command.<name>.file}}` is the absolute path;
+  `{{command.<name>.stdout}}` is then unavailable, with an error that says so.
+- Blank output (nothing, or only a byte order mark and whitespace) fails the step: an empty env file would
+  be taken for a real one. Whitespace counts because tools end even an empty result with a line break.
+- An env file has one variable per line, so the example does not carry values with line breaks (PEM, JSON)
+  over: each further line is taken for a variable of its own, or rejected. Docker then quotes the line, or
+  its part before `=`, on stderr, which shows in the error of `bp up`, the ledger and `bp status --json`.
+- The output may hold secrets, so it is nowhere but in the file: not in the ledger, `bp status --json`, what
+  `bp up` prints, or an error. The run log (#9) must not get the stdout of such a command either. stderr is
+  not part of the output and is quoted in errors as for any command, as is the stderr of a command that
+  reads the file: a tool that prints secrets there shows them.
+- On Unix the file has mode 0600 from the moment it is created, in a directory with mode 0700: a container
+  that mounts the file and runs as another user cannot read it. On Windows both inherit the permissions
+  of the `bp` home; the default one is in the user's profile.
+- The path is known before `create` runs, so the intent has it and `destroy` is always rendered into the
+  intent, also when it references the file. The file is written atomically.
+- `bp up` on a pod with nothing left to destroy starts by removing the whole `outputs` directory, which an
+  earlier `down` may have failed to remove: its files may hold secrets, under names the config no longer
+  has, and must not pass for new output. If it cannot be removed, `up` fails.
+- After an interruption before the file was written, or a failed `create`, `bp down` still runs `destroy`
+  but the file does not exist. `destroy` should therefore find the resource by its name or label, not need
+  the file.
+- The order of kinds is unchanged: later commands and services can use the file, file resources cannot.
+- The name must not be a Windows device name (`nul`, `aux`, ...), on any platform.
+- Compatibility: the ledger gets an optional `file` field, and older records are read as before. A `bp`
+  without this feature refuses a config with `output` (`unknown field`, before anything is created), in
+  `up` and `config`; its `status` and `down` read no config, ignore the new field and tear such a pod
+  down, file included.
+- Rejected: arguments that expand per line of output (`"-e", "{{command.env.lines}}"`). A variable would be
+  a list that only some places accept, and the lines, with their secrets, would be in the process list and
+  in the ledger. Mounting a worktree root entry by entry, the other case for expansion, stays a list in the
+  config, at the price of a config change for each new top-level entry.
 
 ## Pod lock
 
@@ -278,8 +331,8 @@ Rules for file resources:
 - Resources are created in a fixed order of kinds — ports, files, commands, then the supervisor and
   services — and within a kind in config order (ports by name: they never depend on each other). Templates and commands reference
   ports; a command (a container) may mount a file provisioned for it. The price: a file cannot reference
-  `{{command.<name>.stdout}}`. A single ordered list or ordering by references would lift that, at the cost
-  of a format change or implicit ordering.
+  `{{command.<name>.stdout}}` or `{{command.<name>.file}}`. A single ordered list or ordering by references
+  would lift that, at the cost of a format change or implicit ordering.
 - `up` is not re-entrant: if the ledger holds any resource that is not destroyed (live, pending or failed),
   it fails at once, lists them and asks for `bp down` first. Reconciling a live pod with a changed config
   is a separate feature, not a side effect of `up`.
@@ -368,8 +421,8 @@ the Orca plugin catalog).
   team does not commit a config; with neither file it is an error naming both places. Chosen over YAML for the
   absence of implicit typing (`no`, `0755`) and significant indentation, and for comment-preserving edits
   (`toml_edit`) needed by future `bp init` / `bp config set`. The schema has a required `version`.
-- **Variables** are written `{{name}}` (`port.<name>`, `command.<name>.stdout`, `pod.id`, ...). An unknown
-  name is an error, never an empty string.
+- **Variables** are written `{{name}}` (`port.<name>`, `command.<name>.stdout`, `command.<name>.file`, `pod.id`,
+  ...). An unknown name is an error, never an empty string.
 - **Filters** are written `{{name | filter}}`: left to right, without arguments, each from string to string.
   The variable is checked first; an unknown or empty filter (`{{a || b}}`) is an error.
   - `json` escapes a value for use inside a JSON string (`"`, `\` and U+0000 to U+001F, RFC 8259). It adds

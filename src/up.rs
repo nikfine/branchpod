@@ -136,6 +136,9 @@ pub(crate) fn up(
             quote(&wt.root)
         );
     }
+    // Left when an earlier `down` could not remove the pod's state: no `destroy` needs it any more,
+    // it may hold secrets, and it must not pass for the output of a command of this run.
+    commands::remove_outputs(&store.pod_dir(&id))?;
 
     let mut vars = builtin_vars(&id, wt);
     check(config, wt, main, &vars, &store.pod_dir(&id))?;
@@ -210,8 +213,8 @@ fn check(
         files::plan(spec, main, &wt.root, &probe)?;
     }
     for spec in &config.command {
-        commands::plan(spec, &wt.root, &probe)?;
-        probe.set(commands::stdout_var(&spec.name), "placeholder");
+        let plan = commands::plan(spec, &wt.root, &probe, pod_dir)?;
+        commands::export_planned(&plan, &mut probe);
     }
     for spec in &config.service {
         services::plan(spec, &wt.root, &probe, pod_dir)?;
@@ -276,8 +279,9 @@ fn provision(
         });
     }
 
+    let pod_dir = store.pod_dir(id);
     for spec in &config.command {
-        let plan = commands::plan(spec, &wt.root, vars)?;
+        let plan = commands::plan(spec, &wt.root, vars, &pod_dir)?;
         let intent = serde_json::to_value(&plan.record)?;
         let record = step(journal, Kind::Command, &spec.name, intent, || {
             commands::create(&plan).map(|out| out.record)
@@ -286,14 +290,16 @@ fn provision(
         items.push(Item {
             kind: Kind::Command,
             name: spec.name.clone(),
-            detail: command_detail(record.stdout.as_deref().unwrap_or_default()),
+            detail: match &record.file {
+                Some(file) => format!("output in {file}"),
+                None => command_detail(record.stdout.as_deref().unwrap_or_default()),
+            },
         });
     }
 
     if config.service.is_empty() {
         return Ok(());
     }
-    let pod_dir = store.pod_dir(id);
     let intent = supervisor::Record {
         endpoint: control::new_endpoint(id)?,
         process: None,
@@ -923,6 +929,58 @@ mod tests {
         let err = format!("{:#}", run(&r, &text).unwrap_err());
         assert!(
             err.contains("port.nope") || err.contains("port.web"),
+            "{err}"
+        );
+        assert!(resources(&r).is_empty());
+    }
+
+    #[test]
+    fn output_files_of_an_earlier_pod_are_removed_only_when_nothing_needs_them() {
+        let r = repo();
+        let text = format!(
+            "version = 1\n[[command]]\nname = 'NAME'\noutput = 'file'\ncreate = {}\n",
+            echo("x")
+        );
+        run(&r, &text.replace("NAME", "old")).unwrap();
+        let id = pod::pod_id(&r.linked);
+        let outputs = r.store.pod_dir(&id).join("outputs");
+        let names = || -> Vec<String> {
+            fs::read_dir(&outputs)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        };
+
+        // Still needed by the live pod.
+        run(&r, &text.replace("NAME", "new")).unwrap_err();
+        assert_eq!(names(), ["old"]);
+
+        // What `bp down` leaves when it cannot remove the state: everything destroyed. The command
+        // has another name by now.
+        let mut ledger = Ledger::open(&r.store.ledger_path(&id)).unwrap();
+        ledger
+            .record(Kind::Command, "old", Event::Destroyed)
+            .unwrap();
+        drop(ledger);
+        run(&r, &text.replace("NAME", "new")).unwrap();
+        assert_eq!(names(), ["new"]);
+    }
+
+    #[test]
+    fn output_files_that_cannot_be_removed_stop_up() {
+        let r = repo();
+        let id = pod::pod_id(&r.linked);
+        let pod_dir = r.store.pod_dir(&id);
+        fs::create_dir_all(&pod_dir).unwrap();
+        // Not a directory, so it is not removed as one.
+        fs::write(pod_dir.join("outputs"), "x").unwrap();
+        let text = format!(
+            "version = 1\n[[command]]\nname = 'app'\ncreate = {}\n",
+            echo("x")
+        );
+        let err = format!("{:#}", run(&r, &text).unwrap_err());
+        assert!(
+            err.contains("cannot remove the command output") && err.contains("outputs"),
             "{err}"
         );
         assert!(resources(&r).is_empty());
