@@ -221,6 +221,7 @@ mod tests {
 
     use super::*;
     use crate::pod::{self, META_VERSION};
+    use crate::test_support::{Reaper, fail, launcher, long_running};
 
     struct Setup {
         _tmp: tempfile::TempDir,
@@ -276,14 +277,6 @@ mod tests {
             vec!["cmd".into(), "/d".into(), "/c".into(), "del".into(), file]
         } else {
             vec!["rm".into(), file]
-        }
-    }
-
-    fn failing() -> Vec<String> {
-        if cfg!(windows) {
-            vec!["cmd".into(), "/d".into(), "/c".into(), "exit 3".into()]
-        } else {
-            vec!["sh".into(), "-c".into(), "exit 3".into()]
         }
     }
 
@@ -343,7 +336,7 @@ mod tests {
         s.live(
             Kind::Command,
             "app",
-            json!({ "create": ["x"], "destroy": failing() }),
+            json!({ "create": ["x"], "destroy": fail(3, "boom") }),
         );
         s.live(Kind::Service, "vite", json!({ "pid": 1 }));
         s.live(Kind::Port, "web", Value::Null);
@@ -361,7 +354,7 @@ mod tests {
         assert_eq!(status("conf").status, Status::Destroyed);
         assert_eq!(status("web").status, Status::Destroyed);
         assert_eq!(status("app").status, Status::Failed);
-        assert_eq!(status("app").data["destroy"], json!(failing()));
+        assert_eq!(status("app").data["destroy"], json!(fail(3, "boom")));
         assert!(s.store.pod_dir(&s.meta.id).join("pod.json").exists());
 
         // The next run visits only what is left.
@@ -417,25 +410,19 @@ mod tests {
     }
 
     /// Starts a supervisor running one long service; records both as `bp up` would.
-    fn supervised(
-        s: &Setup,
-    ) -> (
-        supervisor::Record,
-        services::Record,
-        supervisor::tests::Reaper,
-    ) {
+    fn supervised(s: &Setup) -> (supervisor::Record, services::Record, Reaper) {
         let endpoint = control::new_endpoint(&s.meta.id).unwrap();
-        let process = supervisor::tests::launcher()
+        let process = launcher()
             .launch(&endpoint, &s.tmp, &s.tmp.join("supervisor.log"))
             .unwrap();
-        let mut reaper = supervisor::tests::Reaper(vec![process]);
+        let mut reaper = Reaper(vec![process]);
         let sup = supervisor::Record {
             endpoint,
             process: Some(process),
         };
         let start = supervisor::Start {
             name: "web".into(),
-            run: supervisor::tests::long_running("web"),
+            run: long_running("web"),
             cwd: s.meta.worktree.clone(),
             env: Default::default(),
             log: s.tmp.join("web.log"),

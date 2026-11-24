@@ -317,6 +317,7 @@ fn decode_stdout(bytes: Vec<u8>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fail;
     use std::fs;
 
     /// Prints the contents of `file` byte for byte, using only what every CI runner has.
@@ -326,17 +327,6 @@ mod tests {
             vec!["cmd".into(), "/d".into(), "/c".into(), "type".into(), file]
         } else {
             vec!["cat".into(), file]
-        }
-    }
-
-    /// Writes `message` to stderr and exits with `code`.
-    fn fail(code: i32, message: &str) -> Vec<String> {
-        if cfg!(windows) {
-            let script = format!("echo {message} 1>&2 & exit {code}");
-            vec!["cmd".into(), "/d".into(), "/c".into(), script]
-        } else {
-            let script = format!("echo {message} >&2; exit {code}");
-            vec!["sh".into(), "-c".into(), script]
         }
     }
 

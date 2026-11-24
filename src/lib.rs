@@ -20,6 +20,8 @@ mod ports;
 mod proc;
 mod services;
 mod supervisor;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod up;
 mod vars;
 mod worktree;

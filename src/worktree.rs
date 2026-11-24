@@ -192,6 +192,7 @@ pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::git_ok;
 
     #[test]
     fn detects_unexpanded_variables() {
@@ -250,16 +251,6 @@ mod tests {
             normalize(&tmp.path().join("real")).unwrap(),
             base.join("real")
         );
-    }
-
-    fn git_ok(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
     }
 
     #[test]

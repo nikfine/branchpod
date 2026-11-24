@@ -401,82 +401,9 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
-
-    /// Name of the env var that makes [`supervisor_process`] run.
-    const ENDPOINT_ENV: &str = "BP_TEST_SUPERVISOR_ENDPOINT";
-
-    /// Starts supervisors as this test binary re-running [`supervisor_process`].
-    pub fn launcher() -> Launcher {
-        let exe = std::env::current_exe().unwrap();
-        Launcher::new(move |endpoint| {
-            let mut cmd = Command::new(&exe);
-            cmd.args([
-                "--exact",
-                "supervisor::tests::supervisor_process",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(ENDPOINT_ENV, endpoint);
-            cmd
-        })
-    }
-
-    /// Kills recorded processes (and their trees) on drop, so that a failing test leaves no
-    /// supervisor or service running (on Windows one would also keep the test binary in use).
-    #[derive(Default)]
-    pub struct Reaper(pub Vec<ProcId>);
-
-    impl Drop for Reaper {
-        fn drop(&mut self) {
-            // Services were recorded after their supervisor: stop them first.
-            for process in self.0.iter().rev() {
-                let _ = proc::stop_recorded_tree(*process, Duration::from_millis(500));
-                let _ = proc::kill(*process);
-            }
-        }
-    }
-
-    /// A [`Reaper`] for every process recorded in pod `id`'s ledger.
-    pub fn reap_pod(store: &crate::pod::Store, id: &str) -> Reaper {
-        let processes = store
-            .resources(id)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|r| serde_json::from_value(r.data.get("process")?.clone()).ok())
-            .collect();
-        Reaper(processes)
-    }
-
-    /// Not a test by itself: the supervisor process for tests.
-    #[test]
-    #[ignore]
-    fn supervisor_process() {
-        if let Some(endpoint) = std::env::var_os(ENDPOINT_ENV) {
-            serve(endpoint.to_str().unwrap()).unwrap();
-        }
-    }
-
-    /// Prints a line, then sleeps for a long time, using what every CI runner has.
-    pub fn long_running(marker: &str) -> Vec<String> {
-        if cfg!(windows) {
-            // `ping` waits about one second between echoes.
-            vec![
-                "cmd".into(),
-                "/d".into(),
-                "/c".into(),
-                format!("echo {marker}& ping -n 300 127.0.0.1 > nul"),
-            ]
-        } else {
-            vec![
-                "sh".into(),
-                "-c".into(),
-                format!("echo {marker}; exec sleep 300"),
-            ]
-        }
-    }
+    use crate::test_support::{fail, launcher, long_running};
 
     struct Running {
         _tmp: tempfile::TempDir,
@@ -599,13 +526,8 @@ pub mod tests {
             start(&r, "none", vec!["bp-no-such-program-\u{e9}".into()]).unwrap_err()
         );
         assert!(err.contains("program not found"), "{err}");
-        let quick = if cfg!(windows) {
-            vec!["cmd".into(), "/d".into(), "/c".into(), "exit 3".into()]
-        } else {
-            vec!["sh".into(), "-c".into(), "exit 3".into()]
-        };
         // It may be gone before the supervisor looks, or be reported as started and exit.
-        if let Ok(process) = start(&r, "quick", quick) {
+        if let Ok(process) = start(&r, "quick", fail(3, "boom")) {
             assert!(proc::wait_gone(process, Duration::from_secs(5)));
         }
     }

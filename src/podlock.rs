@@ -442,7 +442,7 @@ mod tests {
 
     /// Not a test by itself: the lock holder process for the cross-process tests.
     #[test]
-    #[ignore]
+    #[ignore = "the lock holder process of other tests, which start it themselves"]
     fn holder_process() {
         let Some(home) = std::env::var_os(HOME_ENV) else {
             return;
@@ -476,7 +476,7 @@ mod tests {
 
     /// Not a test by itself: a long-running grandchild for `child_processes_do_not_inherit_the_lock`.
     #[test]
-    #[ignore]
+    #[ignore = "a process started by `holder_process`"]
     fn sleeper_process() {
         if std::env::var(MODE_ENV).as_deref() == Ok("sleep") {
             println!("BP-SLEEPING");
