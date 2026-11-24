@@ -22,8 +22,6 @@ use crate::{commands, control, ports, proc, services};
 pub struct Step {
     pub kind: Kind,
     pub name: String,
-    /// Status before teardown.
-    pub was: Status,
     /// `None` when the resource is gone.
     pub error: Option<String>,
 }
@@ -81,7 +79,6 @@ pub fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
             steps.push(Step {
                 kind: r.kind,
                 name: r.name.clone(),
-                was: r.status,
                 error,
             });
         }
@@ -144,7 +141,6 @@ fn destroy(
             .map(drop),
         Kind::Command => {
             let record: commands::Record = data(r)?;
-            // stderr of a successful destroy belongs in the run log (not written yet).
             commands::destroy(&record, &command_cwd(store, meta)?)
                 .map(drop)
                 .with_context(|| format!("command {:?}", r.name))

@@ -89,6 +89,7 @@ impl Store {
         Ok(Store { home })
     }
 
+    #[cfg(test)]
     pub fn at(home: PathBuf) -> Store {
         Store { home }
     }

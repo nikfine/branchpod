@@ -216,6 +216,7 @@ impl Config {
         Ok(config)
     }
 
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Config> {
         let config: Config = toml::from_str(text)?;
         config.validate()?;

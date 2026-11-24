@@ -140,6 +140,7 @@ impl Registry {
     }
 
     /// Releases every port of a pod (used by `gc`).
+    #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#20)"))]
     pub fn release_pod(&self, pod: &str) -> Result<Vec<u16>> {
         let _lock = self.lock()?;
         let mut reg = self.load()?;
@@ -157,6 +158,7 @@ impl Registry {
     }
 
     /// The port currently registered to `(pod, name)`, if any.
+    #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#22)"))]
     pub fn registered(&self, pod: &str, name: &str) -> Result<Option<u16>> {
         let _lock = self.lock()?;
         Ok(self
@@ -167,6 +169,7 @@ impl Registry {
             .map(|(p, _)| *p))
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#22)"))]
     pub fn list(&self) -> Result<BTreeMap<u16, Owner>> {
         let _lock = self.lock()?;
         Ok(self.load()?.ports)

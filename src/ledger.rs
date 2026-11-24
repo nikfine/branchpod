@@ -129,6 +129,7 @@ pub struct Ledger {
     file: File,
 }
 
+#[cfg(test)]
 impl Event {
     /// An intent without data.
     pub fn intent() -> Event {

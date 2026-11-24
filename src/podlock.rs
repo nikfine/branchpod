@@ -156,6 +156,7 @@ impl Store {
 
     /// Takes the lock of pod `id` only if it is free right now (for `gc`, which skips busy pods).
     /// Taking a lock this process already holds is an error.
+    #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#20)"))]
     pub fn try_lock_pod(&self, id: &str, command: &str) -> Result<Option<PodLock>> {
         let path = self.lock_path(id);
         let claim = Claim::new(&path)?;

@@ -54,13 +54,11 @@ pub struct Plan {
     vars: Vars,
 }
 
-/// Successful run of `create` or `destroy`.
+/// Successful run of `create` or `destroy`. Its stderr is not kept until there is a run log (#9).
 #[derive(Debug)]
 pub struct Output {
     /// Ledger data (for `create`; the input record for `destroy`).
     pub record: Record,
-    /// stderr of the command, decoded lossily, for the run log.
-    pub stderr: String,
 }
 
 /// A command ran and exited unsuccessfully. Kept as a typed error so that the run log can
@@ -202,10 +200,7 @@ fn create_inner(plan: &Plan) -> Result<Output> {
         record.destroy = Some(render_destroy(&vars, &argv)?);
     }
     record.stdout = Some(stdout);
-    Ok(Output {
-        record,
-        stderr: run.stderr,
-    })
+    Ok(Output { record })
 }
 
 /// Runs the recorded `destroy` in `cwd`: the worktree root while it exists, otherwise any
@@ -223,13 +218,11 @@ pub fn destroy(record: &Record, cwd: &Path) -> Result<Output> {
         }
         return Ok(Output {
             record: record.clone(),
-            stderr: String::new(),
         });
     };
-    let run = run(argv, cwd).context("destroy")?;
+    run(argv, cwd).context("destroy")?;
     Ok(Output {
         record: record.clone(),
-        stderr: run.stderr,
     })
 }
 

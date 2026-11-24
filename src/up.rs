@@ -267,7 +267,6 @@ fn provision(
     for spec in &config.command {
         let plan = commands::plan(spec, &wt.root, vars)?;
         let intent = serde_json::to_value(&plan.record)?;
-        // stderr of a successful command is for the run log, which does not exist yet.
         let record = step(journal, Kind::Command, &spec.name, intent, || {
             commands::create(&plan).map(|out| out.record)
         })?;

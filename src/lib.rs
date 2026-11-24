@@ -4,9 +4,6 @@
 //! the code directly; anything in it may change in any release. The contract of `bp` is its `--json`
 //! output and event schema.
 
-// Some helpers are only used by tests so far and by `bp gc`, which lands later.
-#![allow(dead_code)]
-
 #[doc(hidden)]
 pub mod cli;
 mod commands;
