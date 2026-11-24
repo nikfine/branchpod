@@ -245,9 +245,13 @@ mod tests {
         out
     }
 
-    /// The end of a pipe is not waited for on macOS: there std creates a pipe and marks it
-    /// close-on-exec in two steps, so a process that another test starts in between would hold it.
-    const ENDS: bool = cfg!(not(target_os = "macos"));
+    /// Not on macOS: there std creates a pipe and marks it close-on-exec in two steps, so a process
+    /// that another test starts in between would hold it.
+    fn wait_for_end(pump: &Pump) {
+        if cfg!(not(target_os = "macos")) {
+            assert!(pump.wait(Instant::now() + Duration::from_secs(10)));
+        }
+    }
 
     fn wait_for(log: &Path, expected: &[u8]) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -270,14 +274,14 @@ mod tests {
         assert!(!pump.wait(Instant::now() + Duration::from_millis(50)));
         drop(second);
         wait_for(&log, b"out\nerr \xff\n");
-        assert!(!ENDS || pump.wait(Instant::now() + Duration::from_secs(10)));
+        wait_for_end(&pump);
 
         // Appended to by the next run.
         let (pump, mut writer) = Pump::start(&log).unwrap();
         writer.write_all(b"again\n").unwrap();
         drop(writer);
         wait_for(&log, b"out\nerr \xff\nagain\n");
-        assert!(!ENDS || pump.wait(Instant::now() + Duration::from_secs(10)));
+        wait_for_end(&pump);
     }
 
     #[cfg(unix)]

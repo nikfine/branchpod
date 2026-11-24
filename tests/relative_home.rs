@@ -132,13 +132,16 @@ fn round_trip(s: &Setup, home: &OsStr) {
 
     // The service's log, which the supervisor opens, is in the pod's directory and nowhere else.
     let all = files(&s.cwd);
-    let logs: Vec<&String> = all.iter().filter(|f| f.ends_with("/web.log")).collect();
+    let logs: Vec<&String> = all
+        .iter()
+        .filter(|f| f.ends_with("/service-web.log"))
+        .collect();
     assert_eq!(logs.len(), 1, "{all:?}");
     let pods = s.cwd.join(HOME).join("pods");
     let [pod] = &names(&pods)[..] else {
         panic!("{all:?}")
     };
-    assert_eq!(*logs[0], format!("{HOME}/pods/{pod}/logs/web.log"));
+    assert_eq!(*logs[0], format!("{HOME}/pods/{pod}/logs/service-web.log"));
 
     let (code, out) = s.bp(home, &["status", "--json"]);
     assert_eq!(code, 0, "{out}");
