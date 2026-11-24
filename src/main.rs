@@ -29,7 +29,12 @@ enum Cmd {
         /// Worktree path; defaults to the current directory.
         path: Option<OsString>,
     },
-    /// Show the pod of a worktree and the resources recorded for it.
+    /// Show the pod of a worktree, its resources and what its services are doing now.
+    ///
+    /// Only looks. For a service that is not running it shows the end of its log, which may hold
+    /// whatever the service printed, secrets included. Exits with 0 when the pod is healthy or there
+    /// is none, 4 when it is degraded (a hint says what to do), 5 when it is busy (`bp up` or
+    /// `bp down` is at work: wait), 1 when its state cannot be read.
     Status {
         /// Worktree path; defaults to the current directory.
         path: Option<OsString>,

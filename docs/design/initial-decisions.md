@@ -143,12 +143,18 @@ One supervisor process per worktree, no global daemon; control over a local sock
   instance always open; clients connect at identification level only. Endpoints carry a random part
   and are recorded in the ledger. The supervisor serves one request at a time and gives up on a client
   that sends nothing for 10 s. Clients have no time limit for the answer: a supervisor that listens but
-  hangs keeps `bp down` waiting, like any other step.
+  hangs keeps `bp down` waiting, like any other step. The exception is `bp status` (see there).
 - **Ledger.** The supervisor never writes the ledger: it reports, and `bp up` / `bp down` record under
   the pod lock, so the ledger keeps a single writer. The supervisor is a resource of its own
   (`supervisor`: endpoint, pid + start time); each service records its pid + start time. The start
   time is the OS's own token (Linux `/proc/<pid>/stat` field 22, macOS `proc_pidinfo`, Windows
   `GetProcessTimes`), not wall-clock time; a pid with another start time is another process.
+- **Exits** are noted when they happen, by a thread per service that waits without collecting the status
+  (Unix: `waitid` with `WNOWAIT`; Windows: a handle of its own). The thread that serves requests collects it
+  when asked, as it also does when stopping, so the two do not race, and on Unix the pid stays taken until
+  then. Rejected: waiting and collecting in that thread, which races with `killpg`; polling. The status is
+  data (`{"code": 1}`, `{"signal": 9}`), not the platform's text. The protocol stays at version 1: a `bp`
+  that refused older supervisors could not take their pods down. Their text is read as "exited".
 - **Services** are not restarted; one that exits keeps its status until it is stopped. Their output goes
   to files through the supervisor, see "Service logs". The environment is passed to the supervisor but
   not recorded (it may hold secrets).
@@ -444,6 +450,48 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
 - `up` returns once every service is started (its process exists), not once it is ready: readiness
   hooks are #18.
 
+## `bp status`
+
+The ledger says what was created; `bp status` adds what has become of it. It only looks.
+
+- **Supervisor** (`runtime.state` in `--json`): `running` (it answers), `unresponsive` (its process runs, but
+  it does not answer), `gone`, `not_started` (no process recorded). Nothing listening is not enough for
+  `gone`: somebody may have removed the socket file. One that stops answering gets a second to be gone.
+- **Service:** what the supervisor says, `running` or `exited` (with `exit`, unless an older supervisor saw
+  it, and `exited_at_ms`). If it does not answer or does not know that process, the recorded process counts:
+  `gone` if it does not run (how it ended was known to the supervisor only); otherwise `orphaned`, or
+  `running` while the supervisor is merely unresponsive. Besides `not_started` there is `unknown`, for a
+  record that cannot be read. `status` stays the status in the ledger.
+- **`health`** of the pod: `healthy`; `degraded` when a process is not `running`, whatever its exit code (there
+  are no one-shot services), or a resource is not live in the ledger; `busy` while `bp up` or `bp down` holds
+  the pod lock, whatever the rest looks like. `problems` lists what is wrong (with `state` for a process,
+  `status` for the rest), `hint` is the next step. Before a pod counts as degraded its ledger is read again:
+  the `bp down` that took it apart may just have ended. Destroyed resources that come before everything else
+  are of an earlier run and are no problem.
+- **The pod lock** is touched only if its holder is recorded or the pod would be degraded, so that asking
+  often does not make `up` and `down` report that they wait.
+- **Waiting.** The supervisor gets 3 s to answer. Elsewhere clients have no limit, as they cannot do without
+  the answer and cannot tell slow work from a hang; here the hang is the answer. Slow work, up to 10 s for
+  each service being stopped, happens under the pod lock and is reported as `busy`. The request runs on a
+  thread that is left behind, because connecting can hang too (a full backlog, no free pipe instance).
+- **The hint** names two commands, not `a && b`, which Windows PowerShell does not have. For a supervisor that
+  hangs it says to end the process first: `bp down` would wait for its answer.
+- **The end of the log** of a service that is not running: 10 lines, at most 4 KB, also in the text output.
+  Bytes that are not UTF-8 are replaced (`lossy`), and in the text control characters too; `bp logs` has the
+  bytes. A service may have printed secrets: they are shown like the rest, nothing is masked, and whoever
+  keeps the output keeps them.
+
+Limits of what it can tell:
+
+- `running` is not ready (#18).
+- On Unix `gone` does not mean that the port is free: a killed process can still have its files open (#84).
+- Children of a service whose own process has exited are not seen.
+- A hung supervisor looks like one that takes longer than 3 s.
+- A process that is not ours to query (on macOS one that runs as another user) looks `gone` without its
+  supervisor. Where the OS gives no start time (other than Linux, macOS and Windows) a reused pid looks alive.
+- The last output may reach the log a moment after the exit is seen.
+- Not checked: `bp up` run elevated and `bp status` not, on Windows.
+
 ## File sync (Mutagen)
 
 Plain resources, no special-casing in the core beyond a readiness hook:
@@ -473,6 +521,19 @@ Docker Desktop's built-in synchronized file shares require a paid subscription; 
   delivered as JSON on stdin to external plugins `bp-<name>` on `PATH`, with a timeout; a failing plugin
   never breaks `up` / `down`.
 - The `--json` output and event schema are a versioned public API.
+- Exit codes are part of it, the same with and without `--json` (the rest of the CLI follows in #54):
+
+  | Code | Meaning | Command |
+  |---|---|---|
+  | `0` | done; `status`: healthy, or no pod | all |
+  | `1` | it could not be done or looked at | all |
+  | `2` | usage error | all |
+  | `3` | resources are left behind | `down` |
+  | `4` | the pod is degraded: act on the hint | `status` |
+  | `5` | the pod is busy: `up` or `down` is at work, wait | `status` |
+
+  `4` and `5` differ because whoever sees `4` takes the pod down, which would be wrong in the middle of
+  somebody else's `up`.
 - Example: an Orca plugin opens a log tab (`bp logs -f <service>`) on `service.started`; closing the tab
   does not stop the service. Orca also attributes listening ports to a worktree by process cwd, so services
   started with cwd inside the worktree show up without any plugin; container-published ports do not.

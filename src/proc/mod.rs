@@ -77,12 +77,28 @@ impl Tree {
         self.0.child()
     }
 
+    /// For another thread to wait for the leader to exit, while this tree is used as before.
+    pub(crate) fn leader_exit(&self) -> io::Result<LeaderExit> {
+        self.0.leader_exit().map(LeaderExit)
+    }
+
     /// Stops the tree, whether or not its leader has exited already, and reaps the leader. On
     /// Unix it is asked to exit and killed after `grace`; on Windows it is killed at once, and
     /// `grace` limits the wait for all of it to be gone. `leader` is the leader's identity: its
     /// pid may have been reused.
     pub(crate) fn stop(&mut self, leader: ProcId, grace: Duration) -> io::Result<()> {
         self.0.stop(leader, grace)
+    }
+}
+
+/// The exit of a tree's leader, to wait for.
+pub(crate) struct LeaderExit(sys::LeaderExit);
+
+impl LeaderExit {
+    /// Returns once the leader has exited. It is not reaped: its exit status is still there to be
+    /// collected, and on Unix its pid stays taken until then.
+    pub(crate) fn wait(self) -> io::Result<()> {
+        self.0.wait()
     }
 }
 

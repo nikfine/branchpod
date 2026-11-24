@@ -21,7 +21,7 @@ use crate::supervisor::{self, Request};
 use crate::{commands, control, ports, proc, services};
 
 /// How long a supervisor whose channel broke gets to be gone.
-const DYING_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const DYING_WAIT: Duration = Duration::from_secs(1);
 
 /// Outcome of tearing down one resource.
 #[derive(Debug)]

@@ -118,6 +118,26 @@ impl Snapshot {
         Ok((first, offset) != (0, 0))
     }
 
+    /// The last bytes, at most `limit` of them, and whether there was anything before them. Reads
+    /// no more than that, unlike [`Snapshot::tail`], which looks for the beginning of a line.
+    pub(crate) fn last_bytes(&mut self, limit: u64) -> io::Result<(Vec<u8>, bool)> {
+        let mut pieces: Vec<Vec<u8>> = Vec::new();
+        let mut left = limit;
+        let mut more = false;
+        for part in self.parts.iter_mut().rev() {
+            let take = part.len.min(left);
+            more |= take < part.len;
+            left -= take;
+            part.file.seek(SeekFrom::Start(part.len - take))?;
+            let mut piece = Vec::new();
+            // Less, if it was truncated behind our back.
+            (&mut part.file).take(take).read_to_end(&mut piece)?;
+            pieces.push(piece);
+        }
+        pieces.reverse();
+        Ok((pieces.concat(), more))
+    }
+
     /// Where following goes on after this snapshot.
     pub(crate) fn end(&self) -> Cursor {
         let last = self.parts.last().expect("never empty");
@@ -453,6 +473,22 @@ mod tests {
     fn bytes_are_passed_as_they_are() {
         let bytes = b"\xff\xfe\x00\r\n\x80abc";
         assert_eq!(tail(&log(&[], Some(bytes)), Lines::All).0, bytes);
+    }
+
+    #[test]
+    fn last_bytes_cross_segments() {
+        let l = log(&[b"abc", b"def"], Some(b"gh"));
+        let last = |limit| {
+            let mut snapshot = Snapshot::open(&l.path).unwrap().unwrap();
+            let (bytes, more) = snapshot.last_bytes(limit).unwrap();
+            (String::from_utf8(bytes).unwrap(), more)
+        };
+        assert_eq!(last(0), (String::new(), true));
+        assert_eq!(last(2), ("gh".into(), true));
+        assert_eq!(last(4), ("efgh".into(), true));
+        assert_eq!(last(7), ("bcdefgh".into(), true));
+        assert_eq!(last(8), ("abcdefgh".into(), false));
+        assert_eq!(last(99), ("abcdefgh".into(), false));
     }
 
     #[test]

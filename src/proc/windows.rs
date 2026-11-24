@@ -87,6 +87,10 @@ impl Tree {
         &mut self.child
     }
 
+    pub(crate) fn leader_exit(&self) -> io::Result<LeaderExit> {
+        self.child.as_handle().try_clone_to_owned().map(LeaderExit)
+    }
+
     /// Waits for the processes themselves, not only for the job to count none: it stops counting
     /// one before that process is gone. One that appears in neither list (created after the first
     /// and no longer counted by the second, or not to be opened) is only waited for by the count.
@@ -119,6 +123,19 @@ impl Tree {
             thread::sleep(POLL);
         }
         self.child.wait().map(drop)
+    }
+}
+
+/// A handle of its own to the process.
+pub(crate) struct LeaderExit(OwnedHandle);
+
+impl LeaderExit {
+    pub(crate) fn wait(self) -> io::Result<()> {
+        // SAFETY: a valid process handle with all access.
+        if unsafe { WaitForSingleObject(self.0.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
