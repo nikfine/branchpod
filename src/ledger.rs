@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 pub(crate) const LEDGER_VERSION: u32 = 1;
@@ -63,9 +63,10 @@ pub(crate) enum Event {
         #[serde(default)]
         data: Value,
     },
-    /// Teardown is about to move the resource before deleting it (a directory renamed to a trash
-    /// name): `data` replaces the recorded data and names the new location, so an interruption at
-    /// any point is finished from the ledger. Status and order are unchanged.
+    /// Teardown is about to move the resource (a directory renamed to a trash name before it is
+    /// deleted, an edited file to where it is kept): `data` replaces the recorded data and names the
+    /// new location, so an interruption at any point is finished from the ledger. Status and order
+    /// are unchanged.
     Moved { data: Value },
     /// Released by teardown or gc.
     Destroyed,
@@ -118,10 +119,28 @@ pub(crate) struct ResourceState {
     pub(crate) kind: Kind,
     pub(crate) name: String,
     pub(crate) status: Status,
-    #[serde(skip_serializing_if = "Value::is_null")]
+    #[serde(
+        skip_serializing_if = "Value::is_null",
+        serialize_with = "without_private_data"
+    )]
     pub(crate) data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
+}
+
+/// Field of a resource's data that stays in the ledger: the state is printed by `bp status --json`,
+/// and the hash of a short secret gives it away.
+pub(crate) const PRIVATE_DATA: &str = "fingerprint";
+
+fn without_private_data<S: Serializer>(data: &Value, serializer: S) -> Result<S::Ok, S::Error> {
+    match data {
+        Value::Object(fields) => serializer.collect_map(
+            fields
+                .iter()
+                .filter(|(name, _)| name.as_str() != PRIVATE_DATA),
+        ),
+        _ => data.serialize(serializer),
+    }
 }
 
 pub(crate) struct Ledger {
@@ -446,6 +465,23 @@ mod tests {
         )
         .unwrap();
         assert!(read(&path).is_err());
+    }
+
+    #[test]
+    fn a_fingerprint_is_kept_but_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger.record(Kind::File, ".env", Event::intent()).unwrap();
+        let data = json!({"path": "/wt/.env", "fingerprint": {"size": 3, "sha256": "abc"}});
+        let created = Event::Created { data: data.clone() };
+        ledger.record(Kind::File, ".env", created).unwrap();
+        drop(ledger);
+
+        let s = state(&read(&path).unwrap());
+        assert_eq!(s[0].data, data);
+        let shown = serde_json::to_value(&s[0]).unwrap();
+        assert_eq!(shown["data"], json!({"path": "/wt/.env"}));
     }
 
     #[test]

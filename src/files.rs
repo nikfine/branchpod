@@ -9,15 +9,19 @@
 //! was created: a link is removed as a link and never followed, a path that has changed type is
 //! left in place and reported, and nothing is reached through a link. `bp down` removes every
 //! link before any directory, so no recursive delete can reach into the main checkout through one.
+//! A single file whose content is not what was created any more is kept: see [`crate::saved`].
 
 use std::fs::{self, File, Metadata};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::{FileMode, FileSpec};
+use crate::saved::{self, Saved, Stamp};
 use crate::vars::Vars;
 use crate::{fsutil, inuse};
 
@@ -50,6 +54,98 @@ pub(crate) struct Record {
     /// recorded before the move, so an interruption at any point is finished from the ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) trash: Option<PathBuf>,
+    /// Single files only: what tells an edited one. Without it (an interrupted copy, a record of an
+    /// older `bp`) the file is removed whatever its content. Not shown by `bp status --json`, see
+    /// [`crate::ledger::PRIVATE_DATA`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fingerprint: Option<Fingerprint>,
+    /// Where teardown keeps the edited file, recorded before it is moved there; an attempt that was
+    /// interrupted or failed may have left a path unused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) saved: Vec<PathBuf>,
+}
+
+/// What a file's content was when it was created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Fingerprint {
+    size: u64,
+    #[serde(flatten)]
+    content: Content,
+}
+
+/// Permissions, attributes and, with a hash, the modification time are not content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Content {
+    Sha256(String),
+    /// Of a copy-on-write clone, as nanoseconds since the epoch: reading all of it would cost what
+    /// cloning saved.
+    Modified(i64),
+}
+
+impl Fingerprint {
+    fn of_bytes(bytes: &[u8]) -> Fingerprint {
+        Fingerprint::hashed(bytes.len() as u64, &Sha256::digest(bytes))
+    }
+
+    fn hashed(size: u64, digest: &[u8]) -> Fingerprint {
+        let hex = digest.iter().map(|b| format!("{b:02x}")).collect();
+        Fingerprint {
+            size,
+            content: Content::Sha256(hex),
+        }
+    }
+
+    /// Of a fresh clone; read after all if its modification time cannot be told.
+    fn of_clone(path: &Path) -> io::Result<Fingerprint> {
+        let meta = fs::symlink_metadata(path)?;
+        match modified(&meta) {
+            Some(modified) => Ok(Fingerprint {
+                size: meta.len(),
+                content: Content::Modified(modified),
+            }),
+            None => hash_file(path),
+        }
+    }
+
+    /// Whether the file `path` still has this content.
+    fn matches(&self, path: &Path, meta: &Metadata) -> io::Result<bool> {
+        if meta.len() != self.size {
+            return Ok(false);
+        }
+        match &self.content {
+            Content::Modified(recorded) => Ok(modified(meta) == Some(*recorded)),
+            Content::Sha256(_) => Ok(hash_file(path)? == *self),
+        }
+    }
+}
+
+fn modified(meta: &Metadata) -> Option<i64> {
+    let since = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    since.as_nanos().try_into().ok()
+}
+
+fn hash_file(path: &Path) -> io::Result<Fingerprint> {
+    copy_hashed(&mut File::open(path)?, &mut io::sink())
+}
+
+/// Copies everything and tells what it was.
+fn copy_hashed(from: &mut impl Read, to: &mut impl Write) -> io::Result<Fingerprint> {
+    let mut hasher = Sha256::new();
+    let mut size = 0;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let n = match from.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(&buffer[..n]);
+        to.write_all(&buffer[..n])?;
+        size += n as u64;
+    }
+    Ok(Fingerprint::hashed(size, &hasher.finalize()))
 }
 
 /// A checked file resource, ready to be created.
@@ -147,6 +243,10 @@ fn plan_inner(spec: &FileSpec, main: &Path, root: &Path, vars: &Vars) -> Result<
         FileMode::Ignore => unreachable!("handled above"),
     };
 
+    let fingerprint = match &action {
+        Action::Write { bytes, .. } => Some(Fingerprint::of_bytes(bytes)),
+        _ => None,
+    };
     Ok(Some(Plan {
         record: Record {
             root: root.to_path_buf(),
@@ -155,6 +255,8 @@ fn plan_inner(spec: &FileSpec, main: &Path, root: &Path, vars: &Vars) -> Result<
             created_dirs,
             cloned: None,
             trash: None,
+            fingerprint,
+            saved: Vec::new(),
         },
         action,
     }))
@@ -210,7 +312,9 @@ fn create_inner(plan: &Plan, record: &mut Record) -> Result<()> {
                 fs::create_dir(path)?;
                 copy_tree(source, path, *reflink, &mut cloned)?;
             } else {
-                cloned = Some(copy_file(source, path, *reflink)?);
+                let copied = copy_file(source, path, *reflink, true)?;
+                cloned = Some(copied.cloned);
+                record.fingerprint = copied.fingerprint;
             }
             // `None` for a reflink of a tree without files: nothing was cloned or copied.
             record.cloned = if *reflink { cloned } else { None };
@@ -226,24 +330,47 @@ fn create_inner(plan: &Plan, record: &mut Record) -> Result<()> {
     Ok(())
 }
 
-/// Copies one file into a new `dest`; returns whether it was cloned copy-on-write.
+struct Copied {
+    /// Copy-on-write.
+    cloned: bool,
+    fingerprint: Option<Fingerprint>,
+}
+
+/// Copies one file into a new `dest`, with its fingerprint if asked for.
 ///
 /// `dest` is always created exclusively, so a file or link that appeared there since `plan` is
 /// never overwritten or written through (`fs::copy` would do both).
-fn copy_file(source: &Path, dest: &Path, reflink: bool) -> Result<bool> {
+fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Result<Copied> {
     let mut from = File::open(source)?;
     if reflink {
         match reflink_copy::reflink_file_to_path(&from, dest) {
-            Ok(()) => return Ok(true),
+            Ok(()) => {
+                let fingerprint = match fingerprint {
+                    true => Some(Fingerprint::of_clone(dest)?),
+                    false => None,
+                };
+                return Ok(Copied {
+                    cloned: true,
+                    fingerprint,
+                });
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e.into()),
             // Not supported here (file system, platform): fall back to a plain copy.
             Err(_) => {}
         }
     }
     let mut to = File::create_new(dest)?;
-    io::copy(&mut from, &mut to)?;
+    let fingerprint = if fingerprint {
+        Some(copy_hashed(&mut from, &mut to)?)
+    } else {
+        io::copy(&mut from, &mut to)?;
+        None
+    };
     to.set_permissions(from.metadata()?.permissions())?;
-    Ok(false)
+    Ok(Copied {
+        cloned: false,
+        fingerprint,
+    })
 }
 
 /// Copies the contents of `source` into the existing, empty `dest`. Links inside the tree are
@@ -262,9 +389,9 @@ fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut Option<bool
             fs::create_dir(&to)?;
             copy_tree(&from, &to, reflink, cloned)?;
         } else if file_type.is_file() {
-            let this = copy_file(&from, &to, reflink)
+            let this = copy_file(&from, &to, reflink, false)
                 .with_context(|| format!("cannot copy {}", from.display()))?;
-            *cloned = Some(cloned.unwrap_or(true) && this);
+            *cloned = Some(cloned.unwrap_or(true) && this.cloned);
         } else {
             bail!("{} is not a file, directory or link", from.display());
         }
@@ -350,12 +477,24 @@ fn symlink_error(e: io::Error) -> anyhow::Error {
 /// record finishes the job: it deletes a leftover trash and moves a remaining directory. Single
 /// files and links are removed in one operation. Transient locks are retried; a lasting one is
 /// reported with the processes holding the path, when the OS can tell.
-pub(crate) fn remove(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
-    remove_inner(record, on_moved)
+///
+/// A single file that was edited is moved to `saved`, its new path recorded through `on_moved` in the
+/// same way; if it cannot be moved it stays, which is an error. Returns where this or an earlier,
+/// interrupted attempt kept the file.
+pub(crate) fn remove(
+    record: &Record,
+    saved: &Saved,
+    on_moved: impl FnOnce(&Record) -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    remove_inner(record, saved, on_moved)
         .with_context(|| format!("cannot remove {}", record.path.display()))
 }
 
-fn remove_inner(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
+fn remove_inner(
+    record: &Record,
+    saved: &Saved,
+    on_moved: impl FnOnce(&Record) -> Result<()>,
+) -> Result<Vec<PathBuf>> {
     let path = &record.path;
     let inside = |p: &Path| p.starts_with(&record.root) && p != record.root;
     let trash_inside = record
@@ -366,13 +505,25 @@ fn remove_inner(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -
         bail!("refusing to touch a path outside {}", record.root.display());
     }
 
+    let mut kept = Vec::new();
+    for target in &record.saved {
+        saved.discard_unfinished(target)?;
+        match fs::symlink_metadata(target) {
+            Ok(_) => kept.push(target.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot read {}", target.display()));
+            }
+        }
+    }
+
     if parents_are_real_dirs(&record.root, path)? {
         // A delete interrupted after the move; the trash shares the parents of `path`.
         if let Some(trash) = &record.trash {
             remove_trash(trash)?;
         }
         match fs::symlink_metadata(path) {
-            Ok(meta) => remove_entry(record, &meta, on_moved)?,
+            Ok(meta) => remove_entry(record, &meta, saved, &mut kept, on_moved)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -390,17 +541,19 @@ fn remove_inner(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -
             // Holds something we did not create, and so do its parents.
             Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => break,
             Err(e) => {
-                return Err(in_use(dir, e))
+                return Err(inuse::error(dir, e))
                     .with_context(|| format!("cannot remove {}", dir.display()));
             }
         }
     }
-    Ok(())
+    Ok(kept)
 }
 
 fn remove_entry(
     record: &Record,
     meta: &Metadata,
+    saved: &Saved,
+    kept: &mut Vec<PathBuf>,
     on_moved: impl FnOnce(&Record) -> Result<()>,
 ) -> Result<()> {
     let (path, expected) = (&record.path, record.entry);
@@ -428,10 +581,81 @@ fn remove_entry(
         );
     }
     match expected {
-        EntryType::Link => fsutil::retry(|| remove_link(path, meta)).map_err(|e| in_use(path, e)),
-        EntryType::File => fsutil::retry(|| fs::remove_file(path)).map_err(|e| in_use(path, e)),
+        EntryType::Link => {
+            fsutil::retry(|| remove_link(path, meta)).map_err(|e| inuse::error(path, e))
+        }
+        EntryType::File => remove_file(record, meta, saved, kept, on_moved),
         EntryType::Dir => remove_tree(record, on_moved),
     }
+}
+
+/// Deletes a file that still is what was created, and moves one that was edited to `saved`.
+fn remove_file(
+    record: &Record,
+    meta: &Metadata,
+    saved: &Saved,
+    kept: &mut Vec<PathBuf>,
+    on_moved: impl FnOnce(&Record) -> Result<()>,
+) -> Result<()> {
+    let path = &record.path;
+    let expendable = match is_expendable(record, meta, kept) {
+        Ok(expendable) => expendable,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(inuse::error(path, e))
+                .context("left in place: cannot tell whether it was edited");
+        }
+    };
+    if expendable {
+        match saved::remove_unchanged(path, &Stamp::of(meta)) {
+            Ok(true) => return Ok(()),
+            // Written to since it was looked at.
+            Ok(false) if fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) => {}
+            Ok(false) => bail!("left in place: it is no longer the file bp created"),
+            Err(e) => return Err(inuse::error(path, e)),
+        }
+    }
+
+    // Recorded by an earlier attempt that did not get to use it.
+    let unused = record.saved.iter().find(|t| !kept.contains(t));
+    let target = match unused.filter(|t| saved.contains(t)) {
+        Some(target) => target.clone(),
+        None => {
+            let target = saved.choose(path.strip_prefix(&record.root)?)?;
+            let mut moved = record.clone();
+            moved.saved.push(target.clone());
+            on_moved(&moved)
+                .context("cannot record where the edited file goes; nothing was moved")?;
+            target
+        }
+    };
+    saved
+        .take(path, &target)
+        .context("it was edited and cannot be kept")?;
+    kept.push(target);
+    Ok(())
+}
+
+/// Whether nothing is lost with the file: it is what was created, or an earlier attempt kept the
+/// same content but could not remove the file.
+fn is_expendable(record: &Record, meta: &Metadata, kept: &[PathBuf]) -> io::Result<bool> {
+    let path = &record.path;
+    let Some(fingerprint) = &record.fingerprint else {
+        return Ok(true);
+    };
+    if fsutil::retry(|| fingerprint.matches(path, meta))? {
+        return Ok(true);
+    }
+    for copy in kept {
+        // Anything unexpected about the copy: keep the file once more.
+        if fs::symlink_metadata(copy).is_ok_and(|m| m.is_file() && m.len() == meta.len())
+            && let Ok(copy) = hash_file(copy)
+            && fsutil::retry(|| hash_file(path))? == copy
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Infix of trash names: `<name>.bp-trash-<unique>` next to the directory being removed.
@@ -453,7 +677,7 @@ fn remove_tree(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) ->
             trash
         }
     };
-    fsutil::retry(|| fs::rename(path, &trash)).map_err(|e| in_use(path, e))?;
+    fsutil::retry(|| fs::rename(path, &trash)).map_err(|e| inuse::error(path, e))?;
     remove_trash(&trash).with_context(|| format!("moved to {}, but", trash.display()))
 }
 
@@ -473,7 +697,7 @@ fn remove_trash(trash: &Path) -> Result<()> {
     match fsutil::retry(|| fs::remove_dir_all(trash)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(in_use(trash, e)),
+        Err(e) => Err(inuse::error(trash, e)),
     }
 }
 
@@ -486,27 +710,6 @@ fn trash_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(format!("{TRASH}{}-{nanos:x}", std::process::id()));
     path.with_file_name(name)
-}
-
-/// The error for a path that could not be removed. A lock that outlasted the retries is
-/// reported with the processes holding it, when the OS can tell.
-fn in_use(path: &Path, e: io::Error) -> anyhow::Error {
-    if !fsutil::is_transient(&e) {
-        return e.into();
-    }
-    let holders = inuse::holders(path);
-    if holders.is_empty() {
-        anyhow::anyhow!(
-            "in use by another process, or access is denied ({e}); \
-             close what holds it and run `bp down` again"
-        )
-    } else {
-        let names: Vec<String> = holders.iter().map(ToString::to_string).collect();
-        anyhow::anyhow!(
-            "in use by {}; close it and run `bp down` again",
-            names.join(", ")
-        )
-    }
 }
 
 #[cfg(unix)]
@@ -647,7 +850,12 @@ mod tests {
 
     /// Removes without a ledger: the trash location is not recorded anywhere.
     fn rm(record: &Record) -> Result<()> {
-        remove(record, |_| Ok(()))
+        remove(record, &saved(record), |_| Ok(())).map(drop)
+    }
+
+    /// Edited files go next to the worktree.
+    fn saved(record: &Record) -> Saved {
+        Saved::new(&record.root.with_file_name("home"), "wt-00000000")
     }
 
     /// Removes links first, then the rest, each in reverse order, as `bp down` does.
@@ -896,7 +1104,7 @@ mod tests {
         write(&t.main.join("vendor/pkg/a.txt"), "a");
         let record = up(&t, &spec("vendor", FileMode::Copy));
         let mut recorded = None;
-        remove(&record, |moved| {
+        remove(&record, &saved(&record), |moved| {
             // Recorded before anything is moved.
             assert!(record.path.join("pkg/a.txt").exists());
             let trash = moved.trash.as_deref().expect("trash name");
@@ -940,7 +1148,7 @@ mod tests {
     }
 
     fn rm_with(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) {
-        remove(record, on_moved).unwrap();
+        remove(record, &saved(record), on_moved).unwrap();
     }
 
     #[test]
@@ -948,7 +1156,7 @@ mod tests {
         let t = tree();
         write(&t.main.join("vendor/a.txt"), "a");
         let record = up(&t, &spec("vendor", FileMode::Copy));
-        let err = remove(&record, |_| bail!("disk full")).unwrap_err();
+        let err = remove(&record, &saved(&record), |_| bail!("disk full")).unwrap_err();
         assert!(format!("{err:#}").contains("disk full"), "{err:#}");
         assert!(t.wt.join("vendor/a.txt").exists());
         assert_eq!(fs::read_dir(&t.wt).unwrap().count(), 1);
@@ -1011,6 +1219,272 @@ mod tests {
         drop(open);
         rm(&record).unwrap();
         assert!(!t.wt.join(".env").exists());
+    }
+
+    /// The only file kept for the pod of `record`.
+    fn kept_text(record: &Record, kept: &[PathBuf]) -> String {
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let home = record.root.with_file_name("home");
+        assert!(kept[0].starts_with(home.join("saved").join("wt-00000000")));
+        let relative = record.path.strip_prefix(&record.root).unwrap();
+        assert!(kept[0].ends_with(relative), "{}", kept[0].display());
+        fs::read_to_string(&kept[0]).unwrap()
+    }
+
+    fn files_in(dir: &Path) -> usize {
+        fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .map(|e| e.unwrap().path())
+                .map(|p| if p.is_dir() { files_in(&p) } else { 1 })
+                .sum()
+        })
+    }
+
+    /// Moves go into the record, as `bp down` does with the ledger.
+    fn rm_recorded(record: &mut Record) -> Result<Vec<PathBuf>> {
+        let mut recorded = None;
+        let result = remove(record, &saved(record), |moved| {
+            recorded = Some(moved.clone());
+            Ok(())
+        });
+        if let Some(moved) = recorded {
+            *record = moved;
+        }
+        result
+    }
+
+    #[test]
+    fn an_edited_file_is_kept() {
+        for mode in [FileMode::Copy, FileMode::Reflink, FileMode::Template] {
+            let mut edits = vec!["A=1\nB=2\n", "", "A={{port.web}}\n"];
+            // The same size and, for a clone, possibly the same modification time.
+            if mode != FileMode::Reflink {
+                edits.push(if mode == FileMode::Copy {
+                    "A=2\n"
+                } else {
+                    "A=9003\n"
+                });
+            }
+            for edit in edits {
+                let t = tree();
+                let source = match mode {
+                    FileMode::Template => "A={{port.web}}\n",
+                    _ => "A=1\n",
+                };
+                write(&t.main.join("conf/.env"), source);
+                let mut record = up(&t, &spec("conf/.env", mode));
+                fs::write(t.wt.join("conf/.env"), edit).unwrap();
+
+                let kept = rm_recorded(&mut record).unwrap();
+                assert_eq!(kept_text(&record, &kept), edit, "{mode:?}");
+                assert!(!t.wt.join("conf").exists());
+                assert_eq!(
+                    fs::read_to_string(t.main.join("conf/.env")).unwrap(),
+                    source
+                );
+                // Again, as after an interruption before the step was recorded.
+                assert_eq!(rm_recorded(&mut record).unwrap(), kept);
+                assert_eq!(kept_text(&record, &kept), edit);
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_replaced_by_rename_is_kept() {
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let mut record = up(&t, &spec(".env", FileMode::Copy));
+        write(&t.wt.join("new"), "A=2\n");
+        fs::rename(t.wt.join("new"), t.wt.join(".env")).unwrap();
+        let kept = rm_recorded(&mut record).unwrap();
+        assert_eq!(kept_text(&record, &kept), "A=2\n");
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_kept() {
+        for mode in [FileMode::Copy, FileMode::Reflink, FileMode::Template] {
+            let t = tree();
+            write(&t.main.join(".env"), "A=1\r\nB=\u{e9}\n");
+            let mut record = up(&t, &spec(".env", mode));
+            let path = t.wt.join(".env");
+            // Only a clone is told by its modification time.
+            if record.cloned != Some(true) {
+                let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_modified(UNIX_EPOCH).unwrap();
+                drop(file);
+                fs::write(&path, fs::read(&path).unwrap()).unwrap();
+            }
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&path, permissions).unwrap();
+            // The source changing is not an edit of the copy.
+            write(&t.main.join(".env"), "A=2\n");
+
+            assert!(rm_recorded(&mut record).unwrap().is_empty(), "{mode:?}");
+            assert!(!path.exists());
+            assert_eq!(files_in(&t.wt.with_file_name("home")), 0);
+        }
+    }
+
+    #[test]
+    fn an_edited_file_that_was_deleted_is_gone() {
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let mut record = up(&t, &spec(".env", FileMode::Copy));
+        fs::write(t.wt.join(".env"), "A=2\n").unwrap();
+        fs::remove_file(t.wt.join(".env")).unwrap();
+        assert!(rm_recorded(&mut record).unwrap().is_empty());
+        assert_eq!(files_in(&t.wt.with_file_name("home")), 0);
+    }
+
+    #[test]
+    fn a_record_without_a_fingerprint_is_removed_as_before() {
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let record = up(&t, &spec(".env", FileMode::Copy));
+        fs::write(t.wt.join(".env"), "A=2\n").unwrap();
+        let mut old = serde_json::to_value(&record).unwrap();
+        assert!(old.as_object_mut().unwrap().remove("fingerprint").is_some());
+        let mut old: Record = serde_json::from_value(old).unwrap();
+        assert!(rm_recorded(&mut old).unwrap().is_empty());
+        assert!(!t.wt.join(".env").exists());
+    }
+
+    #[test]
+    fn only_single_files_have_a_fingerprint() {
+        let t = tree();
+        write(&t.main.join("dir/a.txt"), "a");
+        for mode in [FileMode::Copy, FileMode::Reflink] {
+            let record = up(&t, &spec("dir", mode));
+            assert_eq!(record.fingerprint, None);
+            rm(&record).unwrap();
+        }
+        let link = up(&t, &spec("dir", FileMode::Link));
+        assert_eq!(link.fingerprint, None);
+        rm(&link).unwrap();
+        // A template's is in the plan already; a copy's comes with its content.
+        write(&t.main.join("f"), "f");
+        for (mode, planned) in [(FileMode::Copy, false), (FileMode::Template, true)] {
+            let plan = plan(&spec("f", mode), &t.main, &t.wt, &vars()).unwrap();
+            let plan = plan.unwrap();
+            assert_eq!(plan.record.fingerprint.is_some(), planned, "{mode:?}");
+        }
+    }
+
+    /// A clone is not read: it goes by its size and modification time.
+    #[test]
+    fn a_clone_is_told_by_its_modification_time() {
+        let t = tree();
+        write(&t.main.join("big.bin"), "data");
+        let mut record = up(&t, &spec("big.bin", FileMode::Reflink));
+        if record.cloned != Some(true) {
+            eprintln!("skipped: no copy-on-write clones here");
+            return;
+        }
+        let path = t.wt.join("big.bin");
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(UNIX_EPOCH).unwrap();
+        drop(file);
+        let kept = rm_recorded(&mut record).unwrap();
+        assert_eq!(kept_text(&record, &kept), "data");
+    }
+
+    #[test]
+    fn every_interruption_of_keeping_a_file_is_finished_from_the_record() {
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let edited = || {
+            let mut record = up(&t, &spec(".env", FileMode::Copy));
+            fs::write(t.wt.join(".env"), "A=2\n").unwrap();
+            let target = saved(&record).choose(Path::new(".env")).unwrap();
+            record.saved = vec![target.clone()];
+            (record, target)
+        };
+
+        // Crashed after recording, before the move.
+        let (mut record, _) = edited();
+        let kept = rm_recorded(&mut record).unwrap();
+        assert_eq!(kept_text(&record, &kept), "A=2\n");
+
+        // Crashed after the move: the other tests call `remove` again. After a copy to another
+        // volume, before the removal: the copy is enough.
+        let (mut record, target) = edited();
+        write(&target, "A=2\n");
+        let kept = rm_recorded(&mut record).unwrap();
+        assert_eq!(kept, [target]);
+        assert_eq!(kept_text(&record, &kept), "A=2\n");
+        assert!(!t.wt.join(".env").exists());
+
+        // The same, but edited once more since: neither is lost.
+        let (mut record, target) = edited();
+        write(&target, "A=2\n");
+        fs::write(t.wt.join(".env"), "A=3\n").unwrap();
+        let kept = rm_recorded(&mut record).unwrap();
+        let texts: Vec<_> = kept
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        assert_eq!(texts, ["A=2\n", "A=3\n"]);
+
+        // Crashed while copying, and then the user deleted the file.
+        let (mut record, target) = edited();
+        fs::remove_file(t.wt.join(".env")).unwrap();
+        let mut part = target.clone().into_os_string();
+        part.push(".bp-part");
+        write(Path::new(&part), "A=");
+        assert!(rm_recorded(&mut record).unwrap().is_empty());
+        assert!(!Path::new(&part).exists());
+    }
+
+    #[test]
+    fn an_edited_file_that_cannot_be_kept_stays() {
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let mut record = up(&t, &spec(".env", FileMode::Copy));
+        fs::write(t.wt.join(".env"), "A=2\n").unwrap();
+
+        let err = remove(&record, &saved(&record), |_| bail!("disk full")).unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "{err:#}");
+        assert_eq!(files_in(&t.wt.with_file_name("home")), 0);
+
+        // No directory can be made there.
+        let home = t.wt.with_file_name("home");
+        write(&home.join("saved"), "in the way");
+        for _ in 0..2 {
+            rm_recorded(&mut record).unwrap_err();
+            assert_eq!(record.saved.len(), 1, "one place is enough");
+            assert_eq!(fs::read_to_string(t.wt.join(".env")).unwrap(), "A=2\n");
+        }
+        fs::remove_file(home.join("saved")).unwrap();
+        let kept = rm_recorded(&mut record).unwrap();
+        assert_eq!(kept_text(&record, &kept), "A=2\n");
+        assert!(!t.wt.join(".env").exists());
+    }
+
+    /// Opened without sharing deletion, as many editors do, it can be read but not moved.
+    #[cfg(windows)]
+    #[test]
+    fn an_edited_file_in_use_stays() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let t = tree();
+        write(&t.main.join(".env"), "A=1\n");
+        let mut record = up(&t, &spec(".env", FileMode::Copy));
+        fs::write(t.wt.join(".env"), "A=2\n").unwrap();
+        let mut options = fs::OpenOptions::new();
+        for share in [FILE_SHARE_READ, 0] {
+            let open = options
+                .read(true)
+                .share_mode(share)
+                .open(t.wt.join(".env"))
+                .unwrap();
+            let err = rm_recorded(&mut record).unwrap_err();
+            assert!(format!("{err:#}").contains("in use by"), "{err:#}");
+            drop(open);
+            assert_eq!(fs::read_to_string(t.wt.join(".env")).unwrap(), "A=2\n");
+        }
+        let kept = rm_recorded(&mut record).unwrap();
+        assert_eq!(kept_text(&record, &kept), "A=2\n");
     }
 
     #[test]

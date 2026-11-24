@@ -58,8 +58,13 @@ Linux `mode = "link"` suits a file edited in place, such as `CLAUDE.local.md`: e
 worktree. A tool that saves by replacing the file turns the link into a regular file, and `down` then exits
 with code 3 and leaves it: move the edits to the main checkout, delete the file and run `down` again.
 
-**Edits to a copy are lost:** `down` deletes the copied file even if it has changed since, without a warning.
-Make lasting changes, such as permissions an agent should keep, in the main checkout.
+**Edits to a copy stay out of the main checkout.** A copied file that has changed since `up` is not deleted:
+`down` moves it to `saved/<pod id>/<time>/` in the `bp` home (`BRANCHPOD_HOME`, by default
+`%LOCALAPPDATA%\branchpod\data` on Windows, `~/.local/share/branchpod` on Linux and
+`~/Library/Application Support/branchpod` on macOS), prints the path and exits with 0. Nothing takes it from
+there: make lasting changes, such as permissions an agent should keep, in the main checkout. Remove what you
+do not need from `saved` yourself, and mind that such files may hold secrets. Files inside a copied
+**directory** are not checked and go with it.
 
 ### Around a session
 
@@ -94,8 +99,8 @@ git worktree remove ../branchpod-worktrees/123-short-slug
   message says what and why. Fix the cause and run `down` again. `no pod for ...` also exits with 0, but
   nothing was torn down: the path is wrong, `BRANCHPOD_HOME` points elsewhere, or the pod is already gone.
 - **Run `down` before a path is used again**, also for a worktree that was removed without it. Otherwise `up`
-  of the new worktree refuses with `already has resources recorded`, and `down` would delete the files
-  recorded for the old one, even if they are not the ones `branchpod` made.
+  of the new worktree refuses with `already has resources recorded`, and `down` would take what is at the
+  recorded paths for its own: it would delete directories, and move files with other contents to `saved`.
 - **`git worktree remove` deletes ignored files without asking**, and refuses if there are uncommitted changes
   or untracked files. Look at those before reaching for `--force`.
 - The local branch stays. After a squash merge git does not see it as merged: delete it with `git branch -D`.

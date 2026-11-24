@@ -4,7 +4,8 @@
 //! after the config changed. Every resource that is not destroyed is visited, pending and failed
 //! ones included (they may exist partially). Each step is idempotent and its outcome is recorded;
 //! a failure does not stop the others, and what is left is reported at the end. Once nothing is
-//! left, the pod's state is removed as well.
+//! left, the pod's state is removed as well. Copies edited in the worktree are kept in the `bp`
+//! home instead of being deleted.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use serde::de::DeserializeOwned;
 use crate::files::{self, EntryType};
 use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
 use crate::pod::{PodMeta, Store};
+use crate::saved::Saved;
 use crate::supervisor::{self, Request};
 use crate::{commands, control, ports, proc, services};
 
@@ -26,6 +28,8 @@ const DYING_WAIT: Duration = Duration::from_secs(1);
 pub(crate) struct Step {
     pub(crate) kind: Kind,
     pub(crate) name: String,
+    /// Files only: where an edited copy was moved to.
+    pub(crate) kept: Vec<PathBuf>,
     /// `None` when the resource is gone.
     pub(crate) error: Option<String>,
 }
@@ -60,14 +64,17 @@ pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
         .iter()
         .rfind(|r| r.kind == Kind::Supervisor)
         .and_then(|r| data::<supervisor::Record>(r).ok());
+    let saved = Saved::new(store.home(), &meta.id);
     let mut steps = Vec::new();
     if !todo.is_empty() {
         let mut ledger = Ledger::open(&store.ledger_path(&meta.id))?;
         for i in todo {
             let r = &resources[i];
-            let mut error = destroy(store, meta, r, supervisor.as_ref(), &mut ledger)
-                .err()
-                .map(|e| format!("{e:#}"));
+            let result = destroy(store, meta, r, supervisor.as_ref(), &saved, &mut ledger);
+            let (kept, mut error) = match result {
+                Ok(kept) => (kept, None),
+                Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+            };
             let event = match &error {
                 None => Event::Destroyed,
                 Some(e) => Event::Failed { error: e.clone() },
@@ -83,6 +90,7 @@ pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
             steps.push(Step {
                 kind: r.kind,
                 name: r.name.clone(),
+                kept,
                 error,
             });
         }
@@ -119,40 +127,42 @@ fn phase(r: &ResourceState) -> u8 {
     }
 }
 
+/// Returns where an edited copy was moved to instead of being deleted.
 fn destroy(
     store: &Store,
     meta: &PodMeta,
     r: &ResourceState,
     supervisor: Option<&supervisor::Record>,
+    saved: &Saved,
     ledger: &mut Ledger,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     match r.kind {
         Kind::Service => {
             let record: services::Record = data(r)?;
             stop_service(supervisor, &r.name, &record)
-                .with_context(|| format!("service {:?}", r.name))
+                .with_context(|| format!("service {:?}", r.name))?;
         }
-        Kind::Supervisor => stop_supervisor(&data(r)?),
+        Kind::Supervisor => stop_supervisor(&data(r)?)?,
         Kind::File => {
             let record: files::Record = data(r)?;
-            files::remove(&record, |moved| {
+            return files::remove(&record, saved, |moved| {
                 let data = serde_json::to_value(moved)?;
                 ledger.record(r.kind, &r.name, Event::Moved { data })
-            })
+            });
         }
-        Kind::Port => ports::Registry::new(store.home())
-            .release(&meta.id, &r.name)
-            .map(drop),
+        Kind::Port => {
+            ports::Registry::new(store.home()).release(&meta.id, &r.name)?;
+        }
         Kind::Command => {
             let record: commands::Record = data(r)?;
             commands::destroy(&record, &command_cwd(store, meta)?)
-                .map(drop)
-                .with_context(|| format!("command {:?}", r.name))
+                .with_context(|| format!("command {:?}", r.name))?;
         }
         Kind::Git => {
             bail!("teardown of {} resources is not supported yet", r.kind)
         }
     }
+    Ok(Vec::new())
 }
 
 /// Asks the supervisor to stop the service. When it is gone, the service's process tree is
@@ -416,6 +426,71 @@ mod tests {
         let report = teardown(&s.store, &s.meta).unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(!trash.exists());
+    }
+
+    /// An edited file in `s`, recorded as `bp up` would have with other content.
+    fn edited(s: &Setup) -> PathBuf {
+        let path = s.meta.worktree.join(".env");
+        fs::write(&path, "A=2").unwrap();
+        let mut data = file_record(&s.meta.worktree, ".env", "file");
+        data["fingerprint"] = json!({ "size": 3, "sha256": "00" });
+        s.live(Kind::File, ".env", data);
+        path
+    }
+
+    #[test]
+    fn an_edited_file_is_kept_and_the_pod_is_clean() {
+        let s = setup(true);
+        let path = edited(&s);
+        let report = teardown(&s.store, &s.meta).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(!path.exists());
+        assert!(!s.store.pod_dir(&s.meta.id).exists());
+        let kept = &report.steps[0].kept;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(&kept[0]).unwrap(), "A=2");
+    }
+
+    #[test]
+    fn an_edited_file_that_cannot_be_kept_is_left_until_it_can() {
+        let s = setup(true);
+        let path = edited(&s);
+        let port = ports::Registry::new(s.store.home());
+        port.allocate(&s.meta.id, "web", [41000, 41999]).unwrap();
+        s.live(Kind::Port, "web", Value::Null);
+        let saved = s.store.home().join("saved");
+        fs::write(&saved, "in the way").unwrap();
+        for _ in 0..2 {
+            let report = teardown(&s.store, &s.meta).unwrap();
+            let left: Vec<&str> = report.leftovers().map(|s| s.name.as_str()).collect();
+            assert_eq!(left, [".env"]);
+            assert_eq!(fs::read_to_string(&path).unwrap(), "A=2");
+        }
+        fs::remove_file(&saved).unwrap();
+        let report = teardown(&s.store, &s.meta).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        let kept = &report.steps[0].kept;
+        assert_eq!(fs::read_to_string(&kept[0]).unwrap(), "A=2");
+    }
+
+    /// Interrupted between the move and its record: the next run says where the file is.
+    #[test]
+    fn a_kept_file_is_reported_by_the_run_that_finishes() {
+        let s = setup(true);
+        let target = s.store.home().join("saved").join("x").join(".env");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "A=2").unwrap();
+        s.live(
+            Kind::File,
+            ".env",
+            file_record(&s.meta.worktree, ".env", "file"),
+        );
+        let mut moved = file_record(&s.meta.worktree, ".env", "file");
+        moved["saved"] = json!([target]);
+        s.record(Kind::File, ".env", vec![Event::Moved { data: moved }]);
+        let report = teardown(&s.store, &s.meta).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(report.steps[0].kept, [target]);
     }
 
     #[test]

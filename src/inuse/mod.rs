@@ -5,7 +5,10 @@
 //! reported.
 
 use std::fmt;
+use std::io;
 use std::path::Path;
+
+use crate::fsutil;
 
 #[cfg(unix)]
 mod unix;
@@ -32,6 +35,27 @@ impl fmt::Display for Holder {
 /// Processes holding `path` open, or for a directory, files inside it.
 pub(crate) fn holders(path: &Path) -> Vec<Holder> {
     sys::holders(path)
+}
+
+/// The error for a path that could not be removed or moved. A lock that outlasted the retries is
+/// reported with the processes holding it, when the OS can tell.
+pub(crate) fn error(path: &Path, e: io::Error) -> anyhow::Error {
+    if !fsutil::is_transient(&e) {
+        return e.into();
+    }
+    let holders = holders(path);
+    if holders.is_empty() {
+        anyhow::anyhow!(
+            "in use by another process, or access is denied ({e}); \
+             close what holds it and run `bp down` again"
+        )
+    } else {
+        let names: Vec<String> = holders.iter().map(ToString::to_string).collect();
+        anyhow::anyhow!(
+            "in use by {}; close it and run `bp down` again",
+            names.join(", ")
+        )
+    }
 }
 
 #[cfg(test)]

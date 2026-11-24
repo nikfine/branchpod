@@ -106,12 +106,22 @@ pub fn down(path: Option<&OsStr>) -> Result<ExitCode> {
     println!("pod {} ({})", meta.id, meta.worktree.display());
     let report = down::teardown(&store, &meta)?;
     for s in &report.steps {
-        let outcome = if s.error.is_none() {
-            "destroyed"
-        } else {
-            "left"
+        let outcome = match (&s.error, s.kept.is_empty()) {
+            (Some(_), _) => "left",
+            (None, true) => "destroyed",
+            (None, false) => "saved",
         };
         println!("  {:<9} {:<10} {}", outcome, s.kind, s.name);
+    }
+    for s in &report.steps {
+        for path in &s.kept {
+            eprintln!(
+                "bp: {} {} was changed after `bp up`; kept as {}",
+                s.kind,
+                s.name,
+                path.display()
+            );
+        }
     }
     for s in report.leftovers() {
         eprintln!(
