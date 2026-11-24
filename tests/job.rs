@@ -6,8 +6,11 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
@@ -83,13 +86,10 @@ impl Pod {
         }
     }
 
-    /// `bp up` in nested jobs with these limits, outermost first. Its output goes to a file, not
-    /// to a pipe: the supervisor inherits whatever other inheritable handles `bp` has (#76), and
-    /// with one of them on the pipe, its end would come only with the supervisor's.
+    /// `bp up` in nested jobs with these limits, outermost first.
     fn up_in(&self, jobs: &[u32]) -> (i32, String) {
         let jobs: Vec<String> = jobs.iter().map(u32::to_string).collect();
-        let path = self.home.with_file_name("up.log");
-        let log = fs::File::create(&path).unwrap();
+        let (mut reader, writer) = std::io::pipe().unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -101,11 +101,20 @@ impl Pod {
             .env(JOBS_ENV, jobs.join(","))
             .env(WORKTREE_ENV, &self.worktree)
             .env("BRANCHPOD_HOME", &self.home)
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
+            .stdout(writer.try_clone().unwrap())
+            .stderr(writer)
             .status()
             .unwrap();
-        let out = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+        // Not `output()`: should the supervisor hold the pipe, it would never return.
+        let (sender, end) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).unwrap();
+            let _ = sender.send(String::from_utf8_lossy(&out).into_owned());
+        });
+        let out = end
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the end of output comes when `bp up` exits");
         (status.code().unwrap(), out)
     }
 
