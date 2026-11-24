@@ -87,8 +87,8 @@ pod demo-feature-1a2b3c4d is up (/work/demo-feature)
   service    web                      pid 4321
 ```
 
-A *pod* is everything created for one worktree. Look at it, and at what the service printed. The log may still be
-empty right after `up`:
+A *pod* is everything created for one worktree. Look at it, and at what the service printed. `status` ends with
+`healthy`; the log may still be empty right after `up`:
 
 ```
 branchpod status ../demo-feature

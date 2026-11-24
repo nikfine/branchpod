@@ -379,7 +379,7 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
   be taken for a real one. Whitespace counts because tools end even an empty result with a line break.
 - An env file has one variable per line, so the example does not carry values with line breaks (PEM, JSON)
   over: each further line is taken for a variable of its own, or rejected. Docker then quotes the line, or
-  its part before `=`, on stderr, which shows in the error of `bp up`, the ledger and `bp status --json`.
+  its part before `=`, on stderr, which shows in the error of `bp up`, the ledger and `bp status`.
 - The output may hold secrets, so it is nowhere but in the file: not in the ledger, `bp status --json`, what
   `bp up` prints, or an error. The run log (#9) must not get the stdout of such a command either. stderr is
   not part of the output and is quoted in errors as for any command, as is the stderr of a command that
@@ -472,8 +472,9 @@ The ledger says what was created; `bp status` adds what has become of it. It onl
 - **`unfinished`** (`up` or `down`) in `pod.json` is set by `bp up` before the first resource and by `bp down`
   before the first step. `up` removes it once everything is up, `down` together with the pod; after a failure
   or an interruption it stays. The ledger cannot tell: what `up` rejects while planning is not recorded, and
-  destroyed resources may be of an earlier run. An optional field, which older versions ignore; without it a
-  pod counts as finished, also one that an older `bp` was interrupted at.
+  destroyed resources may be of an earlier run. Versions without the field ignore it, and later ones read a
+  value they do not know as `other`. Without it a pod counts as finished, also one that an older `bp` was
+  interrupted at.
 - **The pod lock** is touched only if its holder is recorded or the pod would be degraded, so that asking
   often does not make `up` and `down` report that they wait.
 - **Waiting.** The supervisor gets 3 s to answer. Elsewhere clients have no limit, as they cannot do without

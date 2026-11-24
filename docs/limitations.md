@@ -25,12 +25,14 @@
 ## Services and commands
 
 - **`up` does not wait until a service is ready**, only until its process exists. A service that exits later is not
-  restarted, and `status` still shows it as `live`: it shows what was recorded. `logs` shows what it printed, if
-  anything; its exit code is not shown.
+  restarted; `status` shows that, with its exit code. It does not see what such a service left running, and
+  `running` does not mean that it is ready.
+- **`status` shows the end of the log of a service that does not run**, secrets that it printed included, also with
+  `--json`.
 - **macOS and Linux: a service can outlive its supervisor.** If the supervisor is killed, services are not
   ([#15](https://github.com/nikfine/branchpod/issues/15),
   [#16](https://github.com/nikfine/branchpod/issues/16)); `down` stops them. A killed process may also still hold
-  its files and sockets for a moment when it already counts as gone
+  its files and sockets, such as a port, for a moment when it already counts as `gone`
   ([#84](https://github.com/nikfine/branchpod/issues/84)).
 - **macOS and Linux: `down` stops the process group of a service.** A process that left it (`setsid`) survives.
 - **Windows: `up` refuses to start services** when the program that called it would take them down with itself
