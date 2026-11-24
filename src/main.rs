@@ -45,6 +45,23 @@ enum Cmd {
         /// Worktree path; defaults to the current directory.
         path: Option<OsString>,
     },
+    /// Print the output of a service.
+    ///
+    /// The bytes are printed as the service wrote them, stdout and stderr together. Reading never
+    /// affects the service. With --follow, ends with 0 once the service has exited or its pod is
+    /// torn down.
+    Logs {
+        /// Name of the service.
+        service: String,
+        /// Worktree path; defaults to the current directory.
+        path: Option<OsString>,
+        /// Keep printing what the service writes.
+        #[arg(short, long)]
+        follow: bool,
+        /// How many of the last lines to print, or `all` [default: 200].
+        #[arg(short = 'n', long, value_name = "N")]
+        lines: Option<cli::Lines>,
+    },
     /// Internal: the supervisor process of a pod, started by `bp up`.
     #[command(hide = true)]
     Supervise {
@@ -69,6 +86,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Up { path } => cli::up(path.as_deref()),
         Cmd::Status { path, json } => cli::status(path.as_deref(), json),
         Cmd::Down { path } => cli::down(path.as_deref()),
+        Cmd::Logs {
+            service,
+            path,
+            follow,
+            lines,
+        } => cli::logs(&service, path.as_deref(), follow, lines),
         Cmd::Supervise { endpoint } => cli::supervise(&endpoint),
     }
 }

@@ -170,6 +170,16 @@ impl Store {
         }
     }
 
+    /// Whether some process holds the lock of pod `id` now. Unlike [`Store::try_lock_pod`] it
+    /// leaves no trace: a held lock is not touched, and a free one is taken for a moment only,
+    /// without becoming its recorded holder. When it cannot tell, the lock counts as held.
+    pub(crate) fn is_pod_locked(&self, id: &str) -> bool {
+        match File::open(self.lock_path(id)) {
+            Ok(file) => file.try_lock_shared().is_err(),
+            Err(e) => e.kind() != ErrorKind::NotFound,
+        }
+    }
+
     /// The recorded holder of pod `id`'s lock, if any. Unreadable or damaged records count as none.
     pub(crate) fn holder(&self, id: &str) -> Option<Holder> {
         let bytes = fs::read(self.holder_path(id)).ok()?;
@@ -249,6 +259,32 @@ mod tests {
             assert!(Instant::now() < deadline, "lock of {id} was never released");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn tells_whether_a_pod_is_locked() {
+        let (_dir, store) = store();
+        assert!(!store.is_pod_locked(POD));
+        let lock = store.lock_pod(POD, "up", |_| panic!()).unwrap();
+        assert!(store.is_pod_locked(POD));
+        assert_eq!(store.holder(POD).unwrap().command, "up");
+        drop(lock);
+        drop(wait_free(&store, POD));
+        assert!(wait_until(|| !store.is_pod_locked(POD)));
+        // Asking does not take it.
+        drop(wait_free(&store, POD));
+    }
+
+    /// See [`wait_free`] on why a lock may stay busy for a moment.
+    fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
     }
 
     #[test]
