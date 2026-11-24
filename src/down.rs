@@ -240,7 +240,7 @@ mod tests {
 
     use super::*;
     use crate::pod::{self, META_VERSION};
-    use crate::test_support::{Reaper, fail, launcher, long_running};
+    use crate::test_support::{Reaper, fail, launcher, long_running, wait_for_log};
 
     struct Setup {
         _tmp: tempfile::TempDir,
@@ -480,6 +480,8 @@ mod tests {
             process: Some(serde_json::from_value(data).unwrap()),
         };
         reaper.0.extend(web.process);
+        // From then on it writes nothing, so on Unix it outlives a killed supervisor.
+        wait_for_log(&start.log, "web");
         s.live(
             Kind::Supervisor,
             "supervisor",

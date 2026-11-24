@@ -499,7 +499,7 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::test_support::{TREE_ENV, tree};
-    use crate::test_support::{fail, launcher, long_running};
+    use crate::test_support::{fail, launcher, long_running, read_log, wait_for_log};
 
     struct Running {
         _tmp: tempfile::TempDir,
@@ -542,27 +542,6 @@ mod tests {
         };
         let data = request(&r.endpoint, &Request::Start(start))?;
         Ok(serde_json::from_value(data)?)
-    }
-
-    /// Lossy: `cmd` writes in the OEM code page.
-    fn read_log(path: &Path) -> String {
-        fs::read(path)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
-    }
-
-    fn wait_for_log(path: &Path, text: &str) {
-        for _ in 0..400 {
-            if read_log(path).contains(text) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        panic!(
-            "{} never contained {text:?}: {:?}",
-            path.display(),
-            read_log(path)
-        );
     }
 
     #[test]
