@@ -26,8 +26,7 @@ pub(crate) fn write_atomic_private(dst: &Path, bytes: &[u8]) -> io::Result<()> {
         remove_file_if_exists(tmp)?;
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        owner_only(&mut options);
         options.open(tmp)
     })
 }
@@ -103,6 +102,18 @@ pub(crate) fn retry<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     }
 }
 
+/// Runs `op` a few times (about 0.3 s in all) until it succeeds, for state files that another `bp`
+/// may be changing right now.
+pub(crate) fn retry_any<T, E>(mut op: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    for delay in [10, 50, 250] {
+        if let Ok(value) = op() {
+            return Ok(value);
+        }
+        std::thread::sleep(Duration::from_millis(delay));
+    }
+    op()
+}
+
 /// Whether `e` is what Windows reports while another process holds the file open (or, for a
 /// directory, a file inside it or its working directory there). A scanner or indexer does so
 /// for a moment; an editor or a dev server until it is closed. Never true on Unix, where open
@@ -122,6 +133,17 @@ pub(crate) fn is_transient(e: &io::Error) -> bool {
 pub(crate) fn is_transient(_: &io::Error) -> bool {
     false
 }
+
+/// Makes a file created with `options` readable and writable by its owner only. On Windows it
+/// inherits the protection of its directory.
+#[cfg(unix)]
+pub(crate) fn owner_only(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn owner_only(_: &mut fs::OpenOptions) {}
 
 #[cfg(test)]
 mod tests {

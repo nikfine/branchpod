@@ -7,9 +7,9 @@
 //! `shutdown`. The supervisor never writes the ledger: `bp up` and `bp down` record what it
 //! reports, under the pod lock, so the ledger keeps a single writer.
 //!
-//! A service's stdout and stderr go to its log file through an inherited handle, without passing
-//! through the supervisor, so they keep flowing if the supervisor dies. Services are not restarted;
-//! one that exits keeps its exit status until it is stopped.
+//! A service's stdout and stderr are one pipe, which the supervisor reads into the service's log
+//! file ([`crate::logs::pump`]); should the supervisor die, the service fails to write. Services are
+//! not restarted; one that exits keeps its exit status until it is stopped.
 //!
 //! The protocol is internal (the same binary on both ends) and carries a version anyway, so that a
 //! supervisor left running by an older `bp` is detected rather than misread.
@@ -19,7 +19,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ use serde_json::Value;
 
 use crate::commands;
 use crate::control::{self, Conn, Server};
+use crate::logs::pump::Pump;
 use crate::proc::{self, ProcId, Tether, Tree};
 
 /// How long a stopped service gets to exit before it is killed.
@@ -34,6 +35,11 @@ pub(crate) const GRACE: Duration = Duration::from_secs(10);
 
 /// How long `bp down` waits for a supervisor to exit after `shutdown` answered, before killing it.
 pub(crate) const EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long one `stop` or `shutdown`, or a start that failed, waits for the last output of the
+/// services to reach their logs. A process that left a service's tree can hold the pipe open for
+/// as long as it lives.
+const DRAIN: Duration = Duration::from_millis(500);
 
 /// How long the supervisor waits for a connected client to send its request. Requests are served
 /// one at a time, so a silent client must not keep everyone else waiting.
@@ -73,7 +79,7 @@ pub(crate) struct Start {
     /// Added to the supervisor's environment (inherited from `bp up`).
     #[serde(default)]
     pub(crate) env: BTreeMap<String, String>,
-    /// stdout and stderr go here, appended.
+    /// stdout and stderr end up here, appended.
     pub(crate) log: PathBuf,
 }
 
@@ -288,6 +294,7 @@ struct Service {
     tree: Tree,
     process: ProcId,
     exit: Option<ExitStatus>,
+    pump: Pump,
 }
 
 impl Service {
@@ -401,6 +408,7 @@ fn handle(conn: &Conn, services: &mut BTreeMap<String, Service>) -> Result<(Valu
                 service
                     .stop()
                     .with_context(|| format!("cannot stop service {name:?}"))?;
+                service.pump.wait(Instant::now() + DRAIN);
                 services.remove(&name);
             }
             Ok((Value::Null, false))
@@ -418,9 +426,15 @@ fn handle(conn: &Conn, services: &mut BTreeMap<String, Service>) -> Result<(Valu
         }
         Request::Shutdown => {
             let mut errors = Vec::new();
+            let mut drain = DRAIN; // for all of them together
             // Only what was stopped is forgotten: the rest can still be stopped through us.
             services.retain(|name, service| match service.stop() {
-                Ok(()) => false,
+                Ok(()) => {
+                    let started = Instant::now();
+                    service.pump.wait(started + drain);
+                    drain = drain.saturating_sub(started.elapsed());
+                    false
+                }
                 Err(e) => {
                     errors.push(format!("{name}: {e}"));
                     true
@@ -447,18 +461,22 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
             start.cwd.display()
         );
     }
-    let log = open_log(&start.log)?;
+    let (pump, output) = Pump::start(&start.log)
+        .with_context(|| format!("cannot open log {}", start.log.display()))?;
     let mut cmd = Command::new(commands::resolve_program(program, &start.cwd));
     cmd.args(args)
         .current_dir(&start.cwd)
         .envs(&start.env)
         .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
+        .stdout(output.try_clone()?)
+        .stderr(output);
     let mut tree = Tree::spawn(&mut cmd).map_err(|e| commands::spawn_error(program, e))?;
+    // It holds our copies of the pipe's writing end: the pump must see the service close the last.
+    drop(cmd);
     let Some(process) = proc::identify(tree.child().id()) else {
         // Exited at once (a zombie has no identity): a start that failed.
         let status = tree.child().wait()?;
+        pump.wait(Instant::now() + DRAIN);
         bail!(
             "{program} exited at once with {status}; see {}",
             start.log.display()
@@ -470,6 +488,7 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
             tree,
             process,
             exit: None,
+            pump,
         },
     );
     Ok(process)
@@ -698,6 +717,85 @@ mod tests {
         proc::kill(r.process).unwrap();
         assert!(proc::wait_gone(leader, Duration::from_secs(10)));
         assert!(proc::wait_gone(child, Duration::from_secs(10)));
+    }
+
+    /// Our copies of a pipe's writing end are closed after the spawn, and no other service holds one.
+    /// Not on macOS: there std creates a pipe and marks it close-on-exec in two steps, so a process
+    /// that another test of this binary starts in between would hold it.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_log_is_complete_as_soon_as_its_own_service_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut services = BTreeMap::new();
+        for name in ["one", "two"] {
+            let start = Start {
+                name: name.into(),
+                run: long_running("started"),
+                cwd: dir.path().to_path_buf(),
+                env: BTreeMap::new(),
+                log: dir.path().join(format!("{name}.log")),
+            };
+            start_service(&start, &mut services).unwrap();
+        }
+        for name in ["one", "two"] {
+            let service = services.get_mut(name).unwrap();
+            wait_for_log(&dir.path().join(format!("{name}.log")), "started");
+            assert!(!service.pump.wait(Instant::now()));
+            service.stop().unwrap();
+            assert!(service.pump.wait(Instant::now() + Duration::from_secs(10)));
+        }
+    }
+
+    /// Starts a service that leaves a process behind, outside its group, with its output open.
+    #[cfg(unix)]
+    fn start_leaving(r: &Running) -> ProcId {
+        // Job control gives the background process a group of its own.
+        let script = "set -m; sleep 60 & echo child $! started; exec sleep 300";
+        start(
+            r,
+            "leaving",
+            vec!["bash".into(), "-c".into(), script.into()],
+        )
+        .unwrap();
+        let log = r.dir.join("logs/leaving.log");
+        wait_for_log(&log, " started");
+        let text = read_log(&log);
+        let (_, text) = text.split_once("child ").unwrap();
+        let pid = text.split_once(' ').unwrap().0.parse().unwrap();
+        proc::identify(pid).expect("the child runs")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_left_the_tree_does_not_delay_stopping() {
+        let r = running();
+        let child = start_leaving(&r);
+        let started = Instant::now();
+        let stop = Request::Stop {
+            name: "leaving".into(),
+        };
+        request(&r.endpoint, &stop).unwrap();
+        request(&r.endpoint, &Request::Shutdown).unwrap();
+        let exited = proc::wait_gone(r.process, EXIT_WAIT);
+        let elapsed = started.elapsed();
+        let outlived = proc::is_running(child);
+        let _ = proc::kill(child);
+        assert!(exited && elapsed < Duration::from_secs(8), "{elapsed:?}");
+        assert!(outlived, "the child was in the group: nothing was tested");
+    }
+
+    /// The price of logs that pass through the supervisor. On Windows it dies in any case.
+    #[cfg(unix)]
+    #[test]
+    fn a_service_that_writes_ends_after_a_killed_supervisor() {
+        let r = running();
+        let script = "while :; do echo tick; sleep 0.1; done";
+        let web = start(&r, "web", vec!["sh".into(), "-c".into(), script.into()]).unwrap();
+        wait_for_log(&r.dir.join("logs/web.log"), "tick");
+        proc::kill(r.process).unwrap();
+        let gone = proc::wait_gone(web, Duration::from_secs(10));
+        let _ = proc::stop_recorded_tree(web, Duration::from_secs(1));
+        assert!(gone);
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub(crate) struct Record {
     /// The command as it was started.
     pub(crate) run: Vec<String>,
     pub(crate) cwd: PathBuf,
+    /// Where its output goes. Not recorded by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) log: Option<PathBuf>,
     /// Its own process, set once started. On Unix also its process group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) process: Option<ProcId>,
@@ -32,9 +35,18 @@ pub(crate) struct Plan {
     pub(crate) record: Record,
 }
 
-/// Where the output of service `name` goes, in the pod directory `pod_dir`.
+/// Where the output of service `name` goes, in the pod directory `pod_dir`. The prefix keeps it
+/// apart from the supervisor's own log and from Windows device names (`con`, `nul`).
 pub(crate) fn log_path(pod_dir: &Path, name: &str) -> PathBuf {
-    pod_dir.join("logs").join(format!("{name}.log"))
+    pod_dir.join("logs").join(format!("service-{name}.log"))
+}
+
+/// Where the output of a recorded service is: as recorded, or where versions that did not record
+/// it wrote it.
+pub(crate) fn recorded_log(record: Option<&Record>, pod_dir: &Path, name: &str) -> PathBuf {
+    record
+        .and_then(|r| r.log.clone())
+        .unwrap_or_else(|| pod_dir.join("logs").join(format!("{name}.log")))
 }
 
 pub(crate) fn plan(spec: &ServiceSpec, root: &Path, vars: &Vars, pod_dir: &Path) -> Result<Plan> {
@@ -55,17 +67,19 @@ fn plan_inner(spec: &ServiceSpec, root: &Path, vars: &Vars, pod_dir: &Path) -> R
         Some(dir) => root.join(dir),
         None => root.to_path_buf(),
     };
+    let log = log_path(pod_dir, &spec.name);
     Ok(Plan {
         start: Start {
             name: spec.name.clone(),
             run: run.clone(),
             cwd: cwd.clone(),
             env,
-            log: log_path(pod_dir, &spec.name),
+            log: log.clone(),
         },
         record: Record {
             run,
             cwd,
+            log: Some(log),
             process: None,
         },
     })
@@ -98,10 +112,27 @@ mod tests {
         assert_eq!(plan.start.cwd, root.join("frontend"));
         assert_eq!(
             plan.start.log,
-            Path::new("/home/pods/p").join("logs").join("vite.log")
+            Path::new("/home/pods/p")
+                .join("logs")
+                .join("service-vite.log")
         );
+        assert_eq!(plan.record.log.as_ref(), Some(&plan.start.log));
         let json = serde_json::to_string(&plan.record).unwrap();
         assert!(!json.contains("s-8003"), "{json}");
+    }
+
+    #[test]
+    fn a_record_without_a_log_means_the_old_place() {
+        let dir = Path::new("/home/pods/p");
+        let old: Record = serde_json::from_str(r#"{ "run": ["x"], "cwd": "/wt" }"#).unwrap();
+        let old_place = dir.join("logs").join("web.log");
+        assert_eq!(recorded_log(Some(&old), dir, "web"), old_place);
+        assert_eq!(recorded_log(None, dir, "web"), old_place);
+        let new = Record {
+            log: Some(log_path(dir, "web")),
+            ..old
+        };
+        assert_eq!(recorded_log(Some(&new), dir, "web"), log_path(dir, "web"));
     }
 
     #[test]

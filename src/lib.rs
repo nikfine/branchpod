@@ -11,12 +11,14 @@
 pub mod cli;
 mod commands;
 mod config;
+mod console;
 mod control;
 mod down;
 mod files;
 mod fsutil;
 mod inuse;
 mod ledger;
+mod logs;
 mod pod;
 mod podlock;
 mod ports;

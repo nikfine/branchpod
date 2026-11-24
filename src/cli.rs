@@ -1,13 +1,18 @@
 //! The subcommands of `bp`: each runs one and prints its result.
 
 use std::ffi::OsStr;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::json;
 
-use crate::{config, down, pod, supervisor, up, worktree};
+use crate::ledger::{Kind, ResourceState, Status};
+use crate::logs::read;
+use crate::proc::{self, ProcId};
+use crate::{config, console, down, fsutil, pod, services, supervisor, up, worktree};
 
 /// Version of the `--json` output. Part of the public API: bump on breaking changes.
 const JSON_SCHEMA: u32 = 1;
@@ -131,6 +136,257 @@ pub fn down(path: Option<&OsStr>) -> Result<ExitCode> {
     }
 }
 
+/// Lines `bp logs` prints unless told otherwise: enough to see a failure, without flooding the
+/// context of an agent.
+const LOG_LINES: u64 = 200;
+
+/// The value of `bp logs --lines`.
+#[derive(Debug, Clone, Copy)]
+pub struct Lines(read::Lines);
+
+impl FromStr for Lines {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Lines, String> {
+        match text {
+            "all" => Ok(Lines(read::Lines::All)),
+            _ => text
+                .parse()
+                .map(|n| Lines(read::Lines::Last(n)))
+                .map_err(|_| "must be a number or `all`".to_owned()),
+        }
+    }
+}
+
+/// `bp logs`.
+pub fn logs(
+    service: &str,
+    path: Option<&OsStr>,
+    follow: bool,
+    lines: Option<Lines>,
+) -> Result<ExitCode> {
+    match print_logs(service, path, follow, lines) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        // Whoever read our output (`| head`) has seen enough.
+        Err(e)
+            if e.downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe) =>
+        {
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn print_logs(
+    service: &str,
+    path: Option<&OsStr>,
+    follow: bool,
+    lines: Option<Lines>,
+) -> Result<()> {
+    let store = pod::Store::open()?;
+    let (target, meta) = find_pod(&store, path)?;
+    let Some(meta) = meta else {
+        bail!("no pod for {}", target.display());
+    };
+    let read = || read_resources(&store, &meta);
+    let up_runs = || up_runs(&store, &meta.id);
+    let resources = if follow {
+        await_record(service, read, up_runs)?
+    } else {
+        read()?
+    };
+    let Some(resource) = find_service(&resources, service) else {
+        let known: Vec<&str> = resources
+            .iter()
+            .filter(|r| r.kind == Kind::Service)
+            .map(|r| r.name.as_str())
+            .collect();
+        if known.is_empty() {
+            if !store.pod_dir(&meta.id).join("pod.json").exists() {
+                bail!("no pod for {}", target.display());
+            }
+            bail!("pod {} has no services", meta.id);
+        }
+        bail!(
+            "pod {} has no service {service:?}; it has: {}",
+            meta.id,
+            known.join(", ")
+        );
+    };
+
+    let record = record_of(resource);
+    let log = services::recorded_log(record.as_ref(), &store.pod_dir(&meta.id), service);
+    let mut out = console::Output::stdout();
+    let cursor = match read::Snapshot::open(&log)? {
+        Some(mut snapshot) => {
+            let wanted = lines.map_or(read::Lines::Last(LOG_LINES), |l| l.0);
+            let more = snapshot.tail(wanted, |bytes| out.write(bytes))?;
+            if more && lines.is_none() && !follow {
+                notice(format_args!(
+                    "the last {LOG_LINES} lines of service {service}; \
+                     `--lines all` prints everything"
+                ));
+            }
+            snapshot.end()
+        }
+        None if follow && resource.status == Status::Pending => read::Cursor::start(&log),
+        None => match &resource.error {
+            Some(e) => bail!("service {service:?} has no log; it failed: {e}"),
+            None => bail!("service {service:?} has no log"),
+        },
+    };
+    if !follow {
+        return Ok(out.finish()?);
+    }
+    let started = record.and_then(|r| r.process);
+    let mut failure = None;
+    if resource.status == Status::Pending && started.is_none() {
+        notice(format_args!(
+            "service {service} has not started yet; waiting"
+        ));
+    }
+
+    let end = read::follow(
+        cursor,
+        || service_state(service, started, read, up_runs, &mut failure),
+        |item| match item {
+            read::Item::Data(bytes) => out.write(bytes),
+            read::Item::Skipped(n) => {
+                notice(format_args!(
+                    "{n} part(s) of the log were removed before they could be read"
+                ));
+                Ok(())
+            }
+        },
+    )?;
+    out.finish()?;
+    if let Some(e) = failure {
+        bail!("service {service:?} did not start: {e}");
+    }
+    match end {
+        read::End::Exited => notice(format_args!("service {service} is not running any more")),
+        read::End::StillWritten => notice(format_args!(
+            "service {service} is not running any more, but something it started still \
+             writes to its log"
+        )),
+        read::End::Gone => notice(format_args!("pod {} was torn down", meta.id)),
+    }
+    Ok(())
+}
+
+fn find_service<'a>(resources: &'a [ResourceState], name: &str) -> Option<&'a ResourceState> {
+    resources
+        .iter()
+        .find(|r| r.kind == Kind::Service && r.name == name)
+}
+
+fn record_of(resource: &ResourceState) -> Option<services::Record> {
+    serde_json::from_value(resource.data.clone()).ok()
+}
+
+/// A line for the user on stderr. Unlike `eprintln!` it does not panic when nobody reads it any more
+/// (`2>&1 | head`).
+fn notice(text: std::fmt::Arguments) {
+    let _ = writeln!(io::stderr(), "bp: {text}");
+}
+
+fn read_resources(store: &pod::Store, meta: &pod::PodMeta) -> Result<Vec<ResourceState>> {
+    match fsutil::retry_any(|| store.resources(&meta.id)) {
+        Ok(resources) => Ok(resources),
+        // Read in the middle of the removal of the pod's state.
+        Err(_) if !store.pod_dir(&meta.id).join("pod.json").exists() => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a `bp up` of the pod is running: it holds the pod lock until its last record is written.
+/// Ask only when it matters, a free lock is taken for a moment.
+fn up_runs(store: &pod::Store, id: &str) -> bool {
+    store.is_pod_locked(id) && store.holder(id).is_none_or(|h| h.command != "down")
+}
+
+/// The ledger, and whether a running `bp up` may still change what is `open` in it.
+fn read_settled(
+    open: impl Fn(&[ResourceState]) -> bool,
+    read: impl Fn() -> Result<Vec<ResourceState>>,
+    up_runs: impl Fn() -> bool,
+) -> Result<(Vec<ResourceState>, bool)> {
+    let resources = read()?;
+    if !open(&resources) {
+        return Ok((resources, false));
+    }
+    if up_runs() {
+        return Ok((resources, true));
+    }
+    // `up` may have written its last record and ended since the ledger was read.
+    Ok((read()?, false))
+}
+
+/// The ledger once it has a record of `service`, or once no `bp up` runs that could write one: `up`
+/// records a service only when its turn comes, after the commands.
+fn await_record(
+    service: &str,
+    read: impl Fn() -> Result<Vec<ResourceState>>,
+    up_runs: impl Fn() -> bool,
+) -> Result<Vec<ResourceState>> {
+    let mut told = false;
+    loop {
+        let unknown = |r: &[ResourceState]| find_service(r, service).is_none();
+        let (resources, wait) = read_settled(unknown, &read, &up_runs)?;
+        if !wait {
+            return Ok(resources);
+        }
+        if !told {
+            notice(format_args!(
+                "no service {service} yet, and `bp up` is running; waiting"
+            ));
+            told = true;
+        }
+        std::thread::sleep(read::POLL);
+    }
+}
+
+/// What the followed service is doing now. `started` is its process when following began: with
+/// another one, this is already the next run of the pod. Why it never started, if it did not,
+/// goes to `failure`.
+fn service_state(
+    service: &str,
+    started: Option<ProcId>,
+    read: impl Fn() -> Result<Vec<ResourceState>>,
+    up_runs: impl Fn() -> bool,
+    failure: &mut Option<String>,
+) -> Result<read::State> {
+    let process_of = |r: &ResourceState| record_of(r).and_then(|r| r.process);
+    let starting = |r: &[ResourceState]| {
+        find_service(r, service)
+            .is_some_and(|r| r.status == Status::Pending && process_of(r).is_none())
+    };
+    let (resources, wait) = read_settled(starting, read, up_runs)?;
+    if wait {
+        return Ok(read::State::Active);
+    }
+    let Some(resource) = find_service(&resources, service) else {
+        return Ok(read::State::Gone);
+    };
+    let process = process_of(resource);
+    if started.is_some() && process != started {
+        return Ok(read::State::Gone);
+    }
+    Ok(match (process, resource.status) {
+        (Some(process), _) if proc::is_running(process) => read::State::Active,
+        (None, Status::Pending) => {
+            *failure = Some("`bp up` ended before it recorded the start; run `bp down`".into());
+            read::State::Exited
+        }
+        (None, Status::Failed) => {
+            *failure = resource.error.clone();
+            read::State::Exited
+        }
+        _ => read::State::Exited,
+    })
+}
+
 /// `bp supervise`: the supervisor process of a pod.
 pub fn supervise(endpoint: &str) -> Result<ExitCode> {
     supervisor::serve(endpoint, supervisor::TetherCheck::On)?;
@@ -162,4 +418,79 @@ fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option
     let wt = worktree::Worktree::resolve(Some(target.as_os_str()))?;
     let meta = store.find_by_worktree(&wt.root)?;
     Ok((target, meta))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    fn service(status: Status, process: Option<ProcId>) -> Vec<ResourceState> {
+        vec![ResourceState {
+            kind: Kind::Service,
+            name: "web".into(),
+            status,
+            data: json!({ "run": ["x"], "cwd": "/wt", "process": process }),
+            error: None,
+        }]
+    }
+
+    /// Reads that give one answer after the other.
+    fn reads(mut answers: Vec<Vec<ResourceState>>) -> impl Fn() -> Result<Vec<ResourceState>> {
+        answers.reverse();
+        let answers = RefCell::new(answers);
+        move || Ok(answers.borrow_mut().pop().expect("one read too many"))
+    }
+
+    fn me() -> ProcId {
+        proc::identify(std::process::id()).unwrap()
+    }
+
+    /// The lock would be taken for a moment before each look at the log.
+    #[test]
+    fn the_pod_lock_of_a_started_service_is_left_alone() {
+        let gone = ProcId { start: 1, ..me() };
+        for (resources, expected) in [
+            (service(Status::Live, Some(me())), read::State::Active),
+            (service(Status::Live, Some(gone)), read::State::Exited),
+            (service(Status::Destroyed, Some(gone)), read::State::Exited),
+            (service(Status::Failed, None), read::State::Exited),
+            (Vec::new(), read::State::Gone),
+        ] {
+            let up_runs = || panic!("asked about the lock");
+            let read = reads(vec![resources]);
+            let state = service_state("web", None, read, up_runs, &mut None).unwrap();
+            assert_eq!(state, expected);
+        }
+        let found = await_record("web", reads(vec![service(Status::Pending, None)]), || {
+            panic!("asked about the lock")
+        });
+        assert_eq!(found.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_service_started_just_before_up_ended_is_running() {
+        let answers = vec![
+            service(Status::Pending, None),
+            service(Status::Live, Some(me())),
+        ];
+        let mut failure = None;
+        let state = service_state("web", None, reads(answers), || false, &mut failure).unwrap();
+        assert_eq!((state, failure), (read::State::Active, None));
+
+        let answers = vec![Vec::new(), service(Status::Live, Some(me()))];
+        assert_eq!(
+            await_record("web", reads(answers), || false).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn another_process_is_another_run() {
+        let before = ProcId { start: 1, ..me() };
+        let read = reads(vec![service(Status::Live, Some(me()))]);
+        let state = service_state("web", Some(before), read, || false, &mut None).unwrap();
+        assert_eq!(state, read::State::Gone);
+    }
 }

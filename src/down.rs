@@ -476,6 +476,7 @@ mod tests {
         let web = services::Record {
             run: start.run,
             cwd: start.cwd,
+            log: None,
             process: Some(serde_json::from_value(data).unwrap()),
         };
         reaper.0.extend(web.process);
