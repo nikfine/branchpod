@@ -30,10 +30,10 @@ use crate::control::{self, Conn, Server};
 use crate::proc::{self, ProcId};
 
 /// How long a stopped service gets to exit before it is killed.
-pub const GRACE: Duration = Duration::from_secs(10);
+pub(crate) const GRACE: Duration = Duration::from_secs(10);
 
 /// How long `bp down` waits for a supervisor to exit after `shutdown` answered, before killing it.
-pub const EXIT_WAIT: Duration = Duration::from_secs(10);
+pub(crate) const EXIT_WAIT: Duration = Duration::from_secs(10);
 
 /// How long the supervisor waits for a connected client to send its request. Requests are served
 /// one at a time, so a silent client must not keep everyone else waiting.
@@ -47,16 +47,16 @@ const READY: &str = "BP-SUPERVISOR ";
 
 /// Ledger data of the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
-    pub endpoint: String,
+pub(crate) struct Record {
+    pub(crate) endpoint: String,
     /// Set once it reported that it listens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process: Option<ProcId>,
+    pub(crate) process: Option<ProcId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
-pub enum Request {
+pub(crate) enum Request {
     Start(Start),
     Stop { name: String },
     Status,
@@ -65,26 +65,26 @@ pub enum Request {
 
 /// A service to start, fully rendered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Start {
-    pub name: String,
-    pub run: Vec<String>,
+pub(crate) struct Start {
+    pub(crate) name: String,
+    pub(crate) run: Vec<String>,
     /// Absolute.
-    pub cwd: PathBuf,
+    pub(crate) cwd: PathBuf,
     /// Added to the supervisor's environment (inherited from `bp up`).
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub(crate) env: BTreeMap<String, String>,
     /// stdout and stderr go here, appended.
-    pub log: PathBuf,
+    pub(crate) log: PathBuf,
 }
 
 /// A service as `status` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServiceStatus {
-    pub name: String,
-    pub process: ProcId,
+pub(crate) struct ServiceStatus {
+    pub(crate) name: String,
+    pub(crate) process: ProcId,
     /// `None` while it runs.
     #[serde(default)]
-    pub exit: Option<String>,
+    pub(crate) exit: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,15 +117,15 @@ struct Ready {
 
 /// Builds the command that runs a supervisor for an endpoint: `bp supervise <endpoint>`, or the
 /// test binary re-running itself in tests.
-pub struct Launcher(Box<dyn Fn(&str) -> Command + Send + Sync>);
+pub(crate) struct Launcher(Box<dyn Fn(&str) -> Command + Send + Sync>);
 
 impl Launcher {
-    pub fn new(build: impl Fn(&str) -> Command + Send + Sync + 'static) -> Launcher {
+    pub(crate) fn new(build: impl Fn(&str) -> Command + Send + Sync + 'static) -> Launcher {
         Launcher(Box::new(build))
     }
 
     /// `bp supervise <endpoint>` with this very binary.
-    pub fn current_exe() -> Result<Launcher> {
+    pub(crate) fn current_exe() -> Result<Launcher> {
         let exe = std::env::current_exe().context("cannot locate the bp binary")?;
         Ok(Launcher::new(move |endpoint| {
             let mut cmd = Command::new(&exe);
@@ -137,7 +137,7 @@ impl Launcher {
     /// Starts a supervisor listening on `endpoint`, with `cwd` as its working directory and its
     /// own diagnostics in `log`, and waits until it listens. It is not waited for afterwards: it
     /// outlives us.
-    pub fn launch(&self, endpoint: &str, cwd: &Path, log: &Path) -> Result<ProcId> {
+    pub(crate) fn launch(&self, endpoint: &str, cwd: &Path, log: &Path) -> Result<ProcId> {
         let log = open_log(log)?;
         let mut cmd = (self.0)(endpoint);
         cmd.current_dir(cwd)
@@ -182,7 +182,7 @@ fn open_log(path: &Path) -> Result<fs::File> {
 
 /// Sends `request` to the supervisor at `endpoint` and returns the data of its answer. Fails with
 /// [`control::Unreachable`] when nothing listens there.
-pub fn request(endpoint: &str, request: &Request) -> Result<Value> {
+pub(crate) fn request(endpoint: &str, request: &Request) -> Result<Value> {
     let conn = control::connect(endpoint)?;
     let message = Message {
         v: PROTOCOL,
@@ -206,7 +206,7 @@ pub fn request(endpoint: &str, request: &Request) -> Result<Value> {
 }
 
 /// Whether `error` means that nothing listens on the supervisor's endpoint.
-pub fn is_unreachable(error: &anyhow::Error) -> bool {
+pub(crate) fn is_unreachable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<control::Unreachable>().is_some()
 }
 
@@ -237,7 +237,7 @@ impl Service {
 }
 
 /// The supervisor process: listens on `endpoint` and serves requests until `shutdown`.
-pub fn serve(endpoint: &str) -> Result<()> {
+pub(crate) fn serve(endpoint: &str) -> Result<()> {
     let mut server = match Server::bind(endpoint) {
         Ok(server) => server,
         Err(e) => {

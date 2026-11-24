@@ -4,6 +4,6 @@ use std::path::Path;
 
 use super::Holder;
 
-pub fn holders(_: &Path) -> Vec<Holder> {
+pub(crate) fn holders(_: &Path) -> Vec<Holder> {
     Vec::new()
 }

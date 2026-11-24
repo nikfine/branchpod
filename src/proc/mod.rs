@@ -33,23 +33,23 @@ const POLL: Duration = Duration::from_millis(25);
 
 /// A process: pid plus start token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProcId {
-    pub pid: u32,
-    pub start: u64,
+pub(crate) struct ProcId {
+    pub(crate) pid: u32,
+    pub(crate) start: u64,
 }
 
 /// The process with `pid` as it is now, if one is running. A zombie (exited, not reaped) is not.
-pub fn identify(pid: u32) -> Option<ProcId> {
+pub(crate) fn identify(pid: u32) -> Option<ProcId> {
     sys::start_token(pid).map(|start| ProcId { pid, start })
 }
 
 /// Whether `id` is still running as the same process.
-pub fn is_running(id: ProcId) -> bool {
+pub(crate) fn is_running(id: ProcId) -> bool {
     identify(id.pid) == Some(id)
 }
 
 /// Waits up to `limit` for `id` to exit; whether it did.
-pub fn wait_gone(id: ProcId, limit: Duration) -> bool {
+pub(crate) fn wait_gone(id: ProcId, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
     while is_running(id) {
         if Instant::now() >= deadline {
@@ -61,25 +61,25 @@ pub fn wait_gone(id: ProcId, limit: Duration) -> bool {
 }
 
 /// Sets `cmd` up to start a new process tree that [`stop_tree`] stops as a whole.
-pub fn new_tree(cmd: &mut Command) {
+pub(crate) fn new_tree(cmd: &mut Command) {
     sys::new_tree(cmd);
 }
 
 /// Stops the tree of `child`, started with [`new_tree`]: asks it to exit, waits up to `grace`,
 /// then kills it. The child is reaped.
-pub fn stop_tree(child: &mut Child, grace: Duration) -> io::Result<()> {
+pub(crate) fn stop_tree(child: &mut Child, grace: Duration) -> io::Result<()> {
     sys::stop_tree(child, grace)
 }
 
 /// Stops a tree that is not our child, known by its recorded leader: the supervisor that started
 /// it is gone or does not answer. Nothing happens if the leader's pid now belongs to another
 /// process.
-pub fn stop_recorded_tree(leader: ProcId, grace: Duration) -> io::Result<()> {
+pub(crate) fn stop_recorded_tree(leader: ProcId, grace: Duration) -> io::Result<()> {
     sys::stop_recorded_tree(leader, grace)
 }
 
 /// Kills `id` at once, if it is still that process.
-pub fn kill(id: ProcId) -> io::Result<()> {
+pub(crate) fn kill(id: ProcId) -> io::Result<()> {
     sys::kill(id)
 }
 
@@ -87,7 +87,7 @@ pub fn kill(id: ProcId) -> io::Result<()> {
 /// window, its own process group and, where the caller's Job Object allows it, outside that job
 /// (Windows). The caller's own standard handles are not inherited, so a caller waiting for the end
 /// of our output (an IDE hook) is not kept waiting by the detached process.
-pub fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
+pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
     sys::spawn_detached(cmd)
 }
 

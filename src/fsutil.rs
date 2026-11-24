@@ -11,7 +11,7 @@ use std::time::Duration;
 /// On Windows the rename fails transiently while another process (an antivirus scanner, the
 /// search indexer) briefly holds the destination or the freshly written temporary file open;
 /// such failures are retried for a short while instead of surfacing as a random error.
-pub fn write_atomic(dst: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic(dst: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut tmp = dst.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = Path::new(&tmp);
@@ -32,7 +32,7 @@ pub fn write_atomic(dst: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Runs `op`, retrying with backoff (about 2.5 s in all) while it fails with an error that
 /// [`is_transient`] attributes to another process briefly holding a file open.
-pub fn retry<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+pub(crate) fn retry<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let mut delay = Duration::from_millis(10);
     let mut attempts = 0;
     loop {
@@ -52,7 +52,7 @@ pub fn retry<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 /// for a moment; an editor or a dev server until it is closed. Never true on Unix, where open
 /// files do not block renaming or removal.
 #[cfg(windows)]
-pub fn is_transient(e: &io::Error) -> bool {
+pub(crate) fn is_transient(e: &io::Error) -> bool {
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_SHARING_VIOLATION: i32 = 32;
     const ERROR_LOCK_VIOLATION: i32 = 33;
@@ -63,7 +63,7 @@ pub fn is_transient(e: &io::Error) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn is_transient(_: &io::Error) -> bool {
+pub(crate) fn is_transient(_: &io::Error) -> bool {
     false
 }
 

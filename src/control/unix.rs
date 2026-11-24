@@ -10,11 +10,11 @@ use anyhow::{Context, Result, bail};
 
 use super::Unreachable;
 
-pub struct Stream(UnixStream);
+pub(crate) struct Stream(UnixStream);
 
 impl Stream {
     /// Each read gives up after `limit` without data.
-    pub fn deadline(&self, limit: std::time::Duration) -> Result<Deadline> {
+    pub(crate) fn deadline(&self, limit: std::time::Duration) -> Result<Deadline> {
         self.0
             .set_read_timeout(Some(limit))
             .context("cannot set a read timeout")?;
@@ -23,7 +23,7 @@ impl Stream {
 }
 
 /// Nothing to undo: the timeout belongs to the socket, used for one request.
-pub struct Deadline;
+pub(crate) struct Deadline;
 
 impl io::Read for &Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -41,7 +41,7 @@ impl io::Write for &Stream {
     }
 }
 
-pub fn new_endpoint(_pod: &str, nonce: &str) -> Result<String> {
+pub(crate) fn new_endpoint(_pod: &str, nonce: &str) -> Result<String> {
     let dir = runtime_dir()?;
     let path = dir.join(format!("{nonce}.sock"));
     let Some(text) = path.to_str() else {
@@ -80,13 +80,13 @@ fn check_private(dir: &Path, uid: libc::uid_t) -> Result<()> {
     Ok(())
 }
 
-pub struct Server {
+pub(crate) struct Server {
     listener: UnixListener,
     path: PathBuf,
 }
 
 impl Server {
-    pub fn bind(endpoint: &str) -> io::Result<Server> {
+    pub(crate) fn bind(endpoint: &str) -> io::Result<Server> {
         let path = PathBuf::from(endpoint);
         Ok(Server {
             listener: UnixListener::bind(&path)?,
@@ -94,7 +94,7 @@ impl Server {
         })
     }
 
-    pub fn accept(&mut self) -> io::Result<Stream> {
+    pub(crate) fn accept(&mut self) -> io::Result<Stream> {
         self.listener.accept().map(|(stream, _)| Stream(stream))
     }
 }
@@ -105,7 +105,7 @@ impl Drop for Server {
     }
 }
 
-pub fn connect(endpoint: &str) -> Result<Stream> {
+pub(crate) fn connect(endpoint: &str) -> Result<Stream> {
     match UnixStream::connect(endpoint) {
         Ok(stream) => Ok(Stream(stream)),
         Err(e)
@@ -120,7 +120,7 @@ pub fn connect(endpoint: &str) -> Result<Stream> {
     }
 }
 
-pub fn remove_stale(endpoint: &str) -> Result<()> {
+pub(crate) fn remove_stale(endpoint: &str) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
     match fs::symlink_metadata(endpoint) {
         Ok(meta) if meta.file_type().is_socket() => {

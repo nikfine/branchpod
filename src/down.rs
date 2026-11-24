@@ -19,27 +19,27 @@ use crate::{commands, control, ports, proc, services};
 
 /// Outcome of tearing down one resource.
 #[derive(Debug)]
-pub struct Step {
-    pub kind: Kind,
-    pub name: String,
+pub(crate) struct Step {
+    pub(crate) kind: Kind,
+    pub(crate) name: String,
     /// `None` when the resource is gone.
-    pub error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug)]
-pub struct Report {
-    pub steps: Vec<Step>,
+pub(crate) struct Report {
+    pub(crate) steps: Vec<Step>,
     /// Every resource is gone, but the pod's own state could not be removed.
-    pub state_error: Option<String>,
+    pub(crate) state_error: Option<String>,
 }
 
 impl Report {
     /// Nothing recorded for the pod is left.
-    pub fn is_clean(&self) -> bool {
+    pub(crate) fn is_clean(&self) -> bool {
         self.state_error.is_none() && self.steps.iter().all(|s| s.error.is_none())
     }
 
-    pub fn leftovers(&self) -> impl Iterator<Item = &Step> {
+    pub(crate) fn leftovers(&self) -> impl Iterator<Item = &Step> {
         self.steps.iter().filter(|s| s.error.is_some())
     }
 }
@@ -48,7 +48,7 @@ impl Report {
 ///
 /// Fails only when teardown cannot start (the ledger cannot be read or opened); everything
 /// after that is collected in the report.
-pub fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
+pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
     let resources = store.resources(&meta.id)?;
     let todo = order(&resources);
     // Services are stopped through the supervisor that runs them.

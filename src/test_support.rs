@@ -9,7 +9,7 @@ use crate::proc::{self, ProcId};
 use crate::supervisor::{self, Launcher};
 
 /// Runs `git` in `dir`; it must succeed.
-pub fn git_ok(dir: &Path, args: &[&str]) {
+pub(crate) fn git_ok(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -20,7 +20,7 @@ pub fn git_ok(dir: &Path, args: &[&str]) {
 }
 
 /// Writes `message` to stderr and exits with `code`.
-pub fn fail(code: i32, message: &str) -> Vec<String> {
+pub(crate) fn fail(code: i32, message: &str) -> Vec<String> {
     if cfg!(windows) {
         let script = format!("echo {message} 1>&2 & exit {code}");
         vec!["cmd".into(), "/d".into(), "/c".into(), script]
@@ -34,7 +34,7 @@ pub fn fail(code: i32, message: &str) -> Vec<String> {
 const ENDPOINT_ENV: &str = "BP_TEST_SUPERVISOR_ENDPOINT";
 
 /// Starts supervisors as this test binary re-running [`supervisor_process`].
-pub fn launcher() -> Launcher {
+pub(crate) fn launcher() -> Launcher {
     let exe = std::env::current_exe().unwrap();
     Launcher::new(move |endpoint| {
         let mut cmd = Command::new(&exe);
@@ -53,7 +53,7 @@ pub fn launcher() -> Launcher {
 /// Kills recorded processes (and their trees) on drop, so that a failing test leaves no
 /// supervisor or service running (on Windows one would also keep the test binary in use).
 #[derive(Default)]
-pub struct Reaper(pub Vec<ProcId>);
+pub(crate) struct Reaper(pub(crate) Vec<ProcId>);
 
 impl Drop for Reaper {
     fn drop(&mut self) {
@@ -66,7 +66,7 @@ impl Drop for Reaper {
 }
 
 /// A [`Reaper`] for every process recorded in pod `id`'s ledger.
-pub fn reap_pod(store: &Store, id: &str) -> Reaper {
+pub(crate) fn reap_pod(store: &Store, id: &str) -> Reaper {
     let processes = store
         .resources(id)
         .unwrap_or_default()
@@ -86,7 +86,7 @@ fn supervisor_process() {
 }
 
 /// Prints a line, then sleeps for a long time, using what every CI runner has.
-pub fn long_running(marker: &str) -> Vec<String> {
+pub(crate) fn long_running(marker: &str) -> Vec<String> {
     if cfg!(windows) {
         // `ping` waits about one second between echoes.
         vec![

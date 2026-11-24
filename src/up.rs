@@ -39,18 +39,18 @@ use crate::{commands, control, files, services};
 
 /// A provisioned pod.
 #[derive(Debug)]
-pub struct Report {
-    pub pod: PodMeta,
+pub(crate) struct Report {
+    pub(crate) pod: PodMeta,
     /// What this run did, in creation order.
-    pub items: Vec<Item>,
+    pub(crate) items: Vec<Item>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Item {
-    pub kind: Kind,
-    pub name: String,
+pub(crate) struct Item {
+    pub(crate) kind: Kind,
+    pub(crate) name: String,
     /// Short human-readable result: the port, the file mode, the command's output.
-    pub detail: String,
+    pub(crate) detail: String,
 }
 
 /// `up` failed after recording resources. They may exist and are left for `bp down`.
@@ -59,13 +59,13 @@ pub struct Item {
 /// print it twice in an error chain. A typed cause (such as [`commands::Failed`] with the full
 /// stderr) is reached with `failed.error.downcast_ref()`.
 #[derive(Debug)]
-pub struct Failed {
-    pub error: anyhow::Error,
-    pub pod: String,
-    pub worktree: PathBuf,
+pub(crate) struct Failed {
+    pub(crate) error: anyhow::Error,
+    pub(crate) pod: String,
+    pub(crate) worktree: PathBuf,
     /// Every resource of the pod that is not destroyed, as the ledger has it now. Empty if the
     /// ledger could not be read back.
-    pub recorded: Vec<ResourceState>,
+    pub(crate) recorded: Vec<ResourceState>,
 }
 
 impl fmt::Display for Failed {
@@ -99,7 +99,7 @@ struct Journal {
 
 /// Provisions the pod of `wt` from `config`. `on_wait` is called if another `bp` holds the pod
 /// lock, before waiting for it.
-pub fn up(
+pub(crate) fn up(
     store: &Store,
     wt: &Worktree,
     config: &Config,

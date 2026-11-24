@@ -17,7 +17,7 @@ use super::Holder;
 /// dev server; the walk stops there rather than enumerate a whole dependency directory.
 const MAX_FILES: usize = 4096;
 
-pub fn holders(path: &Path) -> Vec<Holder> {
+pub(crate) fn holders(path: &Path) -> Vec<Holder> {
     query(&files_under(path, MAX_FILES)).unwrap_or_default()
 }
 

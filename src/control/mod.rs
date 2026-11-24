@@ -35,7 +35,7 @@ const MAX_LINE: u64 = 1 << 20;
 
 /// Nobody listens on the endpoint: the supervisor is gone (or its endpoint was removed).
 #[derive(Debug)]
-pub struct Unreachable(pub String);
+pub(crate) struct Unreachable(pub(crate) String);
 
 impl fmt::Display for Unreachable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -46,7 +46,7 @@ impl fmt::Display for Unreachable {
 impl std::error::Error for Unreachable {}
 
 /// A fresh endpoint for a supervisor of pod `pod`.
-pub fn new_endpoint(pod: &str) -> Result<String> {
+pub(crate) fn new_endpoint(pod: &str) -> Result<String> {
     sys::new_endpoint(pod, &nonce(pod))
 }
 
@@ -63,17 +63,17 @@ fn nonce(pod: &str) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub struct Server(sys::Server);
+pub(crate) struct Server(sys::Server);
 
 impl Server {
-    pub fn bind(endpoint: &str) -> Result<Server> {
+    pub(crate) fn bind(endpoint: &str) -> Result<Server> {
         sys::Server::bind(endpoint)
             .map(Server)
             .with_context(|| format!("cannot listen on {endpoint}"))
     }
 
     /// Waits for the next client.
-    pub fn accept(&mut self) -> Result<Conn> {
+    pub(crate) fn accept(&mut self) -> Result<Conn> {
         self.0
             .accept()
             .map(Conn)
@@ -82,17 +82,17 @@ impl Server {
 }
 
 /// One connection, for one request and its answer.
-pub struct Conn(sys::Stream);
+pub(crate) struct Conn(sys::Stream);
 
 impl Conn {
     /// Like [`Conn::read_line`], but gives up when nothing arrives for `limit`: a server serving
     /// one connection at a time must not hang on a client that connects and stays silent.
-    pub fn read_line_within(&self, limit: Duration) -> Result<String> {
+    pub(crate) fn read_line_within(&self, limit: Duration) -> Result<String> {
         let _deadline = self.0.deadline(limit)?;
         self.read_line()
     }
 
-    pub fn read_line(&self) -> Result<String> {
+    pub(crate) fn read_line(&self) -> Result<String> {
         let mut line = String::new();
         BufReader::new((&self.0).take(MAX_LINE))
             .read_line(&mut line)
@@ -104,7 +104,7 @@ impl Conn {
         Ok(line)
     }
 
-    pub fn write_line(&self, line: &str) -> Result<()> {
+    pub(crate) fn write_line(&self, line: &str) -> Result<()> {
         let mut out = line.as_bytes().to_vec();
         out.push(b'\n');
         (&self.0)
@@ -115,13 +115,13 @@ impl Conn {
 }
 
 /// Connects to `endpoint`. Fails with [`Unreachable`] when nothing listens there.
-pub fn connect(endpoint: &str) -> Result<Conn> {
+pub(crate) fn connect(endpoint: &str) -> Result<Conn> {
     sys::connect(endpoint).map(Conn)
 }
 
 /// Removes what a server that died without cleaning up left at `endpoint` (a socket file on
 /// Unix; a pipe disappears with its last handle). Call only once the server is known to be gone.
-pub fn remove_stale(endpoint: &str) -> Result<()> {
+pub(crate) fn remove_stale(endpoint: &str) -> Result<()> {
     sys::remove_stale(endpoint)
 }
 

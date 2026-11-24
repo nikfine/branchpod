@@ -23,21 +23,21 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-pub fn new_tree(cmd: &mut Command) {
+pub(crate) fn new_tree(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
 /// Terminates the service process itself; its children survive until #14 (Job Object).
-pub fn stop_tree(child: &mut Child, _grace: Duration) -> io::Result<()> {
+pub(crate) fn stop_tree(child: &mut Child, _grace: Duration) -> io::Result<()> {
     child.kill()?;
     child.wait().map(drop)
 }
 
-pub fn stop_recorded_tree(leader: ProcId, _grace: Duration) -> io::Result<()> {
+pub(crate) fn stop_recorded_tree(leader: ProcId, _grace: Duration) -> io::Result<()> {
     kill(leader)
 }
 
-pub fn kill(id: ProcId) -> io::Result<()> {
+pub(crate) fn kill(id: ProcId) -> io::Result<()> {
     let process = match Process::open(id.pid, PROCESS_TERMINATE) {
         Ok(Some(process)) => process,
         Ok(None) => return Ok(()),
@@ -66,7 +66,7 @@ pub fn kill(id: ProcId) -> io::Result<()> {
     Ok(())
 }
 
-pub fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
+pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
     // Our standard handles may be an IDE hook's pipes: inherited by a process that outlives
     // us, they would keep the hook waiting for the end of our output.
     for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
@@ -92,7 +92,7 @@ pub fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
 }
 
 /// `None` also when the process is not ours to query: then it is not one we started.
-pub fn start_token(pid: u32) -> Option<u64> {
+pub(crate) fn start_token(pid: u32) -> Option<u64> {
     let process = Process::open(pid, 0).ok()??;
     if !process.running() {
         return None;

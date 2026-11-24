@@ -39,7 +39,7 @@ const BUFFER: u32 = 64 * 1024;
 
 /// A connected pipe end. The server's end waits for the client to read everything before it
 /// is closed: closing at once could discard an answer not read yet.
-pub struct Stream {
+pub(crate) struct Stream {
     file: File,
     server: bool,
 }
@@ -47,7 +47,7 @@ pub struct Stream {
 impl Stream {
     /// Cancels a read still waiting after `limit`; the read then fails. Synchronous pipe
     /// reads have no timeout of their own, so a watchdog thread cancels it.
-    pub fn deadline(&self, limit: Duration) -> Result<Deadline> {
+    pub(crate) fn deadline(&self, limit: Duration) -> Result<Deadline> {
         let (done, wait) = mpsc::channel::<()>();
         let handle = self.file.as_raw_handle() as usize;
         let watchdog = std::thread::spawn(move || {
@@ -64,7 +64,7 @@ impl Stream {
 }
 
 /// Stops the watchdog when dropped, before the stream can be closed.
-pub struct Deadline {
+pub(crate) struct Deadline {
     done: Option<mpsc::Sender<()>>,
     watchdog: Option<JoinHandle<()>>,
 }
@@ -103,11 +103,11 @@ impl Drop for Stream {
     }
 }
 
-pub fn new_endpoint(pod: &str, nonce: &str) -> Result<String> {
+pub(crate) fn new_endpoint(pod: &str, nonce: &str) -> Result<String> {
     Ok(format!(r"\\.\pipe\branchpod-{pod}-{nonce}"))
 }
 
-pub fn remove_stale(_endpoint: &str) -> Result<()> {
+pub(crate) fn remove_stale(_endpoint: &str) -> Result<()> {
     Ok(())
 }
 
@@ -204,7 +204,7 @@ fn current_user_sid() -> io::Result<String> {
     result
 }
 
-pub struct Server {
+pub(crate) struct Server {
     name: Vec<u16>,
     security: Security,
     /// The instance the next client connects to.
@@ -212,7 +212,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn bind(endpoint: &str) -> io::Result<Server> {
+    pub(crate) fn bind(endpoint: &str) -> io::Result<Server> {
         let name = wide(endpoint);
         let security = Security::current_user_only()?;
         let next = create_instance(&name, &security, true)?;
@@ -223,7 +223,7 @@ impl Server {
         })
     }
 
-    pub fn accept(&mut self) -> io::Result<Stream> {
+    pub(crate) fn accept(&mut self) -> io::Result<Stream> {
         loop {
             // SAFETY: `next` is a valid pipe instance; synchronous call.
             if unsafe { ConnectNamedPipe(self.next, ptr::null_mut()) } != 0 {
@@ -285,7 +285,7 @@ fn create_instance(name: &[u16], security: &Security, first: bool) -> io::Result
     Ok(handle)
 }
 
-pub fn connect(endpoint: &str) -> Result<Stream> {
+pub(crate) fn connect(endpoint: &str) -> Result<Stream> {
     let name = wide(endpoint);
     loop {
         // Identification level only: a server that took the name of a dead supervisor cannot

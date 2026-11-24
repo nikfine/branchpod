@@ -7,17 +7,17 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Worktree {
+pub(crate) struct Worktree {
     /// Top-level directory of the worktree.
-    pub root: PathBuf,
+    pub(crate) root: PathBuf,
     /// Top-level directory of the main checkout; `None` when the common git dir is not a `.git`
     /// directory inside one (a bare repository, a submodule, `--separate-git-dir`).
-    pub main_checkout: Option<PathBuf>,
+    pub(crate) main_checkout: Option<PathBuf>,
 }
 
 impl Worktree {
     /// Resolves `path` (or the current directory) to the enclosing worktree.
-    pub fn resolve(path: Option<&OsStr>) -> Result<Worktree> {
+    pub(crate) fn resolve(path: Option<&OsStr>) -> Result<Worktree> {
         let start = match path {
             Some(p) => {
                 reject_placeholder(p)?;
@@ -60,7 +60,7 @@ impl Worktree {
 
     /// The checked-out branch name (`feature/x`); `None` on a detached HEAD. A branch without
     /// commits yet counts as checked out.
-    pub fn branch(&self) -> Result<Option<String>> {
+    pub(crate) fn branch(&self) -> Result<Option<String>> {
         // `symbolic-ref -q` exits with 1 and prints nothing when HEAD is not a branch. Not
         // `--short`: it abbreviates to a name unambiguous among all refs, so a tag with the same
         // name as the branch turns `feature` into `heads/feature`.
@@ -91,7 +91,7 @@ impl Worktree {
 
 /// Hook runners sometimes pass `%VAR%` or `$VAR` through unexpanded. Such a string is almost
 /// never a real path, and treating it as one creates directories named `%WORKTREE_PATH%`.
-pub fn reject_placeholder(arg: &OsStr) -> Result<()> {
+pub(crate) fn reject_placeholder(arg: &OsStr) -> Result<()> {
     let text = arg.to_string_lossy();
     if let Some(name) = unexpanded_variable(&text) {
         bail!(
@@ -143,7 +143,7 @@ fn unexpanded_variable(text: &str) -> Option<String> {
 }
 
 /// Canonical path without the `\\?\` prefix on Windows, which many tools cannot handle.
-pub fn canonical(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical(path: &Path) -> Result<PathBuf> {
     dunce::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))
 }
 
@@ -151,7 +151,7 @@ pub fn canonical(path: &Path) -> Result<PathBuf> {
 /// deepest existing ancestor is canonicalized and the rest appended, with `.` and `..` resolved
 /// lexically. So a short 8.3 name on Windows, `..`, or `/var` for `/private/var` on macOS still
 /// matches the canonical path recorded for a pod.
-pub fn normalize(path: &Path) -> Result<PathBuf> {
+pub(crate) fn normalize(path: &Path) -> Result<PathBuf> {
     let abs =
         std::path::absolute(path).with_context(|| format!("cannot resolve {}", path.display()))?;
     for ancestor in abs.ancestors() {
@@ -175,7 +175,7 @@ pub fn normalize(path: &Path) -> Result<PathBuf> {
 
 /// Runs git without a shell and returns stdout. Git prints paths as UTF-8 on every platform, so
 /// the output is never decoded with the console code page.
-pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(cwd)

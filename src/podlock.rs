@@ -47,13 +47,13 @@ static HELD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 /// It is a separate file because Windows locks are mandatory, so a locked file cannot be read by
 /// another process. A holder that crashed leaves it behind; the next holder overwrites it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Holder {
-    pub v: u32,
-    pub pid: u32,
+pub(crate) struct Holder {
+    pub(crate) v: u32,
+    pub(crate) pid: u32,
     /// The `bp` subcommand holding the lock (`up`, `down`, ...).
-    pub command: String,
+    pub(crate) command: String,
     /// When the lock was taken, in seconds since the Unix epoch.
-    pub since: u64,
+    pub(crate) since: u64,
 }
 
 impl fmt::Display for Holder {
@@ -68,7 +68,7 @@ impl fmt::Display for Holder {
 
 /// A held pod lock; released when dropped.
 #[derive(Debug)]
-pub struct PodLock {
+pub(crate) struct PodLock {
     holder: PathBuf,
     // Kept open for the lifetime of the lock; closing the handle unlocks it.
     _file: File,
@@ -109,7 +109,7 @@ impl Drop for Claim {
 }
 
 impl Store {
-    pub fn lock_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn lock_path(&self, id: &str) -> PathBuf {
         self.home().join("locks").join(format!("{id}.lock"))
     }
 
@@ -122,7 +122,7 @@ impl Store {
     /// If the lock is busy, `on_wait` is called once before waiting, with the current holder when
     /// it is known (it may be missing or outdated for a moment right after the lock changes hands).
     /// Taking a lock this process already holds is an error.
-    pub fn lock_pod(
+    pub(crate) fn lock_pod(
         &self,
         id: &str,
         command: &str,
@@ -157,7 +157,7 @@ impl Store {
     /// Takes the lock of pod `id` only if it is free right now (for `gc`, which skips busy pods).
     /// Taking a lock this process already holds is an error.
     #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#20)"))]
-    pub fn try_lock_pod(&self, id: &str, command: &str) -> Result<Option<PodLock>> {
+    pub(crate) fn try_lock_pod(&self, id: &str, command: &str) -> Result<Option<PodLock>> {
         let path = self.lock_path(id);
         let claim = Claim::new(&path)?;
         let file = open(&path)?;
@@ -171,7 +171,7 @@ impl Store {
     }
 
     /// The recorded holder of pod `id`'s lock, if any. Unreadable or damaged records count as none.
-    pub fn holder(&self, id: &str) -> Option<Holder> {
+    pub(crate) fn holder(&self, id: &str) -> Option<Holder> {
         let bytes = fs::read(self.holder_path(id)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }

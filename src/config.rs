@@ -17,43 +17,43 @@ use std::path::{Component, Path};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const PROJECT_FILE: &str = "branchpod.toml";
-pub const LOCAL_FILE: &str = "branchpod.local.toml";
-pub const SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROJECT_FILE: &str = "branchpod.toml";
+pub(crate) const LOCAL_FILE: &str = "branchpod.local.toml";
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
+pub(crate) struct Config {
     /// Config schema version. Required, so that a future format change is detected, not guessed.
-    pub version: u32,
+    pub(crate) version: u32,
 
     /// Named ports, referenced as `{{port.<name>}}`.
     #[serde(default)]
-    pub port: std::collections::BTreeMap<String, PortSpec>,
+    pub(crate) port: std::collections::BTreeMap<String, PortSpec>,
 
     /// Git-ignored files carried over from the main checkout.
     #[serde(default)]
-    pub file: Vec<FileSpec>,
+    pub(crate) file: Vec<FileSpec>,
 
     /// External resources managed by create/destroy commands (containers, volumes, sync sessions).
     #[serde(default)]
-    pub command: Vec<CommandSpec>,
+    pub(crate) command: Vec<CommandSpec>,
 
     /// Long-running processes under the supervisor.
     #[serde(default)]
-    pub service: Vec<ServiceSpec>,
+    pub(crate) service: Vec<ServiceSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PortSpec {
+pub(crate) struct PortSpec {
     /// Inclusive range `[first, last]` to allocate from.
-    pub range: [u16; 2],
+    pub(crate) range: [u16; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum FileMode {
+pub(crate) enum FileMode {
     /// Plain copy.
     Copy,
     /// Copy-on-write clone where the filesystem supports it, plain copy otherwise.
@@ -68,7 +68,7 @@ pub enum FileMode {
 
 impl FileMode {
     /// The name used in the config.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             FileMode::Copy => "copy",
             FileMode::Reflink => "reflink",
@@ -81,25 +81,25 @@ impl FileMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileSpec {
+pub(crate) struct FileSpec {
     /// Destination, relative to the worktree root.
-    pub path: String,
-    pub mode: FileMode,
+    pub(crate) path: String,
+    pub(crate) mode: FileMode,
     /// Source, relative to the main checkout. Defaults to `path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub(crate) source: Option<String>,
     /// A missing source is skipped instead of failing `bp up`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub optional: bool,
+    pub(crate) optional: bool,
     /// Template mode: substitute `{{var}}` in the source. `false` for sources that legitimately
     /// contain `{{ }}` (Blade, Vue); only `replace` rules are applied then. A few literal `{{`
     /// can instead be written `{{{{`.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
-    pub vars: bool,
+    pub(crate) vars: bool,
     /// Literal find/replace rules, applied after `{{var}}` substitution. Template mode only.
     /// A rule that matches nothing is an error, so drift in the source file is noticed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub replace: Vec<Replace>,
+    pub(crate) replace: Vec<Replace>,
 }
 
 fn yes() -> bool {
@@ -112,58 +112,58 @@ fn is_yes(value: &bool) -> bool {
 
 impl FileSpec {
     /// Source path relative to the main checkout.
-    pub fn source(&self) -> &str {
+    pub(crate) fn source(&self) -> &str {
         self.source.as_deref().unwrap_or(&self.path)
     }
 
     /// Identity of the resource in the ledger: the normalized destination path.
-    pub fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         normalize(&self.path)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Replace {
+pub(crate) struct Replace {
     /// Text to find, taken literally (no `{{var}}`). It is matched against the rendered text, so
     /// a source `{{{{x}}` is found as `{{x}}`.
-    pub find: String,
+    pub(crate) find: String,
     /// Replacement; may contain `{{var}}` references.
-    pub with: String,
+    pub(crate) with: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CommandSpec {
+pub(crate) struct CommandSpec {
     /// Referenced as `{{command.<name>.stdout}}` by later resources.
-    pub name: String,
+    pub(crate) name: String,
     /// Argument array; executed without a shell.
-    pub create: Vec<String>,
+    pub(crate) create: Vec<String>,
     /// Argument array run on teardown; may reference this command's captured output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destroy: Option<Vec<String>>,
+    pub(crate) destroy: Option<Vec<String>>,
     /// Argument array listing leftovers by label, one id per line; used by `bp gc`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gc: Option<Vec<String>>,
+    pub(crate) gc: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ServiceSpec {
-    pub name: String,
+pub(crate) struct ServiceSpec {
+    pub(crate) name: String,
     /// Argument array; executed without a shell.
-    pub run: Vec<String>,
+    pub(crate) run: Vec<String>,
     /// Working directory relative to the worktree root. Defaults to the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub env: std::collections::BTreeMap<String, String>,
+    pub(crate) env: std::collections::BTreeMap<String, String>,
 }
 
 impl Config {
     /// Loads the project file from `worktree` and layers the local file from `main_checkout` on top.
     /// Without a project file the local file alone is the configuration.
-    pub fn load(worktree: &Path, main_checkout: Option<&Path>) -> Result<Config> {
+    pub(crate) fn load(worktree: &Path, main_checkout: Option<&Path>) -> Result<Config> {
         let project_path = worktree.join(PROJECT_FILE);
         let local_path = main_checkout.map(|main| main.join(LOCAL_FILE));
         let project = read_table(&project_path)?;
@@ -217,13 +217,13 @@ impl Config {
     }
 
     #[cfg(test)]
-    pub fn parse(text: &str) -> Result<Config> {
+    pub(crate) fn parse(text: &str) -> Result<Config> {
         let config: Config = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.version != SCHEMA_VERSION {
             bail!(
                 "unsupported config version {} (this build supports {SCHEMA_VERSION})",

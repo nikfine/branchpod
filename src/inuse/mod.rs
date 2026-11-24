@@ -17,10 +17,10 @@ mod windows;
 use windows as sys;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Holder {
-    pub pid: u32,
+pub(crate) struct Holder {
+    pub(crate) pid: u32,
     /// Application name as the OS reports it.
-    pub name: String,
+    pub(crate) name: String,
 }
 
 impl fmt::Display for Holder {
@@ -30,7 +30,7 @@ impl fmt::Display for Holder {
 }
 
 /// Processes holding `path` open, or for a directory, files inside it.
-pub fn holders(path: &Path) -> Vec<Holder> {
+pub(crate) fn holders(path: &Path) -> Vec<Holder> {
     sys::holders(path)
 }
 
