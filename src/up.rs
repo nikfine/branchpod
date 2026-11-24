@@ -210,8 +210,8 @@ fn check(
         files::plan(spec, main, &wt.root, &probe)?;
     }
     for spec in &config.command {
-        commands::plan(spec, &wt.root, &probe)?;
-        probe.set(commands::stdout_var(&spec.name), "placeholder");
+        let plan = commands::plan(spec, &wt.root, &probe, pod_dir)?;
+        commands::export_planned(&plan, &mut probe);
     }
     for spec in &config.service {
         services::plan(spec, &wt.root, &probe, pod_dir)?;
@@ -276,8 +276,9 @@ fn provision(
         });
     }
 
+    let pod_dir = store.pod_dir(id);
     for spec in &config.command {
-        let plan = commands::plan(spec, &wt.root, vars)?;
+        let plan = commands::plan(spec, &wt.root, vars, &pod_dir)?;
         let intent = serde_json::to_value(&plan.record)?;
         let record = step(journal, Kind::Command, &spec.name, intent, || {
             commands::create(&plan).map(|out| out.record)
@@ -286,14 +287,16 @@ fn provision(
         items.push(Item {
             kind: Kind::Command,
             name: spec.name.clone(),
-            detail: command_detail(record.stdout.as_deref().unwrap_or_default()),
+            detail: match &record.file {
+                Some(file) => format!("output in {file}"),
+                None => command_detail(record.stdout.as_deref().unwrap_or_default()),
+            },
         });
     }
 
     if config.service.is_empty() {
         return Ok(());
     }
-    let pod_dir = store.pod_dir(id);
     let intent = supervisor::Record {
         endpoint: control::new_endpoint(id)?,
         process: None,

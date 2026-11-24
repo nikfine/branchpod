@@ -10,6 +10,11 @@
 //! Processes are spawned from an argument array, never through a shell. Output is decoded as
 //! UTF-8, never with the console code page, and invalid UTF-8 is an error.
 //!
+//! With `output = "file"` the output is kept byte for byte in a file of the pod's state instead.
+//! It may hold secrets, so it goes nowhere else: not into the ledger, the printed result, an error
+//! or a log. The path is known beforehand and recorded in the intent; the file goes with the pod's
+//! state, after every `destroy` that may read it.
+//!
 //! Recording in the ledger is the caller's job (`bp up` / `bp down`).
 
 use std::fmt;
@@ -20,7 +25,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::CommandSpec;
+use crate::config::{CommandSpec, OutputMode};
+use crate::fsutil;
 use crate::vars::{self, Vars};
 
 /// Lines of stderr quoted in an error message; the full text goes to the run log.
@@ -31,9 +37,14 @@ const STDERR_TAIL_LINES: usize = 20;
 pub(crate) struct Record {
     /// The `create` command as it was run.
     pub(crate) create: Vec<String>,
-    /// Trimmed stdout of `create`, the value of `{{command.<name>.stdout}}`. Set once created.
+    /// Trimmed stdout of `create`, the value of `{{command.<name>.stdout}}`. Set once created;
+    /// never set with `output = "file"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stdout: Option<String>,
+    /// With `output = "file"`, the file holding stdout: the value of `{{command.<name>.file}}`
+    /// (hence a string). Known at intent time; the contents are never recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file: Option<String>,
     /// The `destroy` command, fully rendered. Known at intent time unless it references this
     /// command's own output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,27 +110,73 @@ fn stderr_tail(stderr: &str) -> String {
 }
 
 /// The variable holding the captured output of command `name`.
-pub(crate) fn stdout_var(name: &str) -> String {
+fn stdout_var(name: &str) -> String {
     format!("command.{name}.stdout")
 }
 
-/// Makes the captured output of a created command available to later resources as
-/// `{{command.<name>.stdout}}`.
+/// The variable holding the path of the file with the output of command `name`.
+fn file_var(name: &str) -> String {
+    format!("command.{name}.file")
+}
+
+/// Where the output of command `name` goes with `output = "file"`, in the pod directory `pod_dir`.
+fn output_path(pod_dir: &Path, name: &str) -> Result<String> {
+    // The `bp` home may be given as a relative path, and the commands run elsewhere.
+    let path = std::path::absolute(pod_dir)
+        .with_context(|| format!("cannot resolve {}", pod_dir.display()))?
+        .join("outputs")
+        .join(name);
+    match path.to_str() {
+        Some(text) => Ok(text.to_owned()),
+        None => bail!(
+            "output = \"file\": the path {} is not valid UTF-8",
+            path.display()
+        ),
+    }
+}
+
+/// Makes the output of a created command available to later resources: as
+/// `{{command.<name>.stdout}}`, or its file as `{{command.<name>.file}}`.
 ///
 /// Empty output defines no variable, so a reference to it is an unknown name and fails when
 /// planning, instead of rendering an empty argument (`docker rm ""`, `bp-`).
 pub(crate) fn export(name: &str, record: &Record, vars: &mut Vars) {
+    if let Some(file) = &record.file {
+        vars.set(file_var(name), file.as_str());
+        vars.set_unavailable(
+            stdout_var(name),
+            format!(
+                "command {name:?} has output = \"file\", which keeps its output in a file only; \
+                 use `{}`",
+                file_var(name)
+            ),
+        );
+        return;
+    }
+    vars.set_unavailable(
+        file_var(name),
+        format!("command {name:?} does not have output = \"file\""),
+    );
     if let Some(stdout) = record.stdout.as_deref().filter(|s| !s.is_empty()) {
         vars.set(stdout_var(name), stdout);
     }
 }
 
-/// Renders a command resource. `create` runs in `cwd` (the worktree root).
+/// Makes a planned command available to later resources, with a stand-in for output that only
+/// `create` yields.
+pub(crate) fn export_planned(plan: &Plan, vars: &mut Vars) {
+    let mut record = plan.record.clone();
+    record.stdout = Some("placeholder".to_owned());
+    export(&plan.name, &record, vars);
+}
+
+/// Renders a command resource. `create` runs in `cwd` (the worktree root); `pod_dir` is the pod's
+/// state directory, where the file of `output = "file"` goes.
 ///
 /// `destroy` is rendered now when it does not depend on this command's own output, so that an
 /// interrupted creation can still be undone from the ledger alone.
-pub(crate) fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
-    plan_inner(spec, cwd, vars).with_context(|| format!("command {:?}", spec.name))
+pub(crate) fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars, pod_dir: &Path) -> Result<Plan> {
+    plan_inner(spec, cwd, vars, pod_dir).with_context(|| format!("command {:?}", spec.name))
 }
 
 /// A `destroy` argument with a line break carries more than an id: most likely a warning printed
@@ -143,41 +200,56 @@ fn render_destroy(vars: &Vars, argv: &[String]) -> Result<Vec<String>> {
     Ok(rendered)
 }
 
-fn plan_inner(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
+fn plan_inner(spec: &CommandSpec, cwd: &Path, vars: &Vars, pod_dir: &Path) -> Result<Plan> {
     let own = stdout_var(&spec.name);
-    if spec.create.iter().any(|arg| vars::references(arg, &own)) {
-        bail!("`create` cannot reference its own output `{own}`");
+    for own in [&own, &file_var(&spec.name)] {
+        if spec.create.iter().any(|arg| vars::references(arg, own)) {
+            bail!("`create` cannot reference its own output `{own}`");
+        }
     }
     let create = vars.render_all(&spec.create).context("create")?;
+    let mut record = Record {
+        create,
+        stdout: None,
+        file: match spec.output {
+            OutputMode::Stdout => None,
+            OutputMode::File => Some(output_path(pod_dir, &spec.name)?),
+        },
+        destroy: None,
+        destroy_unresolved: None,
+    };
 
-    let (destroy, destroy_unresolved) = match &spec.destroy {
+    // Its own `destroy` may reference the file, whose path is known already.
+    let mut vars = vars.clone();
+    export(&spec.name, &record, &mut vars);
+
+    let captured = record.file.is_none();
+    (record.destroy, record.destroy_unresolved) = match &spec.destroy {
         None => (None, None),
-        Some(argv) if argv.iter().any(|arg| vars::references(arg, &own)) => {
+        Some(argv) if captured && argv.iter().any(|arg| vars::references(arg, &own)) => {
             // Check every other reference now rather than after the resource exists.
             let mut probe = vars.clone();
             probe.set(own.as_str(), "x");
             render_destroy(&probe, argv)?;
             (None, Some(argv.clone()))
         }
-        Some(argv) => (Some(render_destroy(vars, argv)?), None),
+        Some(argv) => (Some(render_destroy(&vars, argv)?), None),
     };
 
     Ok(Plan {
         name: spec.name.clone(),
-        record: Record {
-            create,
-            stdout: None,
-            destroy,
-            destroy_unresolved,
-        },
+        record,
         cwd: cwd.to_path_buf(),
-        vars: vars.clone(),
+        vars,
     })
 }
 
 /// Runs `create` and returns the final record for the ledger. A non-zero exit is an error
 /// ([`Failed`]); so is output that is not UTF-8, or output that `destroy` depends on and that is
 /// empty or spans several lines (a warning printed next to the id would become part of it).
+///
+/// With `output = "file"` the output is written to the planned file, whatever it is, unless it is
+/// blank, which is an error: a reader would take the empty file for the real thing.
 pub(crate) fn create(plan: &Plan) -> Result<Output> {
     create_inner(plan).with_context(|| format!("command {:?}: create", plan.name))
 }
@@ -186,6 +258,9 @@ pub(crate) fn create(plan: &Plan) -> Result<Output> {
 const MAY_EXIST: &str = "the resource may have been created; `bp gc` finds it by label";
 
 fn create_inner(plan: &Plan) -> Result<Output> {
+    if let Some(file) = &plan.record.file {
+        return create_file(plan, Path::new(file));
+    }
     let run = run(&plan.record.create, &plan.cwd)?;
     // stderr of a command that succeeded best explains output that cannot be used.
     let stdout = decode_stdout(run.stdout)
@@ -215,6 +290,42 @@ fn create_inner(plan: &Plan) -> Result<Output> {
     }
     record.stdout = Some(stdout);
     Ok(Output { record })
+}
+
+fn create_file(plan: &Plan, file: &Path) -> Result<Output> {
+    // Before the command runs: a failure here leaves nothing behind, and a file of an earlier pod
+    // in the same place is never taken for this one's output.
+    if let Some(dir) = file.parent() {
+        fsutil::create_private_dir(dir)
+            .with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    fsutil::remove_file_if_exists(file)
+        .with_context(|| format!("cannot remove {}", file.display()))?;
+
+    // From here on errors must not show stdout.
+    let run = run(&plan.record.create, &plan.cwd)?;
+    if is_blank(&run.stdout) {
+        bail!(
+            "printed nothing to keep in a file (output = \"file\"){}",
+            stderr_tail(&run.stderr)
+        );
+    }
+    fsutil::write_atomic_private(file, &run.stdout)
+        .with_context(|| format!("cannot write its output to {}", file.display()))?;
+    Ok(Output {
+        record: plan.record.clone(),
+    })
+}
+
+/// Whether there is nothing but whitespace, with or without a UTF-8 byte order mark: what
+/// [`decode_stdout`] calls empty, for output that need not be text. Tools end even an empty result
+/// with a line break.
+fn is_blank(bytes: &[u8]) -> bool {
+    bytes
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(bytes)
+        .iter()
+        .all(u8::is_ascii_whitespace)
 }
 
 /// Runs the recorded `destroy` in `cwd`: the worktree root while it exists, otherwise any
@@ -334,6 +445,11 @@ mod tests {
     use crate::test_support::fail;
     use std::fs;
 
+    /// With the working directory as the pod's state directory, which only `output = "file"` uses.
+    fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
+        super::plan(spec, cwd, vars, cwd)
+    }
+
     /// Prints the contents of `file` byte for byte, using only what every CI runner has.
     fn cat(file: &Path) -> Vec<String> {
         let file = file.to_string_lossy().into_owned();
@@ -348,8 +464,16 @@ mod tests {
         CommandSpec {
             name: name.into(),
             create,
+            output: OutputMode::Stdout,
             destroy,
             gc: None,
+        }
+    }
+
+    fn file_spec(name: &str, create: Vec<String>, destroy: Option<Vec<String>>) -> CommandSpec {
+        CommandSpec {
+            output: OutputMode::File,
+            ..spec(name, create, destroy)
         }
     }
 
@@ -429,6 +553,7 @@ mod tests {
             ),
             dir.path(),
             &vars(),
+            dir.path(),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("literal"), "{err:#}");
@@ -561,6 +686,7 @@ mod tests {
         let empty = Record {
             create: strings(&["x"]),
             stdout: Some(String::new()),
+            file: None,
             destroy: None,
             destroy_unresolved: None,
         };
@@ -643,6 +769,7 @@ mod tests {
         let record = Record {
             create: strings(&["x"]),
             stdout: None,
+            file: None,
             destroy: Some(strings(&["docker", "version"])),
             destroy_unresolved: None,
         };
@@ -769,6 +896,7 @@ mod tests {
         let record = Record {
             create: strings(&["unused"]),
             stdout: Some("x".into()),
+            file: None,
             destroy: Some(cat(&out)),
             destroy_unresolved: None,
         };
@@ -790,6 +918,7 @@ mod tests {
         let nothing = Record {
             create: strings(&["x"]),
             stdout: None,
+            file: None,
             destroy: None,
             destroy_unresolved: None,
         };
@@ -811,11 +940,180 @@ mod tests {
         let record = Record {
             create: strings(&["docker", "run", "-d", "--label", "bp.pod=x"]),
             stdout: Some("abc".into()),
+            file: None,
             destroy: Some(strings(&["docker", "rm", "-f", "-v", "abc"])),
             destroy_unresolved: None,
         };
         let json = serde_json::to_value(&record).unwrap();
         assert!(json.get("destroy_unresolved").is_none(), "{json}");
+        // Written and read as before `output = "file"`.
+        assert!(json.get("file").is_none(), "{json}");
         assert_eq!(serde_json::from_value::<Record>(json).unwrap(), record);
+    }
+
+    /// BOM, CRLF, trailing spaces, a NUL and bytes that are not UTF-8.
+    const RAW: &[u8] = b"\xef\xbb\xbfTOKEN=s3cr3t \r\nX=\xa8\xa4\0\r\n\n  ";
+
+    #[test]
+    fn file_output_is_kept_byte_for_byte_and_recorded_nowhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("pod-\u{e9}");
+        fs::create_dir(&dir).unwrap();
+        let out = dir.join("raw.txt");
+        fs::write(&out, RAW).unwrap();
+
+        let destroy = strings(&["rm", "bp-{{pod.id}}", "--env-file", "{{command.env.file}}"]);
+        let plan = plan(&file_spec("env", cat(&out), Some(destroy)), &dir, &vars()).unwrap();
+        // All of it is known at intent time, its own `destroy` included.
+        let file = dir.join("outputs").join("env");
+        let text = file.to_str().unwrap();
+        assert_eq!(plan.record.file.as_deref(), Some(text));
+        assert_eq!(
+            plan.record.destroy,
+            Some(strings(&[
+                "rm",
+                "bp-feature-x-1a2b3c4d",
+                "--env-file",
+                text
+            ]))
+        );
+        assert_eq!(plan.record.destroy_unresolved, None);
+        assert!(!file.exists());
+
+        let record = create(&plan).unwrap().record;
+        assert_eq!(record, plan.record);
+        assert_eq!(fs::read(&file).unwrap(), RAW);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("s3cr3t"), "{json}");
+        assert_eq!(serde_json::from_str::<Record>(&json).unwrap(), record);
+
+        // Later commands get the path, with filters, and are told why there is no stdout.
+        let mut later = vars();
+        export("env", &record, &mut later);
+        let plan = super::plan(
+            &spec(
+                "app",
+                strings(&[
+                    "docker",
+                    "{{command.env.file}}",
+                    "{{command.env.file | slash}}",
+                    "{{command.env.file | json}}",
+                ]),
+                None,
+            ),
+            &dir,
+            &later,
+            &dir,
+        )
+        .unwrap();
+        let slash = if cfg!(windows) {
+            text.replace('\\', "/")
+        } else {
+            text.to_owned()
+        };
+        let json = serde_json::to_string(text).unwrap();
+        assert_eq!(
+            plan.record.create,
+            ["docker", text, &slash, &json[1..json.len() - 1]]
+        );
+        let uses_stdout = spec("app", strings(&["x", "{{command.env.stdout}}"]), None);
+        let err = super::plan(&uses_stdout, &dir, &later, &dir).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("`command.env.stdout` is not available")
+                && err.contains("use `command.env.file`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn references_to_the_output_the_command_does_not_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = |spec: &CommandSpec| {
+            let err = plan(spec, dir.path(), &vars()).unwrap_err();
+            format!("{err:#}")
+        };
+        let own_file = strings(&["x", "{{command.env.file}}"]);
+        let own_stdout = strings(&["x", "{{command.env.stdout}}"]);
+        for create in [&own_file, &own_stdout] {
+            let err = error(&file_spec("env", create.clone(), None));
+            assert!(err.contains("its own output"), "{err}");
+        }
+        let err = error(&file_spec("env", strings(&["x"]), Some(own_stdout)));
+        assert!(err.contains("use `command.env.file`"), "{err}");
+        let err = error(&spec("env", strings(&["x"]), Some(own_file)));
+        assert!(err.contains("does not have output = \"file\""), "{err}");
+    }
+
+    #[test]
+    fn blank_output_is_not_kept_in_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        let file = dir.path().join("outputs").join("env");
+        fs::create_dir(dir.path().join("outputs")).unwrap();
+        for blank in ["", "\r\n \n", "\u{feff}\r\n"] {
+            fs::write(&out, blank).unwrap();
+            // Left by an earlier pod: it must not pass for the output of this one.
+            fs::write(&file, "stale").unwrap();
+            let spec = file_spec("env", cat(&out), None);
+            let err = create(&plan(&spec, dir.path(), &vars()).unwrap()).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("printed nothing") && err.contains("command \"env\""),
+                "{err}"
+            );
+            assert!(!file.exists());
+        }
+    }
+
+    #[test]
+    fn a_failing_command_keeps_no_file_and_shows_only_its_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("raw.txt");
+        fs::write(&out, RAW).unwrap();
+        let script = if cfg!(windows) {
+            let script = "type raw.txt & echo boom 1>&2 & exit 3";
+            strings(&["cmd", "/d", "/c", script])
+        } else {
+            strings(&["sh", "-c", "cat raw.txt; echo boom >&2; exit 3"])
+        };
+        let plan = plan(&file_spec("env", script, None), dir.path(), &vars()).unwrap();
+        let err = create(&plan).unwrap_err();
+        assert!(err.downcast_ref::<Failed>().is_some(), "{err:#}");
+        for text in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(text.contains("boom") && !text.contains("s3cr3t"), "{text}");
+        }
+        assert!(!dir.path().join("outputs").join("env").exists());
+    }
+
+    #[test]
+    fn the_file_is_prepared_before_the_command_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("outputs"), "not a directory").unwrap();
+        let script = if cfg!(windows) {
+            strings(&["cmd", "/d", "/c", "echo x> ran.txt"])
+        } else {
+            strings(&["sh", "-c", "echo x > ran.txt"])
+        };
+        let plan = plan(&file_spec("env", script, None), dir.path(), &vars()).unwrap();
+        let err = format!("{:#}", create(&plan).unwrap_err());
+        assert!(err.contains("cannot create"), "{err}");
+        assert!(!dir.path().join("ran.txt").exists());
+    }
+
+    #[test]
+    fn the_file_path_is_absolute_even_with_a_relative_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec("env", strings(&["x"]), None);
+        let plan = super::plan(&spec, dir.path(), &vars(), Path::new("home")).unwrap();
+        let file = PathBuf::from(plan.record.file.unwrap());
+        assert_eq!(
+            file,
+            std::env::current_dir()
+                .unwrap()
+                .join("home")
+                .join("outputs")
+                .join("env")
+        );
     }
 }
