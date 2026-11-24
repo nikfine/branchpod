@@ -14,6 +14,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
+use crate::fsutil;
+
 pub(crate) const LEDGER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -161,11 +163,16 @@ impl Ledger {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // It holds the output of commands and the fingerprints of files that may be secrets.
+        fsutil::owner_only(&mut options);
+        let file = options
             .open(path)
             .with_context(|| format!("cannot open ledger {}", path.display()))?;
+        // Also one that an older `bp` created. A file system without permissions may refuse.
+        #[cfg(unix)]
+        let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));
         let ledger = Ledger {
             path: path.to_path_buf(),
             file,
@@ -482,6 +489,21 @@ mod tests {
         assert_eq!(s[0].data, data);
         let shown = serde_json::to_value(&s[0]).unwrap();
         assert_eq!(shown["data"], json!({"path": "/wt/.env"}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_user_can_read_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mode = || fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        drop(Ledger::open(&path).unwrap());
+        assert_eq!(mode(), 0o600);
+        // From an older `bp`.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(Ledger::open(&path).unwrap());
+        assert_eq!(mode(), 0o600);
     }
 
     #[test]
