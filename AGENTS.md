@@ -12,6 +12,7 @@ Guidance for AI coding agents (and humans) working on branchpod.
 
 - One branch per issue, named `<issue number>-<short-slug>` (e.g. `7-bp-down`), created from an
   up-to-date `main`. Small maintenance without an issue: `chore-<slug>`.
+- One worktree per session, set up with `branchpod`: [CONTRIBUTING.md](CONTRIBUTING.md).
 - Changes reach `main` through pull requests; the PR body links the issue (`Closes #7`). CI runs on
   pull requests.
 - Open a pull request as a draft and keep it a draft while it is being reviewed: CI then runs the quick
