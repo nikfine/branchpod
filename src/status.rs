@@ -1020,6 +1020,18 @@ mod tests {
             let state = |i: usize| report.resources[i].runtime.as_ref().unwrap().state;
             (state(0), state(1), report.health.state)
         }
+
+        /// The same, once a signal sent to the supervisor has taken effect: it does so a moment after
+        /// `kill` returns, and until then an answer is right.
+        fn states_after_signal(&self) -> (State, State, Health) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let states = self.states();
+                if states.0 != State::Running || Instant::now() >= deadline {
+                    return states;
+                }
+            }
+        }
     }
 
     #[test]
@@ -1031,6 +1043,11 @@ mod tests {
         );
         assert!(proc::wait_gone(pod.web, Duration::from_secs(10)));
         wait_for_log(&pod.tmp.path().join("web.log"), "last words");
+        // On macOS a process can count as gone before its parent is told (#84).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pod.states().1 == State::Running && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
         let report = pod.look();
         let runtime = report.resources[1].runtime.as_ref().unwrap();
         assert_eq!(
@@ -1049,7 +1066,7 @@ mod tests {
         wait_for_log(&pod.tmp.path().join("web.log"), "web-up");
         proc::kill(pod.supervisor.process.unwrap()).unwrap();
         // Looked at at once: it may still be dying.
-        let (supervisor, _, health) = pod.states();
+        let (supervisor, _, health) = pod.states_after_signal();
         assert_eq!((supervisor, health), (State::Gone, Health::Degraded));
         if cfg!(unix) {
             assert_eq!(
@@ -1151,22 +1168,41 @@ mod tests {
         assert!(matches!(observed, Supervisor::NotStarted), "{observed:?}");
     }
 
+    /// A process that is stopped until this is dropped, also when the test fails.
+    #[cfg(unix)]
+    struct Stopped(ProcId);
+
+    #[cfg(unix)]
+    impl Stopped {
+        fn new(process: ProcId) -> Stopped {
+            let stopped = Stopped(process);
+            assert_eq!(stopped.signal(libc::SIGSTOP), 0);
+            stopped
+        }
+
+        fn signal(&self, signal: libc::c_int) -> libc::c_int {
+            // SAFETY: plain system call on a process of ours.
+            unsafe { libc::kill(self.0.pid as libc::pid_t, signal) }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            self.signal(libc::SIGCONT);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_stopped_supervisor_is_unresponsive_until_it_goes_on() {
         let pod = pod(long_running("web-up"));
-        let signal = |signal| {
-            let pid = pod.supervisor.process.unwrap().pid;
-            // SAFETY: plain system call on a process of ours.
-            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
-        };
-        signal(libc::SIGSTOP);
-        let stopped = pod.states();
-        signal(libc::SIGCONT);
+        let stopped = Stopped::new(pod.supervisor.process.unwrap());
         assert_eq!(
-            stopped,
+            pod.states_after_signal(),
             (State::Unresponsive, State::Running, Health::Degraded)
         );
+        drop(stopped);
         assert_eq!(
             pod.states(),
             (State::Running, State::Running, Health::Healthy)

@@ -134,6 +134,19 @@ impl Pod {
         )
     }
 
+    /// Once the pod is not busy any more: a lock that was just given up can stay taken for a moment, on
+    /// Unix by a process that another test is starting, on Windows until the system has cleaned up.
+    fn json_when_free(&self) -> (i32, Value) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (code, status) = self.json();
+            if code != BUSY || Instant::now() >= deadline {
+                return (code, status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Waits for the only service to be in `state`.
     fn wait_for(&self, state: &str) -> (i32, Value) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -349,7 +362,7 @@ fn a_pod_that_is_worked_on_is_busy() {
     // The record of one that crashed does not make the pod busy.
     drop(lock);
     fs::write(&holder, record.to_string()).unwrap();
-    assert_eq!(pod.json().0, DEGRADED);
+    assert_eq!(pod.json_when_free().0, DEGRADED);
     fs::write(&meta, good).unwrap();
     assert_eq!(pod.json().0, HEALTHY);
     fs::remove_file(holder).unwrap();
@@ -479,7 +492,7 @@ fn a_pod_whose_down_was_killed_is_degraded() {
     down.kill().unwrap();
     down.wait().unwrap();
 
-    let (code, status) = pod.json();
+    let (code, status) = pod.json_when_free();
     assert_eq!(code, DEGRADED, "{status:#}");
     assert_eq!(resource(&status, "command")["status"], "live");
     let hint = status["health"]["hint"].as_str().unwrap();
