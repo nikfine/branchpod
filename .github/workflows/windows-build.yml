@@ -1,0 +1,39 @@
+# A Windows release build from a clean machine, without paths of a developer's computer in it: to
+# compare with a local build, or to have it checked by an antivirus vendor. Not a release.
+name: Windows build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The compiler of the local build it is compared with.
+      - uses: dtolnay/rust-toolchain@1.92
+      # No cache: everything is compiled from the locked sources.
+      - run: cargo build --release --locked
+      - name: Versions and hashes
+        shell: pwsh
+        run: |
+          rustc -vV
+          git rev-parse HEAD
+          $exe = Get-Item target/release/branchpod.exe
+          "size $($exe.Length)"
+          foreach ($algorithm in 'SHA256', 'MD5') {
+            "$algorithm $((Get-FileHash $exe -Algorithm $algorithm).Hash)"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: branchpod-windows
+          path: target/release/branchpod.exe
+          if-no-files-found: error
+          retention-days: 7
