@@ -83,6 +83,10 @@ pub(crate) struct PodMeta {
 pub(crate) enum Unfinished {
     Up,
     Down,
+    /// Written by a newer version. Without it such a pod, and with it every list of pods, could not
+    /// be read.
+    #[serde(other)]
+    Other,
 }
 
 impl PodMeta {
@@ -300,6 +304,9 @@ mod tests {
             serde_json::from_str(r#"{ "v": 1, "id": "p", "worktree": "/wt", "later": 1 }"#)
                 .unwrap();
         assert_eq!(meta.unfinished, None);
+        let newer = r#"{ "v": 1, "id": "p", "worktree": "/wt", "unfinished": "gc" }"#;
+        let newer: PodMeta = serde_json::from_str(newer).unwrap();
+        assert_eq!(newer.unfinished, Some(Unfinished::Other));
         store
             .write_meta(&meta.with(Some(Unfinished::Down)))
             .unwrap();

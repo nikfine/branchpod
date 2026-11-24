@@ -392,6 +392,7 @@ fn hint(pod: &PodMeta, hang: Option<String>) -> String {
     let (reason, again) = match pod.unfinished {
         Some(Unfinished::Up) => ("`bp up` did not finish; ", ""),
         Some(Unfinished::Down) => ("`bp down` did not finish; ", " again"),
+        Some(Unfinished::Other) => ("another `bp` command did not finish; ", ""),
         None => ("", ""),
     };
     let steps = format!("run `bp down {path}`{again}, then `bp up {path}`");
