@@ -114,7 +114,8 @@ impl Pod {
         pod
     }
 
-    /// Output goes to a file, not to a pipe, for the reasons given in `tests/job.rs` (#76).
+    /// Output goes to a file, not to a pipe: should the supervisor hold the pipe, its end would come
+    /// only with the supervisor's.
     fn run_up(&self) {
         let path = self.home.with_file_name("up.log");
         let log = fs::File::create(&path).unwrap();
