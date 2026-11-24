@@ -24,7 +24,7 @@ use crate::{fsutil, inuse};
 /// What a file resource is on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum EntryType {
+pub(crate) enum EntryType {
     File,
     Dir,
     /// Symlink, or a junction for a directory on Windows.
@@ -33,29 +33,29 @@ pub enum EntryType {
 
 /// Ledger data of a file resource: everything teardown needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
+pub(crate) struct Record {
     /// Worktree root. Nothing outside it is ever created or removed.
-    pub root: PathBuf,
+    pub(crate) root: PathBuf,
     /// Absolute destination.
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     #[serde(rename = "type")]
-    pub entry: EntryType,
+    pub(crate) entry: EntryType,
     /// Directories created to hold `path`, outermost first; removed on teardown while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub created_dirs: Vec<PathBuf>,
+    pub(crate) created_dirs: Vec<PathBuf>,
     /// Reflink mode only: whether every file was cloned copy-on-write rather than copied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloned: Option<bool>,
+    pub(crate) cloned: Option<bool>,
     /// Directories only: the trash name teardown moves `path` to before deleting it. Chosen and
     /// recorded before the move, so an interruption at any point is finished from the ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trash: Option<PathBuf>,
+    pub(crate) trash: Option<PathBuf>,
 }
 
 /// A checked file resource, ready to be created.
 #[derive(Debug)]
-pub struct Plan {
-    pub record: Record,
+pub(crate) struct Plan {
+    pub(crate) record: Record,
     action: Action,
 }
 
@@ -70,7 +70,7 @@ enum Action {
 /// nothing to create: `mode = "ignore"`, or an optional source that does not exist.
 ///
 /// `main` and `root` are expected in canonical form, as [`crate::worktree::Worktree`] gives them.
-pub fn plan(spec: &FileSpec, main: &Path, root: &Path, vars: &Vars) -> Result<Option<Plan>> {
+pub(crate) fn plan(spec: &FileSpec, main: &Path, root: &Path, vars: &Vars) -> Result<Option<Plan>> {
     plan_inner(spec, main, root, vars).with_context(|| format!("file {:?}", spec.path))
 }
 
@@ -184,7 +184,7 @@ fn render_template(spec: &FileSpec, source: &Path, vars: &Vars) -> Result<Vec<u8
 }
 
 /// Creates what `plan` describes and returns the final record for the ledger.
-pub fn create(plan: &Plan) -> Result<Record> {
+pub(crate) fn create(plan: &Plan) -> Result<Record> {
     let mut record = plan.record.clone();
     create_inner(plan, &mut record)
         .with_context(|| format!("cannot create {}", record.path.display()))?;
@@ -350,7 +350,7 @@ fn symlink_error(e: io::Error) -> anyhow::Error {
 /// record finishes the job: it deletes a leftover trash and moves a remaining directory. Single
 /// files and links are removed in one operation. Transient locks are retried; a lasting one is
 /// reported with the processes holding the path, when the OS can tell.
-pub fn remove(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
+pub(crate) fn remove(record: &Record, on_moved: impl FnOnce(&Record) -> Result<()>) -> Result<()> {
     remove_inner(record, on_moved)
         .with_context(|| format!("cannot remove {}", record.path.display()))
 }

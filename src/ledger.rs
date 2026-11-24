@@ -14,11 +14,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const LEDGER_VERSION: u32 = 1;
+pub(crate) const LEDGER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Kind {
+pub(crate) enum Kind {
     Git,
     File,
     Port,
@@ -30,7 +30,7 @@ pub enum Kind {
 
 impl Kind {
     /// The name used in the ledger and in output.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Kind::Git => "git",
             Kind::File => "file",
@@ -51,7 +51,7 @@ impl fmt::Display for Kind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
-pub enum Event {
+pub(crate) enum Event {
     /// About to create the resource. `data` holds what teardown needs to undo a creation that
     /// was interrupted (the planned path, for example).
     Intent {
@@ -74,18 +74,18 @@ pub enum Event {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Entry {
-    pub v: u32,
-    pub ts_ms: u64,
-    pub kind: Kind,
-    pub name: String,
+pub(crate) struct Entry {
+    pub(crate) v: u32,
+    pub(crate) ts_ms: u64,
+    pub(crate) kind: Kind,
+    pub(crate) name: String,
     #[serde(flatten)]
-    pub event: Event,
+    pub(crate) event: Event,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Status {
+pub(crate) enum Status {
     /// Intent recorded, creation not confirmed: may or may not exist.
     Pending,
     Live,
@@ -96,7 +96,7 @@ pub enum Status {
 
 impl Status {
     /// The name used in output.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Status::Pending => "pending",
             Status::Live => "live",
@@ -114,30 +114,31 @@ impl fmt::Display for Status {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ResourceState {
-    pub kind: Kind,
-    pub name: String,
-    pub status: Status,
+pub(crate) struct ResourceState {
+    pub(crate) kind: Kind,
+    pub(crate) name: String,
+    pub(crate) status: Status,
     #[serde(skip_serializing_if = "Value::is_null")]
-    pub data: Value,
+    pub(crate) data: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
-pub struct Ledger {
+pub(crate) struct Ledger {
     path: PathBuf,
     file: File,
 }
 
+#[cfg(test)]
 impl Event {
     /// An intent without data.
-    pub fn intent() -> Event {
+    pub(crate) fn intent() -> Event {
         Event::Intent { data: Value::Null }
     }
 }
 
 impl Ledger {
-    pub fn open(path: &Path) -> Result<Ledger> {
+    pub(crate) fn open(path: &Path) -> Result<Ledger> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         }
@@ -154,7 +155,7 @@ impl Ledger {
         Ok(ledger)
     }
 
-    pub fn record(&mut self, kind: Kind, name: &str, event: Event) -> Result<()> {
+    pub(crate) fn record(&mut self, kind: Kind, name: &str, event: Event) -> Result<()> {
         let entry = Entry {
             v: LEDGER_VERSION,
             ts_ms: now_ms(),
@@ -184,7 +185,7 @@ impl Ledger {
 
 /// Reads all entries. A malformed last line is a torn write and is skipped; a malformed line in
 /// the middle means the file was damaged and is reported.
-pub fn read(path: &Path) -> Result<Vec<Entry>> {
+pub(crate) fn read(path: &Path) -> Result<Vec<Entry>> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -216,7 +217,7 @@ pub fn read(path: &Path) -> Result<Vec<Entry>> {
 
 /// Folds entries into the current state of each resource, ordered by its latest intent.
 /// Teardown visits every non-destroyed resource in reverse of this order.
-pub fn state(entries: &[Entry]) -> Vec<ResourceState> {
+pub(crate) fn state(entries: &[Entry]) -> Vec<ResourceState> {
     let mut resources: Vec<ResourceState> = Vec::new();
     for entry in entries {
         let pos = resources

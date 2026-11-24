@@ -23,20 +23,20 @@ use sha2::{Digest, Sha256};
 
 use crate::fsutil;
 
-pub const REGISTRY_VERSION: u32 = 1;
+pub(crate) const REGISTRY_VERSION: u32 = 1;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ledger data of a port resource. Teardown releases by `(pod, name)` and does not need it; it
 /// is recorded for `bp status` and for rendering `{{port.<name>}}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
-    pub port: u16,
+pub(crate) struct Record {
+    pub(crate) port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Owner {
-    pub pod: String,
-    pub name: String,
+pub(crate) struct Owner {
+    pub(crate) pod: String,
+    pub(crate) name: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -47,14 +47,14 @@ struct RegistryFile {
 }
 
 /// The registry stored under `home`. Every operation takes the lock for its whole duration.
-pub struct Registry {
+pub(crate) struct Registry {
     file: PathBuf,
     lock: PathBuf,
     lock_timeout: Duration,
 }
 
 impl Registry {
-    pub fn new(home: &Path) -> Registry {
+    pub(crate) fn new(home: &Path) -> Registry {
         Registry {
             file: home.join("ports.json"),
             lock: home.join("ports.lock"),
@@ -69,7 +69,7 @@ impl Registry {
     /// moving it would point templates at a port nothing serves. Whether such a port was taken by
     /// a foreign process while the pod was down is for the caller to decide from the pod state;
     /// it can `release` and allocate again. Only new candidates are bind-checked.
-    pub fn allocate(&self, pod: &str, name: &str, range: [u16; 2]) -> Result<u16> {
+    pub(crate) fn allocate(&self, pod: &str, name: &str, range: [u16; 2]) -> Result<u16> {
         self.allocate_with(pod, name, range, is_free)
     }
 
@@ -124,7 +124,7 @@ impl Registry {
 
     /// Releases the port of `(pod, name)`. Releasing something not registered is not an error, so
     /// teardown stays idempotent.
-    pub fn release(&self, pod: &str, name: &str) -> Result<Option<u16>> {
+    pub(crate) fn release(&self, pod: &str, name: &str) -> Result<Option<u16>> {
         let _lock = self.lock()?;
         let mut reg = self.load()?;
         let port = reg
@@ -140,7 +140,8 @@ impl Registry {
     }
 
     /// Releases every port of a pod (used by `gc`).
-    pub fn release_pod(&self, pod: &str) -> Result<Vec<u16>> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#20)"))]
+    pub(crate) fn release_pod(&self, pod: &str) -> Result<Vec<u16>> {
         let _lock = self.lock()?;
         let mut reg = self.load()?;
         let ports: Vec<u16> = reg
@@ -157,7 +158,8 @@ impl Registry {
     }
 
     /// The port currently registered to `(pod, name)`, if any.
-    pub fn registered(&self, pod: &str, name: &str) -> Result<Option<u16>> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#22)"))]
+    pub(crate) fn registered(&self, pod: &str, name: &str) -> Result<Option<u16>> {
         let _lock = self.lock()?;
         Ok(self
             .load()?
@@ -167,7 +169,8 @@ impl Registry {
             .map(|(p, _)| *p))
     }
 
-    pub fn list(&self) -> Result<BTreeMap<u16, Owner>> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "for `bp gc` (#22)"))]
+    pub(crate) fn list(&self) -> Result<BTreeMap<u16, Owner>> {
         let _lock = self.lock()?;
         Ok(self.load()?.ports)
     }
@@ -277,7 +280,7 @@ fn preferred_offset(pod: &str, name: &str) -> u32 {
 ///
 /// Not detected: a listener on one specific non-loopback address (e.g. `192.168.1.10:<port>`) on
 /// Windows, where binding the wildcard address still succeeds next to it.
-pub fn is_free(port: u16) -> bool {
+pub(crate) fn is_free(port: u16) -> bool {
     let v4 = [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED];
     if !v4
         .iter()

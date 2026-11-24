@@ -30,10 +30,10 @@ use crate::control::{self, Conn, Server};
 use crate::proc::{self, ProcId};
 
 /// How long a stopped service gets to exit before it is killed.
-pub const GRACE: Duration = Duration::from_secs(10);
+pub(crate) const GRACE: Duration = Duration::from_secs(10);
 
 /// How long `bp down` waits for a supervisor to exit after `shutdown` answered, before killing it.
-pub const EXIT_WAIT: Duration = Duration::from_secs(10);
+pub(crate) const EXIT_WAIT: Duration = Duration::from_secs(10);
 
 /// How long the supervisor waits for a connected client to send its request. Requests are served
 /// one at a time, so a silent client must not keep everyone else waiting.
@@ -47,16 +47,16 @@ const READY: &str = "BP-SUPERVISOR ";
 
 /// Ledger data of the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
-    pub endpoint: String,
+pub(crate) struct Record {
+    pub(crate) endpoint: String,
     /// Set once it reported that it listens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process: Option<ProcId>,
+    pub(crate) process: Option<ProcId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
-pub enum Request {
+pub(crate) enum Request {
     Start(Start),
     Stop { name: String },
     Status,
@@ -65,26 +65,26 @@ pub enum Request {
 
 /// A service to start, fully rendered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Start {
-    pub name: String,
-    pub run: Vec<String>,
+pub(crate) struct Start {
+    pub(crate) name: String,
+    pub(crate) run: Vec<String>,
     /// Absolute.
-    pub cwd: PathBuf,
+    pub(crate) cwd: PathBuf,
     /// Added to the supervisor's environment (inherited from `bp up`).
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub(crate) env: BTreeMap<String, String>,
     /// stdout and stderr go here, appended.
-    pub log: PathBuf,
+    pub(crate) log: PathBuf,
 }
 
 /// A service as `status` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServiceStatus {
-    pub name: String,
-    pub process: ProcId,
+pub(crate) struct ServiceStatus {
+    pub(crate) name: String,
+    pub(crate) process: ProcId,
     /// `None` while it runs.
     #[serde(default)]
-    pub exit: Option<String>,
+    pub(crate) exit: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,15 +117,15 @@ struct Ready {
 
 /// Builds the command that runs a supervisor for an endpoint: `bp supervise <endpoint>`, or the
 /// test binary re-running itself in tests.
-pub struct Launcher(Box<dyn Fn(&str) -> Command + Send + Sync>);
+pub(crate) struct Launcher(Box<dyn Fn(&str) -> Command + Send + Sync>);
 
 impl Launcher {
-    pub fn new(build: impl Fn(&str) -> Command + Send + Sync + 'static) -> Launcher {
+    pub(crate) fn new(build: impl Fn(&str) -> Command + Send + Sync + 'static) -> Launcher {
         Launcher(Box::new(build))
     }
 
     /// `bp supervise <endpoint>` with this very binary.
-    pub fn current_exe() -> Result<Launcher> {
+    pub(crate) fn current_exe() -> Result<Launcher> {
         let exe = std::env::current_exe().context("cannot locate the bp binary")?;
         Ok(Launcher::new(move |endpoint| {
             let mut cmd = Command::new(&exe);
@@ -137,7 +137,7 @@ impl Launcher {
     /// Starts a supervisor listening on `endpoint`, with `cwd` as its working directory and its
     /// own diagnostics in `log`, and waits until it listens. It is not waited for afterwards: it
     /// outlives us.
-    pub fn launch(&self, endpoint: &str, cwd: &Path, log: &Path) -> Result<ProcId> {
+    pub(crate) fn launch(&self, endpoint: &str, cwd: &Path, log: &Path) -> Result<ProcId> {
         let log = open_log(log)?;
         let mut cmd = (self.0)(endpoint);
         cmd.current_dir(cwd)
@@ -182,7 +182,7 @@ fn open_log(path: &Path) -> Result<fs::File> {
 
 /// Sends `request` to the supervisor at `endpoint` and returns the data of its answer. Fails with
 /// [`control::Unreachable`] when nothing listens there.
-pub fn request(endpoint: &str, request: &Request) -> Result<Value> {
+pub(crate) fn request(endpoint: &str, request: &Request) -> Result<Value> {
     let conn = control::connect(endpoint)?;
     let message = Message {
         v: PROTOCOL,
@@ -206,7 +206,7 @@ pub fn request(endpoint: &str, request: &Request) -> Result<Value> {
 }
 
 /// Whether `error` means that nothing listens on the supervisor's endpoint.
-pub fn is_unreachable(error: &anyhow::Error) -> bool {
+pub(crate) fn is_unreachable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<control::Unreachable>().is_some()
 }
 
@@ -237,7 +237,7 @@ impl Service {
 }
 
 /// The supervisor process: listens on `endpoint` and serves requests until `shutdown`.
-pub fn serve(endpoint: &str) -> Result<()> {
+pub(crate) fn serve(endpoint: &str) -> Result<()> {
     let mut server = match Server::bind(endpoint) {
         Ok(server) => server,
         Err(e) => {
@@ -401,82 +401,9 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
-
-    /// Name of the env var that makes [`supervisor_process`] run.
-    const ENDPOINT_ENV: &str = "BP_TEST_SUPERVISOR_ENDPOINT";
-
-    /// Starts supervisors as this test binary re-running [`supervisor_process`].
-    pub fn launcher() -> Launcher {
-        let exe = std::env::current_exe().unwrap();
-        Launcher::new(move |endpoint| {
-            let mut cmd = Command::new(&exe);
-            cmd.args([
-                "--exact",
-                "supervisor::tests::supervisor_process",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(ENDPOINT_ENV, endpoint);
-            cmd
-        })
-    }
-
-    /// Kills recorded processes (and their trees) on drop, so that a failing test leaves no
-    /// supervisor or service running (on Windows one would also keep the test binary in use).
-    #[derive(Default)]
-    pub struct Reaper(pub Vec<ProcId>);
-
-    impl Drop for Reaper {
-        fn drop(&mut self) {
-            // Services were recorded after their supervisor: stop them first.
-            for process in self.0.iter().rev() {
-                let _ = proc::stop_recorded_tree(*process, Duration::from_millis(500));
-                let _ = proc::kill(*process);
-            }
-        }
-    }
-
-    /// A [`Reaper`] for every process recorded in pod `id`'s ledger.
-    pub fn reap_pod(store: &crate::pod::Store, id: &str) -> Reaper {
-        let processes = store
-            .resources(id)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|r| serde_json::from_value(r.data.get("process")?.clone()).ok())
-            .collect();
-        Reaper(processes)
-    }
-
-    /// Not a test by itself: the supervisor process for tests.
-    #[test]
-    #[ignore]
-    fn supervisor_process() {
-        if let Some(endpoint) = std::env::var_os(ENDPOINT_ENV) {
-            serve(endpoint.to_str().unwrap()).unwrap();
-        }
-    }
-
-    /// Prints a line, then sleeps for a long time, using what every CI runner has.
-    pub fn long_running(marker: &str) -> Vec<String> {
-        if cfg!(windows) {
-            // `ping` waits about one second between echoes.
-            vec![
-                "cmd".into(),
-                "/d".into(),
-                "/c".into(),
-                format!("echo {marker}& ping -n 300 127.0.0.1 > nul"),
-            ]
-        } else {
-            vec![
-                "sh".into(),
-                "-c".into(),
-                format!("echo {marker}; exec sleep 300"),
-            ]
-        }
-    }
+    use crate::test_support::{fail, launcher, long_running};
 
     struct Running {
         _tmp: tempfile::TempDir,
@@ -599,13 +526,8 @@ pub mod tests {
             start(&r, "none", vec!["bp-no-such-program-\u{e9}".into()]).unwrap_err()
         );
         assert!(err.contains("program not found"), "{err}");
-        let quick = if cfg!(windows) {
-            vec!["cmd".into(), "/d".into(), "/c".into(), "exit 3".into()]
-        } else {
-            vec!["sh".into(), "-c".into(), "exit 3".into()]
-        };
         // It may be gone before the supervisor looks, or be reported as started and exit.
-        if let Ok(process) = start(&r, "quick", quick) {
+        if let Ok(process) = start(&r, "quick", fail(3, "boom")) {
             assert!(proc::wait_gone(process, Duration::from_secs(5)));
         }
     }

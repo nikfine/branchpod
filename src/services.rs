@@ -16,28 +16,28 @@ use crate::vars::Vars;
 
 /// Ledger data of a service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
+pub(crate) struct Record {
     /// The command as it was started.
-    pub run: Vec<String>,
-    pub cwd: PathBuf,
+    pub(crate) run: Vec<String>,
+    pub(crate) cwd: PathBuf,
     /// Its own process, set once started. On Unix also its process group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process: Option<ProcId>,
+    pub(crate) process: Option<ProcId>,
 }
 
 /// A rendered service: the supervisor's request and the intent's ledger data.
 #[derive(Debug)]
-pub struct Plan {
-    pub start: Start,
-    pub record: Record,
+pub(crate) struct Plan {
+    pub(crate) start: Start,
+    pub(crate) record: Record,
 }
 
 /// Where the output of service `name` goes, in the pod directory `pod_dir`.
-pub fn log_path(pod_dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn log_path(pod_dir: &Path, name: &str) -> PathBuf {
     pod_dir.join("logs").join(format!("{name}.log"))
 }
 
-pub fn plan(spec: &ServiceSpec, root: &Path, vars: &Vars, pod_dir: &Path) -> Result<Plan> {
+pub(crate) fn plan(spec: &ServiceSpec, root: &Path, vars: &Vars, pod_dir: &Path) -> Result<Plan> {
     plan_inner(spec, root, vars, pod_dir).with_context(|| format!("service {:?}", spec.name))
 }
 

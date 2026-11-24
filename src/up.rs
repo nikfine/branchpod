@@ -39,18 +39,18 @@ use crate::{commands, control, files, services};
 
 /// A provisioned pod.
 #[derive(Debug)]
-pub struct Report {
-    pub pod: PodMeta,
+pub(crate) struct Report {
+    pub(crate) pod: PodMeta,
     /// What this run did, in creation order.
-    pub items: Vec<Item>,
+    pub(crate) items: Vec<Item>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Item {
-    pub kind: Kind,
-    pub name: String,
+pub(crate) struct Item {
+    pub(crate) kind: Kind,
+    pub(crate) name: String,
     /// Short human-readable result: the port, the file mode, the command's output.
-    pub detail: String,
+    pub(crate) detail: String,
 }
 
 /// `up` failed after recording resources. They may exist and are left for `bp down`.
@@ -59,13 +59,13 @@ pub struct Item {
 /// print it twice in an error chain. A typed cause (such as [`commands::Failed`] with the full
 /// stderr) is reached with `failed.error.downcast_ref()`.
 #[derive(Debug)]
-pub struct Failed {
-    pub error: anyhow::Error,
-    pub pod: String,
-    pub worktree: PathBuf,
+pub(crate) struct Failed {
+    pub(crate) error: anyhow::Error,
+    pub(crate) pod: String,
+    pub(crate) worktree: PathBuf,
     /// Every resource of the pod that is not destroyed, as the ledger has it now. Empty if the
     /// ledger could not be read back.
-    pub recorded: Vec<ResourceState>,
+    pub(crate) recorded: Vec<ResourceState>,
 }
 
 impl fmt::Display for Failed {
@@ -99,7 +99,7 @@ struct Journal {
 
 /// Provisions the pod of `wt` from `config`. `on_wait` is called if another `bp` holds the pod
 /// lock, before waiting for it.
-pub fn up(
+pub(crate) fn up(
     store: &Store,
     wt: &Worktree,
     config: &Config,
@@ -267,7 +267,6 @@ fn provision(
     for spec in &config.command {
         let plan = commands::plan(spec, &wt.root, vars)?;
         let intent = serde_json::to_value(&plan.record)?;
-        // stderr of a successful command is for the run log, which does not exist yet.
         let record = step(journal, Kind::Command, &spec.name, intent, || {
             commands::create(&plan).map(|out| out.record)
         })?;
@@ -444,24 +443,14 @@ fn listing(resources: &[ResourceState]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{fail, git_ok, launcher, long_running, reap_pod};
     use std::fs;
-    use std::process::Command;
 
     struct Repo {
         _tmp: tempfile::TempDir,
         store: Store,
         main: PathBuf,
         linked: PathBuf,
-    }
-
-    fn git_ok(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
     }
 
     /// A main checkout and a linked worktree on branch `feature`, with a `bp` home of their own.
@@ -511,13 +500,9 @@ mod tests {
 
     fn run(r: &Repo, config: &str) -> Result<Report> {
         let config = Config::parse(config).unwrap();
-        up(
-            &r.store,
-            &worktree(r),
-            &config,
-            &supervisor::tests::launcher(),
-            |_| panic!("lock is busy"),
-        )
+        up(&r.store, &worktree(r), &config, &launcher(), |_| {
+            panic!("lock is busy")
+        })
     }
 
     /// TOML array printing its arguments joined by spaces, using what every CI runner has.
@@ -526,14 +511,6 @@ mod tests {
             format!("['cmd', '/d', '/c', 'echo {text}']")
         } else {
             format!("['echo', '{text}']")
-        }
-    }
-
-    fn fail() -> String {
-        if cfg!(windows) {
-            "['cmd', '/d', '/c', 'echo boom 1>&2 & exit 3']".into()
-        } else {
-            "['sh', '-c', 'echo boom >&2; exit 3']".into()
         }
     }
 
@@ -668,7 +645,10 @@ mod tests {
     fn a_failure_keeps_what_was_created_and_points_to_down() {
         let r = repo();
         fs::write(r.main.join(".env"), "A=1\n").unwrap();
-        let extra = format!("[[command]]\nname = 'broken'\ncreate = {}\n", fail());
+        let extra = format!(
+            "[[command]]\nname = 'broken'\ncreate = {}\n",
+            serde_json::to_string(&fail(3, "boom")).unwrap()
+        );
         let err = run(&r, &config(&extra)).unwrap_err();
 
         let failed = err.downcast_ref::<Failed>().expect("typed failure");
@@ -750,7 +730,7 @@ mod tests {
         fs::write(r.main.join(".env"), "A=1\n").unwrap();
         let wt = Worktree::resolve(Some(r.main.as_os_str())).unwrap();
         let config = Config::parse(&config("")).unwrap();
-        let launcher = supervisor::tests::launcher();
+        let launcher = launcher();
         let err = format!(
             "{:#}",
             up(&r.store, &wt, &config, &launcher, |_| panic!()).unwrap_err()
@@ -809,10 +789,10 @@ mod tests {
         let r = repo();
         let text = format!(
             "version = 1\n[port.web]\nrange = [41000, 41999]\n{}",
-            service_config("web", &supervisor::tests::long_running("web-up"))
+            service_config("web", &long_running("web-up"))
         );
         let result = run(&r, &text);
-        let _reaper = supervisor::tests::reap_pod(&r.store, &pod::pod_id(&r.linked));
+        let _reaper = reap_pod(&r.store, &pod::pod_id(&r.linked));
         let report = result.unwrap();
         let kinds: Vec<(Kind, &str)> = report
             .items
@@ -866,7 +846,7 @@ mod tests {
             service_config("broken", &["bp-no-such-program".to_owned()])
         );
         let result = run(&r, &text);
-        let _reaper = supervisor::tests::reap_pod(&r.store, &pod::pod_id(&r.linked));
+        let _reaper = reap_pod(&r.store, &pod::pod_id(&r.linked));
         let err = result.unwrap_err();
         let failed = err.downcast_ref::<Failed>().expect("typed failure");
         let statuses: Vec<_> = failed.recorded.iter().map(|s| (s.kind, s.status)).collect();

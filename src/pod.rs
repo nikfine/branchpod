@@ -12,12 +12,12 @@ use sha2::{Digest, Sha256};
 
 use crate::ledger;
 
-pub const META_VERSION: u32 = 1;
+pub(crate) const META_VERSION: u32 = 1;
 const HOME_ENV: &str = "BRANCHPOD_HOME";
 
 /// Stable identifier: a readable slug of the directory name plus a hash of the full path.
 /// Used in labels (`bp.pod=<id>`), so it is limited to `[a-z0-9-]`.
-pub fn pod_id(worktree_root: &Path) -> String {
+pub(crate) fn pod_id(worktree_root: &Path) -> String {
     let slug: String = worktree_root
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -59,26 +59,26 @@ fn path_key(path: &Path) -> String {
     }
 }
 
-pub fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodMeta {
-    pub v: u32,
-    pub id: String,
-    pub worktree: PathBuf,
+pub(crate) struct PodMeta {
+    pub(crate) v: u32,
+    pub(crate) id: String,
+    pub(crate) worktree: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub main_checkout: Option<PathBuf>,
+    pub(crate) main_checkout: Option<PathBuf>,
 }
 
 /// The `bp` home: `$BRANCHPOD_HOME`, or the platform's local data directory.
-pub struct Store {
+pub(crate) struct Store {
     home: PathBuf,
 }
 
 impl Store {
-    pub fn open() -> Result<Store> {
+    pub(crate) fn open() -> Result<Store> {
         let home = match std::env::var_os(HOME_ENV) {
             Some(home) if !home.is_empty() => PathBuf::from(home),
             _ => directories::ProjectDirs::from("", "", "branchpod")
@@ -89,23 +89,24 @@ impl Store {
         Ok(Store { home })
     }
 
-    pub fn at(home: PathBuf) -> Store {
+    #[cfg(test)]
+    pub(crate) fn at(home: PathBuf) -> Store {
         Store { home }
     }
 
-    pub fn home(&self) -> &Path {
+    pub(crate) fn home(&self) -> &Path {
         &self.home
     }
 
-    pub fn pod_dir(&self, id: &str) -> PathBuf {
+    pub(crate) fn pod_dir(&self, id: &str) -> PathBuf {
         self.home.join("pods").join(id)
     }
 
-    pub fn ledger_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn ledger_path(&self, id: &str) -> PathBuf {
         self.pod_dir(id).join("ledger.jsonl")
     }
 
-    pub fn write_meta(&self, meta: &PodMeta) -> Result<()> {
+    pub(crate) fn write_meta(&self, meta: &PodMeta) -> Result<()> {
         let dir = self.pod_dir(&meta.id);
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
         let path = dir.join("pod.json");
@@ -113,7 +114,7 @@ impl Store {
             .with_context(|| format!("cannot write {}", path.display()))
     }
 
-    pub fn list(&self) -> Result<Vec<PodMeta>> {
+    pub(crate) fn list(&self) -> Result<Vec<PodMeta>> {
         let dir = self.home.join("pods");
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -135,14 +136,14 @@ impl Store {
 
     /// Finds a known pod by its worktree path. Works when the directory no longer exists, which
     /// is why it compares recorded paths instead of recomputing an id from a canonical path.
-    pub fn find_by_worktree(&self, path: &Path) -> Result<Option<PodMeta>> {
+    pub(crate) fn find_by_worktree(&self, path: &Path) -> Result<Option<PodMeta>> {
         Ok(self
             .list()?
             .into_iter()
             .find(|p| same_path(&p.worktree, path)))
     }
 
-    pub fn resources(&self, id: &str) -> Result<Vec<ledger::ResourceState>> {
+    pub(crate) fn resources(&self, id: &str) -> Result<Vec<ledger::ResourceState>> {
         Ok(ledger::state(&ledger::read(&self.ledger_path(id))?))
     }
 
@@ -150,7 +151,7 @@ impl Store {
     /// before `pod.json`: interrupted or failing before that, the pod is still listed with nothing
     /// to tear down, and the next `bp down` finishes the removal. The lock file is kept (see
     /// `podlock`).
-    pub fn remove_pod(&self, id: &str) -> Result<()> {
+    pub(crate) fn remove_pod(&self, id: &str) -> Result<()> {
         use crate::fsutil::retry;
 
         let checked = |path: &Path, result: std::io::Result<()>| match result {

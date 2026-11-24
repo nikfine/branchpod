@@ -28,48 +28,46 @@ const STDERR_TAIL_LINES: usize = 20;
 
 /// Ledger data of a command resource: everything teardown needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
+pub(crate) struct Record {
     /// The `create` command as it was run.
-    pub create: Vec<String>,
+    pub(crate) create: Vec<String>,
     /// Trimmed stdout of `create`, the value of `{{command.<name>.stdout}}`. Set once created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stdout: Option<String>,
+    pub(crate) stdout: Option<String>,
     /// The `destroy` command, fully rendered. Known at intent time unless it references this
     /// command's own output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destroy: Option<Vec<String>>,
+    pub(crate) destroy: Option<Vec<String>>,
     /// The `destroy` command as configured, kept while it cannot be rendered yet because the
     /// output it references was never captured (an interrupted or failed creation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destroy_unresolved: Option<Vec<String>>,
+    pub(crate) destroy_unresolved: Option<Vec<String>>,
 }
 
 /// A rendered command resource, ready to be created.
 #[derive(Debug)]
-pub struct Plan {
-    pub name: String,
+pub(crate) struct Plan {
+    pub(crate) name: String,
     /// Ledger data for the intent.
-    pub record: Record,
+    pub(crate) record: Record,
     cwd: PathBuf,
     vars: Vars,
 }
 
-/// Successful run of `create` or `destroy`.
+/// Successful run of `create` or `destroy`. Its stderr is not kept until there is a run log (#9).
 #[derive(Debug)]
-pub struct Output {
+pub(crate) struct Output {
     /// Ledger data (for `create`; the input record for `destroy`).
-    pub record: Record,
-    /// stderr of the command, decoded lossily, for the run log.
-    pub stderr: String,
+    pub(crate) record: Record,
 }
 
 /// A command ran and exited unsuccessfully. Kept as a typed error so that the run log can
 /// write the full stderr; the message quotes only its tail.
 #[derive(Debug)]
-pub struct Failed {
-    pub program: String,
-    pub status: ExitStatus,
-    pub stderr: String,
+pub(crate) struct Failed {
+    pub(crate) program: String,
+    pub(crate) status: ExitStatus,
+    pub(crate) stderr: String,
 }
 
 impl fmt::Display for Failed {
@@ -101,7 +99,7 @@ fn stderr_tail(stderr: &str) -> String {
 }
 
 /// The variable holding the captured output of command `name`.
-pub fn stdout_var(name: &str) -> String {
+pub(crate) fn stdout_var(name: &str) -> String {
     format!("command.{name}.stdout")
 }
 
@@ -110,7 +108,7 @@ pub fn stdout_var(name: &str) -> String {
 ///
 /// Empty output defines no variable, so a reference to it is an unknown name and fails when
 /// planning, instead of rendering an empty argument (`docker rm ""`, `bp-`).
-pub fn export(name: &str, record: &Record, vars: &mut Vars) {
+pub(crate) fn export(name: &str, record: &Record, vars: &mut Vars) {
     if let Some(stdout) = record.stdout.as_deref().filter(|s| !s.is_empty()) {
         vars.set(stdout_var(name), stdout);
     }
@@ -120,7 +118,7 @@ pub fn export(name: &str, record: &Record, vars: &mut Vars) {
 ///
 /// `destroy` is rendered now when it does not depend on this command's own output, so that an
 /// interrupted creation can still be undone from the ledger alone.
-pub fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
+pub(crate) fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
     plan_inner(spec, cwd, vars).with_context(|| format!("command {:?}", spec.name))
 }
 
@@ -169,7 +167,7 @@ fn plan_inner(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
 /// Runs `create` and returns the final record for the ledger. A non-zero exit is an error
 /// ([`Failed`]); so is output that is not UTF-8, or output that `destroy` depends on and that is
 /// empty or spans several lines (a warning printed next to the id would become part of it).
-pub fn create(plan: &Plan) -> Result<Output> {
+pub(crate) fn create(plan: &Plan) -> Result<Output> {
     create_inner(plan).with_context(|| format!("command {:?}: create", plan.name))
 }
 
@@ -202,10 +200,7 @@ fn create_inner(plan: &Plan) -> Result<Output> {
         record.destroy = Some(render_destroy(&vars, &argv)?);
     }
     record.stdout = Some(stdout);
-    Ok(Output {
-        record,
-        stderr: run.stderr,
-    })
+    Ok(Output { record })
 }
 
 /// Runs the recorded `destroy` in `cwd`: the worktree root while it exists, otherwise any
@@ -213,7 +208,7 @@ fn create_inner(plan: &Plan) -> Result<Output> {
 ///
 /// Fails when `destroy` depends on output that was never captured: the resource may exist and
 /// is left for `bp gc`.
-pub fn destroy(record: &Record, cwd: &Path) -> Result<Output> {
+pub(crate) fn destroy(record: &Record, cwd: &Path) -> Result<Output> {
     let Some(argv) = &record.destroy else {
         if let Some(argv) = &record.destroy_unresolved {
             bail!(
@@ -223,13 +218,11 @@ pub fn destroy(record: &Record, cwd: &Path) -> Result<Output> {
         }
         return Ok(Output {
             record: record.clone(),
-            stderr: String::new(),
         });
     };
-    let run = run(argv, cwd).context("destroy")?;
+    run(argv, cwd).context("destroy")?;
     Ok(Output {
         record: record.clone(),
-        stderr: run.stderr,
     })
 }
 
@@ -324,6 +317,7 @@ fn decode_stdout(bytes: Vec<u8>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fail;
     use std::fs;
 
     /// Prints the contents of `file` byte for byte, using only what every CI runner has.
@@ -333,17 +327,6 @@ mod tests {
             vec!["cmd".into(), "/d".into(), "/c".into(), "type".into(), file]
         } else {
             vec!["cat".into(), file]
-        }
-    }
-
-    /// Writes `message` to stderr and exits with `code`.
-    fn fail(code: i32, message: &str) -> Vec<String> {
-        if cfg!(windows) {
-            let script = format!("echo {message} 1>&2 & exit {code}");
-            vec!["cmd".into(), "/d".into(), "/c".into(), script]
-        } else {
-            let script = format!("echo {message} >&2; exit {code}");
-            vec!["sh".into(), "-c".into(), script]
         }
     }
 

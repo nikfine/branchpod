@@ -19,29 +19,27 @@ use crate::{commands, control, ports, proc, services};
 
 /// Outcome of tearing down one resource.
 #[derive(Debug)]
-pub struct Step {
-    pub kind: Kind,
-    pub name: String,
-    /// Status before teardown.
-    pub was: Status,
+pub(crate) struct Step {
+    pub(crate) kind: Kind,
+    pub(crate) name: String,
     /// `None` when the resource is gone.
-    pub error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug)]
-pub struct Report {
-    pub steps: Vec<Step>,
+pub(crate) struct Report {
+    pub(crate) steps: Vec<Step>,
     /// Every resource is gone, but the pod's own state could not be removed.
-    pub state_error: Option<String>,
+    pub(crate) state_error: Option<String>,
 }
 
 impl Report {
     /// Nothing recorded for the pod is left.
-    pub fn is_clean(&self) -> bool {
+    pub(crate) fn is_clean(&self) -> bool {
         self.state_error.is_none() && self.steps.iter().all(|s| s.error.is_none())
     }
 
-    pub fn leftovers(&self) -> impl Iterator<Item = &Step> {
+    pub(crate) fn leftovers(&self) -> impl Iterator<Item = &Step> {
         self.steps.iter().filter(|s| s.error.is_some())
     }
 }
@@ -50,7 +48,7 @@ impl Report {
 ///
 /// Fails only when teardown cannot start (the ledger cannot be read or opened); everything
 /// after that is collected in the report.
-pub fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
+pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
     let resources = store.resources(&meta.id)?;
     let todo = order(&resources);
     // Services are stopped through the supervisor that runs them.
@@ -81,7 +79,6 @@ pub fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
             steps.push(Step {
                 kind: r.kind,
                 name: r.name.clone(),
-                was: r.status,
                 error,
             });
         }
@@ -144,7 +141,6 @@ fn destroy(
             .map(drop),
         Kind::Command => {
             let record: commands::Record = data(r)?;
-            // stderr of a successful destroy belongs in the run log (not written yet).
             commands::destroy(&record, &command_cwd(store, meta)?)
                 .map(drop)
                 .with_context(|| format!("command {:?}", r.name))
@@ -225,6 +221,7 @@ mod tests {
 
     use super::*;
     use crate::pod::{self, META_VERSION};
+    use crate::test_support::{Reaper, fail, launcher, long_running};
 
     struct Setup {
         _tmp: tempfile::TempDir,
@@ -280,14 +277,6 @@ mod tests {
             vec!["cmd".into(), "/d".into(), "/c".into(), "del".into(), file]
         } else {
             vec!["rm".into(), file]
-        }
-    }
-
-    fn failing() -> Vec<String> {
-        if cfg!(windows) {
-            vec!["cmd".into(), "/d".into(), "/c".into(), "exit 3".into()]
-        } else {
-            vec!["sh".into(), "-c".into(), "exit 3".into()]
         }
     }
 
@@ -347,7 +336,7 @@ mod tests {
         s.live(
             Kind::Command,
             "app",
-            json!({ "create": ["x"], "destroy": failing() }),
+            json!({ "create": ["x"], "destroy": fail(3, "boom") }),
         );
         s.live(Kind::Service, "vite", json!({ "pid": 1 }));
         s.live(Kind::Port, "web", Value::Null);
@@ -365,7 +354,7 @@ mod tests {
         assert_eq!(status("conf").status, Status::Destroyed);
         assert_eq!(status("web").status, Status::Destroyed);
         assert_eq!(status("app").status, Status::Failed);
-        assert_eq!(status("app").data["destroy"], json!(failing()));
+        assert_eq!(status("app").data["destroy"], json!(fail(3, "boom")));
         assert!(s.store.pod_dir(&s.meta.id).join("pod.json").exists());
 
         // The next run visits only what is left.
@@ -421,25 +410,19 @@ mod tests {
     }
 
     /// Starts a supervisor running one long service; records both as `bp up` would.
-    fn supervised(
-        s: &Setup,
-    ) -> (
-        supervisor::Record,
-        services::Record,
-        supervisor::tests::Reaper,
-    ) {
+    fn supervised(s: &Setup) -> (supervisor::Record, services::Record, Reaper) {
         let endpoint = control::new_endpoint(&s.meta.id).unwrap();
-        let process = supervisor::tests::launcher()
+        let process = launcher()
             .launch(&endpoint, &s.tmp, &s.tmp.join("supervisor.log"))
             .unwrap();
-        let mut reaper = supervisor::tests::Reaper(vec![process]);
+        let mut reaper = Reaper(vec![process]);
         let sup = supervisor::Record {
             endpoint,
             process: Some(process),
         };
         let start = supervisor::Start {
             name: "web".into(),
-            run: supervisor::tests::long_running("web"),
+            run: long_running("web"),
             cwd: s.meta.worktree.clone(),
             env: Default::default(),
             log: s.tmp.join("web.log"),

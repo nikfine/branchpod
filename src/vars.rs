@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, Default)]
-pub struct Vars {
+pub(crate) struct Vars {
     values: BTreeMap<String, String>,
     /// Known names without a value here, with the reason (`branch` on a detached HEAD). A
     /// reference to one is still an error, but one that says why.
@@ -20,36 +20,36 @@ pub struct Vars {
 }
 
 impl Vars {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
+    pub(crate) fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
         self.unavailable.remove(&name);
         self.values.insert(name, value.into());
     }
 
     /// Declares `name` as known but without a value, so that a reference to it explains `reason`.
-    pub fn set_unavailable(&mut self, name: impl Into<String>, reason: impl Into<String>) {
+    pub(crate) fn set_unavailable(&mut self, name: impl Into<String>, reason: impl Into<String>) {
         let name = name.into();
         self.values.remove(&name);
         self.unavailable.insert(name, reason.into());
     }
 
-    pub fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)
     }
 
     /// Replaces every `{{ name }}` (surrounding spaces allowed) with its value. Errors quote the
     /// input, so this is meant for short strings such as arguments.
-    pub fn render(&self, input: &str) -> Result<String> {
+    pub(crate) fn render(&self, input: &str) -> Result<String> {
         self.render_inner(input)
             .map_err(|(_, problem)| anyhow!("{problem} in {input:?}"))
     }
 
     /// Like [`Vars::render`] for the contents of a file: errors name the line, not the text.
-    pub fn render_text(&self, input: &str) -> Result<String> {
+    pub(crate) fn render_text(&self, input: &str) -> Result<String> {
         self.render_inner(input).map_err(|(offset, problem)| {
             let line = input[..offset].matches('\n').count() + 1;
             anyhow!("line {line}: {problem}")
@@ -82,7 +82,7 @@ impl Vars {
         }
     }
 
-    pub fn render_all(&self, items: &[String]) -> Result<Vec<String>> {
+    pub(crate) fn render_all(&self, items: &[String]) -> Result<Vec<String>> {
         items.iter().map(|item| self.render(item)).collect()
     }
 }
@@ -90,7 +90,7 @@ impl Vars {
 /// Whether `input` references the variable `name`. Parsed exactly as rendering does, so an
 /// escaped `{{{{name}}` is not a reference. Malformed references are ignored here; rendering
 /// reports them.
-pub fn references(input: &str, name: &str) -> bool {
+pub(crate) fn references(input: &str, name: &str) -> bool {
     Pieces::new(input)
         .map_while(Result::ok)
         .any(|piece| matches!(piece, Piece::Var { name: n, .. } if n == name))
