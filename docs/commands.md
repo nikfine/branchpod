@@ -16,6 +16,9 @@ A usage error exits with `2`.
 `no pod for ...` when it found none: the path is wrong, `BRANCHPOD_HOME` is another one, the worktree was moved, or
 the pod is already gone.
 
+**`down` keeps edited files.** A copied or rendered file that is not as `up` made it is shown as `saved` instead of
+`destroyed`, and its new path is printed on stderr (`kept as ...`). That alone does not change the exit code.
+
 When `up` fails before creating anything, there is nothing to clean up. When it fails midway, what was created
 stays, and the message lists it with the `down` command to run.
 
@@ -34,3 +37,7 @@ What was created, command output and service logs are kept outside the worktree,
 
 Every command must see the same one. Arguments of commands and services are recorded there as they were run, so do
 not pass secrets in them.
+
+Edited files that `down` kept are in `saved/<pod id>/<time>/`, where `<time>` is in milliseconds since 1970, under
+the path they had in the worktree. `down` never removes them: do it yourself once you do not need them, and mind that
+they may hold secrets.

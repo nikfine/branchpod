@@ -59,12 +59,9 @@ worktree. A tool that saves by replacing the file turns the link into a regular 
 with code 3 and leaves it: move the edits to the main checkout, delete the file and run `down` again.
 
 **Edits to a copy stay out of the main checkout.** A copied file that has changed since `up` is not deleted:
-`down` moves it to `saved/<pod id>/<time>/` in the `bp` home (`BRANCHPOD_HOME`, by default
-`%LOCALAPPDATA%\branchpod\data` on Windows, `~/.local/share/branchpod` on Linux and
-`~/Library/Application Support/branchpod` on macOS), prints the path and exits with 0. Nothing takes it from
-there: make lasting changes, such as permissions an agent should keep, in the main checkout. Remove what you
-do not need from `saved` yourself, and mind that such files may hold secrets. Files inside a copied
-**directory** are not checked and go with it.
+`down` moves it to `saved` in the [state directory](docs/commands.md#state), prints the path and exits with 0.
+Nothing takes it from there: make lasting changes, such as permissions an agent should keep, in the main checkout.
+Files inside a copied **directory** are not checked and go with it.
 
 ### Around a session
 

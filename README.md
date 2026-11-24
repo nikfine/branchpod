@@ -37,7 +37,7 @@ service = [{ name = "web", run = ["your-dev-server", "--port", "{{port.web}}"] }
 
 - This is an early version (0.x): the config format, the state on disk and the output may still change.
 - Run `down` before a worktree is removed, moved or its path is used again, and look for `clean` in its output.
-- `down` deletes a copied or rendered file even if it was edited since, without a warning.
+- `down` moves an edited copy of a file out of the worktree and prints where; copied directories are deleted.
 - `up` does not wait until a service is ready. All [limitations](docs/limitations.md).
 
 ## Documentation

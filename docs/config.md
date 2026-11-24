@@ -157,10 +157,14 @@ With any rule other than `ignore`, `up` refuses to run in the main checkout, as 
 there.
 
 **Teardown** removes the destination if it is still a file, directory or link as created, and leaves it in place
-(exit code 3) otherwise, as it does with what is in use on Windows. Contents are not compared: an edited copy is
-deleted, and a copied directory goes with all that was put into it. A file that **you** put at a recorded path, in a
-new worktree at the same place, is deleted as well: run `down` before a path is used again. A link is removed as a
-link, never what it points to. Created parent directories are removed if they are empty.
+(exit code 3) otherwise, as it does with what is in use on Windows. A link is removed as a link, never what it points
+to. Created parent directories are removed if they are empty.
+
+A copied or rendered **file** whose content has changed is not deleted but moved to
+[`saved`](commands.md#state), and the path is printed. If it cannot be moved it stays (exit code 3): to give it up,
+delete it. A copied **directory** is not compared and goes with all that was changed in it or put into it. Teardown
+takes what **you** put at a recorded path, in a new worktree at the same place, for its own: it deletes a directory,
+and a file with the same content. Run `down` before a path is used again.
 
 ### `[[command]]`
 
@@ -323,7 +327,7 @@ does not stop the others.
 | `output is not valid UTF-8` | Output of a command without `output = "file"`. |
 | `no free port` | Every port of the range is taken. |
 | `program not found` | Not on `PATH`, or a Windows script without its extension. |
-| `already has resources recorded` | The pod is up, or an earlier `up` failed: run `down` first. If the worktree is a new one at a path used before, `down` deletes the files at the recorded paths, even those that are yours: move them away first. |
+| `already has resources recorded` | The pod is up, or an earlier `up` failed: run `down` first. If the worktree is a new one at a path used before, `down` takes what is at the recorded paths for its own, even if it is yours: it deletes directories and moves changed files to `saved`. Move them away first. |
 | `looks like an unexpanded variable` | The caller passed `%NAME%` or `$NAME` as the path. |
 
 All of them exit with code 1. The other codes are in the [command reference](commands.md).
