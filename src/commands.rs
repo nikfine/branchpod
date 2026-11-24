@@ -122,12 +122,21 @@ pub(crate) fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> 
     plan_inner(spec, cwd, vars).with_context(|| format!("command {:?}", spec.name))
 }
 
-/// A rendered `destroy` argument with a line break carries more than an id: most likely a
-/// warning printed next to it by an earlier command. Teardown must not run with it.
+/// A `destroy` argument with a line break carries more than an id: most likely a warning printed
+/// next to it by an earlier command. Teardown must not run with it. The values are checked before
+/// filters: `json` would turn the line break into `\n` and hide it.
 fn render_destroy(vars: &Vars, argv: &[String]) -> Result<Vec<String>> {
+    let several_lines = |text: &str| text.contains(['\n', '\r']);
     let rendered = vars.render_all(argv).context("destroy")?;
-    if let Some(arg) = rendered.iter().find(|arg| arg.contains(['\n', '\r'])) {
-        bail!("destroy: argument {arg:?} spans several lines; teardown needs a single-line value");
+    for (configured, arg) in argv.iter().zip(&rendered) {
+        let in_value = vars::names(configured)
+            .filter_map(|name| vars.get(name))
+            .any(several_lines);
+        if in_value || several_lines(arg) {
+            bail!(
+                "destroy: argument {arg:?} spans several lines; teardown needs a single-line value"
+            );
+        }
     }
     Ok(rendered)
 }
@@ -197,7 +206,9 @@ fn create_inner(plan: &Plan) -> Result<Output> {
         }
         let mut vars = plan.vars.clone();
         vars.set(stdout_var(&plan.name), stdout.as_str());
-        record.destroy = Some(render_destroy(&vars, &argv)?);
+        let destroy = render_destroy(&vars, &argv)
+            .with_context(|| format!("{MAY_EXIST}{}", stderr_tail(&run.stderr)))?;
+        record.destroy = Some(destroy);
     }
     record.stdout = Some(stdout);
     Ok(Output { record })
@@ -472,6 +483,65 @@ mod tests {
         let plan = plan(&spec("app", cat(&out), Some(destroy)), dir.path(), &vars()).unwrap();
         let err = format!("{:#}", create(&plan).unwrap_err());
         assert!(err.contains("several lines"), "{err}");
+    }
+
+    #[test]
+    fn filters_do_not_hide_several_lines_from_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let destroy = strings(&["docker", "rm", "{{command.app.stdout | json}}"]);
+        for output in ["abc123\r\nWARNING: something\r\n", "abc123\rWARNING\n"] {
+            // Its own output: rendered after `create`.
+            let out = dir.path().join("out.txt");
+            fs::write(&out, output).unwrap();
+            let own = spec("app", cat(&out), Some(destroy.clone()));
+            let err = create(&plan(&own, dir.path(), &vars()).unwrap()).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("several lines") && err.contains("may have been created"),
+                "{err}"
+            );
+
+            // Another command's output: rendered when planning.
+            let mut later = vars();
+            later.set("command.app.stdout", output.trim());
+            let other = spec("net", strings(&["x"]), Some(destroy.clone()));
+            let err = format!("{:#}", plan(&other, dir.path(), &later).unwrap_err());
+            assert!(err.contains("several lines"), "{err}");
+        }
+    }
+
+    #[test]
+    fn filtered_own_output_is_recognized() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = strings(&["echo", "{{command.app.stdout | json}}"]);
+        let err = plan(&spec("app", own, None), dir.path(), &vars()).unwrap_err();
+        assert!(format!("{err:#}").contains("its own output"), "{err:#}");
+
+        let out = dir.path().join("out.txt");
+        fs::write(&out, "a\"b\\c\n").unwrap();
+        let destroy = strings(&["rm", "{{ command.app.stdout | json }}"]);
+        let plan = plan(&spec("app", cat(&out), Some(destroy)), dir.path(), &vars()).unwrap();
+        assert!(plan.record.destroy_unresolved.is_some());
+        assert_eq!(
+            create(&plan).unwrap().record.destroy.unwrap(),
+            strings(&["rm", r#"a\"b\\c"#])
+        );
+    }
+
+    /// Only the real output shows that a filter rejects it: the resource exists by then.
+    #[cfg(windows)]
+    #[test]
+    fn output_rejected_by_a_filter_says_the_resource_may_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        fs::write(&out, "\\\\?\\C:\\x\n").unwrap();
+        let destroy = strings(&["rm", "{{command.app.stdout | slash}}"]);
+        let plan = plan(&spec("app", cat(&out), Some(destroy)), dir.path(), &vars()).unwrap();
+        let err = format!("{:#}", create(&plan).unwrap_err());
+        assert!(
+            err.contains("may have been created") && err.contains("`slash`"),
+            "{err}"
+        );
     }
 
     #[test]

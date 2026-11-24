@@ -179,7 +179,8 @@ Rules for file resources:
   rule that matches nothing is an error (drift in the source is noticed). Files that legitimately contain
   `{{ }}` (Blade, Vue) set `vars = false` and keep only `replace`; the `with` side is always substituted.
   A few literal brackets can stay in template mode written as `{{{{` (see "Literal `{{`"). `find` is
-  literal and matches the rendered text, so an escaped `{{{{` is matched as `{{`.
+  literal and matches the rendered text, so an escaped `{{{{` is matched as `{{`. Filters work wherever
+  variables do, so in `with` also when `vars = false`.
 
 ## Command resources
 
@@ -195,7 +196,8 @@ Rules for file resources:
 - Teardown must never run with an empty or garbled id. Empty output defines no variable, so any
   reference to it is an unknown name and fails when planning. A rendered `destroy` argument must be a
   single line, whichever command's output it comes from: a warning printed next to an id would otherwise
-  become part of it. Output that no `destroy` depends on is kept whole.
+  become part of it. The values it uses must be single lines before filters too, since `json` would turn a
+  line break into `\n`. Output that no `destroy` depends on is kept whole.
 - A program given as a relative path with a directory part (`./scripts/up.sh`) is resolved against the
   command's working directory on every platform; Windows would otherwise resolve it against `bp`'s own.
   A bare name is searched on `PATH`.
@@ -319,6 +321,16 @@ the Orca plugin catalog).
   (`toml_edit`) needed by future `bp init` / `bp config set`. The schema has a required `version`.
 - **Variables** are written `{{name}}` (`port.<name>`, `command.<name>.stdout`, `pod.id`, ...). An unknown
   name is an error, never an empty string.
+- **Filters** are written `{{name | filter}}`: left to right, without arguments, each from string to string.
+  The variable is checked first; an unknown or empty filter (`{{a || b}}`) is an error.
+  - `json` escapes a value for use inside a JSON string (`"`, `\` and U+0000 to U+001F, RFC 8259). It adds
+    **no quotes**, so that the value can be a part of one: `"{{worktree | json}}/src"`.
+  - `slash` writes a Windows path with `/`: `C:/work/feature-x`, `//server/share`. On Windows a value with a
+    `\\?\` path is an error, since `/` is not a separator there. On Unix it changes nothing: `\` is an
+    ordinary character of a file name. Combined, `slash` comes first: `{{worktree | slash | json}}`.
+  - Text of another tool that happens to be a valid reference, such as `{{ branch | json }}`, used to be an
+    error and is now rendered: write `{{{{ branch | json }}`, or set `vars = false` for the file.
+  - Rejected: a variable per spelling (`worktree.slash`), which multiplies with every path.
 - **Literal `{{`** is written `{{{{`, in command arguments and templates alike, for tools that use the same
   brackets (Go templates in `docker` / `podman --format`, `kubectl -o go-template`, Helm):
   `["docker", "inspect", "-f", "{{{{.Config.Image}}", "app"]` passes `{{.Config.Image}}`. Input is read

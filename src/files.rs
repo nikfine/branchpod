@@ -1090,6 +1090,45 @@ mod tests {
     }
 
     #[test]
+    fn template_filters_apply_in_the_source_and_in_with() {
+        let t = tree();
+        let mut v = vars();
+        v.set("q", r#"C:\x "y""#);
+        let render = |s: &FileSpec| {
+            let plan = plan(s, &t.main, &t.wt, &v).unwrap().unwrap();
+            create(&plan).unwrap();
+            fs::read_to_string(t.wt.join(&s.path)).unwrap()
+        };
+        let rule = |find: &str, with: &str| Replace {
+            find: find.into(),
+            with: with.into(),
+        };
+
+        write(
+            &t.main.join("mcp.json"),
+            r#"{"a":"{{q | json}}","b":"OLD"}"#,
+        );
+        let mut s = template("mcp.json");
+        s.replace = vec![rule("OLD", "{{q | json}}/src")];
+        let parsed: serde_json::Value = serde_json::from_str(&render(&s)).unwrap();
+        assert_eq!(parsed["a"], r#"C:\x "y""#);
+        assert_eq!(parsed["b"], r#"C:\x "y"/src"#);
+
+        // Without `vars` the source is left alone; `with` is still rendered. `find` is literal.
+        write(
+            &t.main.join("view.html"),
+            "{{ q | json }} OLD {{q | slash}}",
+        );
+        let mut s = template("view.html");
+        s.vars = false;
+        s.replace = vec![
+            rule("OLD", "{{q | json}}/src"),
+            rule("{{q | slash}}", "{{port.web | json}}"),
+        ];
+        assert_eq!(render(&s), r#"{{ q | json }} C:\\x \"y\"/src 8003"#);
+    }
+
+    #[test]
     fn template_errors_are_found_before_anything_is_written() {
         let t = tree();
         write(&t.main.join("a.conf"), "x={{port.vite}}\n");
