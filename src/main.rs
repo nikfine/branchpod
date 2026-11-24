@@ -38,6 +38,9 @@ enum Cmd {
     },
     /// Tear down everything recorded for a worktree's pod, in reverse order.
     ///
+    /// A copied file that was edited since `bp up` is moved to `saved` in the `bp` home instead of being
+    /// deleted, and its new path is printed.
+    ///
     /// Works when the worktree is already gone. Exits with 0 when nothing is left, 3 when some
     /// resources are left behind (run it again once their cause is fixed), 1 when teardown could
     /// not run.

@@ -48,10 +48,18 @@ fn write_through(
         return Err(e);
     }
 
+    sync_parent(dst)
+}
+
+/// Makes a rename to `path` survive a crash: on Unix its directory is flushed, on Windows there is
+/// nothing to do.
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    if let Some(dir) = dst.parent() {
+    if let Some(dir) = path.parent() {
         File::open(dir)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

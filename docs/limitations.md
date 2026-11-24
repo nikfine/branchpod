@@ -3,15 +3,18 @@
 ## Tearing down
 
 - **Run `down` before a path is used again**, also for a worktree that was removed without it. Otherwise `up` of the
-  new worktree refuses with `already has resources recorded`, and the `down` it asks for deletes the files at the
-  recorded paths, even if they are not the ones `branchpod` made. Move them away first.
+  new worktree refuses with `already has resources recorded`, and the `down` it asks for takes what is at the
+  recorded paths for its own, even if it is yours: it deletes directories, and moves files with other contents to
+  `saved`, see [State](commands.md#state). Move them away first.
 - **Run `down` before `git worktree move`.** A pod is found by the recorded path: at the new path there is `no pod`,
   and files that moved along are not removed.
 - **Only `clean` shows that a pod was torn down.** `down` also exits with `0` when it finds no pod, see
   [Commands](commands.md).
-- **`down` deletes a copied or rendered file even if it was edited since**, without a warning
-  ([#67](https://github.com/nikfine/branchpod/issues/67)). Keep lasting changes in the main checkout.
-- **Directories.** A copied directory is removed with everything that was put into it later. A linked one *is* the
+- **`down` moves an edited copy to `saved`** in the [state directory](commands.md#state) and prints the path. Nothing
+  brings it back to the main checkout or cleans `saved` up. Keep lasting changes in the main checkout. A file that
+  was cloned copy-on-write (`reflink`) is compared by size and modification time only.
+- **Directories.** A copied directory is removed with everything that was changed in it or put into it later: list a
+  file that matters in a rule of its own. A linked one *is* the
   directory of the main checkout: what is written there shows up in every worktree. On Windows a copied directory or
   file that is in use cannot be removed: `down` leaves it, exits with `3` and can be run again.
 - **Only what `destroy` can undo is undone.** If it fails, or needs output that was never captured, `down` keeps

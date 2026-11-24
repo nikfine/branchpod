@@ -49,7 +49,7 @@ Lessons from running it on Windows, which the new tool must handle by design:
 | Kind | Create | Destroy | Example |
 |---|---|---|---|
 | `git` | `git worktree add` (optional thin wrapper) | unlink links, then `git worktree remove`, `prune` | the worktree |
-| `file` | copy / reflink / link / template | delete; links removed **as links** | `.env`, `node_modules` |
+| `file` | copy / reflink / link / template | delete, edited copies kept; links removed **as links** | `.env`, `node_modules` |
 | `port` | allocate from a range, verify by binding | release in the registry | web, dev server |
 | `command` | `create` command, stdout captured into a variable or a file | `destroy` with those variables, `gc` query | container, volume, sync session |
 | `service` | long-running process under the supervisor | the whole process tree dies | dev server |
@@ -266,7 +266,8 @@ Rules for file resources:
   undone from the ledger alone.
 - Teardown removes a path only while it is still what was created (file, directory, link) and is reached
   without passing through a link; otherwise it is left in place and reported. A copied directory is removed
-  with whatever was written into it; parent directories created for it are removed while empty.
+  with whatever was written into it; parent directories created for it are removed while empty. A single file
+  whose content changed is kept, see "Edited copies".
 - `link`: symlink on Unix; on Windows a junction for directories (no privileges needed) and a symlink for
   files. Without the right to create a file symlink (Developer Mode or admin) it is an error with a hint,
   not a silent copy: a copy would quietly stop propagating edits. Hard links are rejected (editors that
@@ -277,6 +278,48 @@ Rules for file resources:
   A few literal brackets can stay in template mode written as `{{{{` (see "Literal `{{`"). `find` is
   literal and matches the rendered text, so an escaped `{{{{` is matched as `{{`. Filters work wherever
   variables do, so in `with` also when `vars = false`.
+
+### Edited copies
+
+A file that `copy`, `reflink` or `template` made and somebody changed since is not deleted by `bp down`: it is
+moved to `saved/<pod id>/<time of the teardown, Unix ms>/<path in the worktree>` in the `bp` home, the step is
+shown as `saved`, its new path printed on stderr, and the exit code stays `0`.
+
+- **Why not leave it in place with exit code `3`.** Teardown is run by hooks and agents, and tools edit their
+  settings file in nearly every session. `3` would then be the normal outcome and a switch that discards the
+  edits would end up in every hook. Nor would it protect the file: `git worktree remove` deletes ignored files
+  without asking. Deleting the file and saying so loses the edit.
+- Edits are never carried back to the main checkout.
+- **What counts as changed** is the content: size and SHA-256 of what was written, taken while it is written
+  (for a template, when it is rendered). Permissions, attributes and times do not count; other line endings
+  do. A file that was really cloned copy-on-write is told by its size and modification time instead, as reading
+  it would cost what cloning saved: one that was only touched is kept needlessly, and an edit that keeps both
+  is missed.
+- **Directories are not checked**: caches and logs written into one would make nearly every directory count as
+  changed, and telling which file was edited would take a record of every file in the ledger. List a file
+  that matters in a rule of its own.
+- **Keeping.** The new path is recorded in the ledger (`moved`) before the file is moved. On the same volume
+  that is a rename. Otherwise the file is copied under another name, flushed, renamed, and the original
+  removed unless it was written to meanwhile. Nothing in `saved` is ever overwritten.
+- **Telling.** The path is printed as soon as the file is kept and before the ledger counts it as destroyed, so
+  a run that is killed is made up for by the next one. The run that leaves nothing behind prints once more
+  what earlier runs of this teardown kept: their output may have been lost.
+- If the file cannot be kept (a full disk, a file in use), it stays and the exit code is `3`; a later `down`
+  tries again. To give the edit up, delete the file.
+- An unchanged file is looked at again (size, modification time) right before each attempt to remove it. What
+  is left is the moment in between.
+- A template whose `up` was interrupted while writing it differs from what was to be written, so it is kept, too.
+- A record without a fingerprint (from an older `bp`, or a copy that was interrupted) is removed as before,
+  whatever its content. An older `bp` ignores the fingerprint and deletes edited copies.
+- **Secrets.** Contents are never printed. The fingerprint stays in the ledger and is left out of `bp status
+  --json`: the hash of a short secret gives it away. (A `bp` from before the fingerprint prints all of a
+  newer record, hash included.) The ledger has mode 0600 on Unix, for the same reason. The directories in
+  `saved` have mode 0700 on Unix and inherit the permissions of the `bp` home on Windows. A file moved
+  within a volume keeps its own permissions, on Windows also those it inherited in the worktree (tried on
+  NTFS); a copy from another volume gets the mode of the file on Unix and the permissions of `saved` on
+  Windows.
+- `down` never cleans `saved` up, not even by age: that would be the loss of the edits put off. It is a task
+  for `gc` (#20).
 
 ## Command resources
 

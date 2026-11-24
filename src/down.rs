@@ -4,9 +4,10 @@
 //! after the config changed. Every resource that is not destroyed is visited, pending and failed
 //! ones included (they may exist partially). Each step is idempotent and its outcome is recorded;
 //! a failure does not stop the others, and what is left is reported at the end. Once nothing is
-//! left, the pod's state is removed as well.
+//! left, the pod's state is removed as well. Copies edited in the worktree are kept in the `bp`
+//! home instead of being deleted.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +16,7 @@ use serde::de::DeserializeOwned;
 use crate::files::{self, EntryType};
 use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
 use crate::pod::{PodMeta, Store};
+use crate::saved::Saved;
 use crate::supervisor::{self, Request};
 use crate::{commands, control, ports, proc, services};
 
@@ -26,6 +28,8 @@ const DYING_WAIT: Duration = Duration::from_secs(1);
 pub(crate) struct Step {
     pub(crate) kind: Kind,
     pub(crate) name: String,
+    /// Files only: an edited copy was kept.
+    pub(crate) kept: bool,
     /// `None` when the resource is gone.
     pub(crate) error: Option<String>,
 }
@@ -50,9 +54,17 @@ impl Report {
 
 /// Tears down pod `meta`. The caller holds the pod lock.
 ///
+/// `on_kept` gets the name of a file and each path where an edited copy of it was kept, before the
+/// file counts as destroyed: if teardown is killed, the next run tells again. The run that leaves
+/// nothing behind also tells what earlier ones kept, as their output may have been lost.
+///
 /// Fails only when teardown cannot start (the ledger cannot be read or opened); everything
 /// after that is collected in the report.
-pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
+pub(crate) fn teardown(
+    store: &Store,
+    meta: &PodMeta,
+    mut on_kept: impl FnMut(&str, &Path),
+) -> Result<Report> {
     let resources = store.resources(&meta.id)?;
     let todo = order(&resources);
     // Services are stopped through the supervisor that runs them.
@@ -60,14 +72,21 @@ pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
         .iter()
         .rfind(|r| r.kind == Kind::Supervisor)
         .and_then(|r| data::<supervisor::Record>(r).ok());
+    let saved = Saved::new(store.home(), &meta.id);
+    saved.discard_unfinished();
     let mut steps = Vec::new();
     if !todo.is_empty() {
         let mut ledger = Ledger::open(&store.ledger_path(&meta.id))?;
         for i in todo {
             let r = &resources[i];
-            let mut error = destroy(store, meta, r, supervisor.as_ref(), &mut ledger)
+            let supervisor = supervisor.as_ref();
+            let mut kept = Vec::new();
+            let mut error = destroy(store, meta, r, supervisor, &saved, &mut kept, &mut ledger)
                 .err()
                 .map(|e| format!("{e:#}"));
+            for path in &kept {
+                on_kept(&r.name, path);
+            }
             let event = match &error {
                 None => Event::Destroyed,
                 Some(e) => Event::Failed { error: e.clone() },
@@ -83,6 +102,7 @@ pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
             steps.push(Step {
                 kind: r.kind,
                 name: r.name.clone(),
+                kept: !kept.is_empty(),
                 error,
             });
         }
@@ -92,6 +112,15 @@ pub(crate) fn teardown(store: &Store, meta: &PodMeta) -> Result<Report> {
         state_error: None,
     };
     if report.is_clean() {
+        for r in &resources {
+            // The others have just been visited.
+            if r.kind == Kind::File && r.status == Status::Destroyed {
+                let record = data::<files::Record>(r);
+                for path in record.iter().flat_map(|f| files::kept_files(f, &saved)) {
+                    on_kept(&r.name, &path);
+                }
+            }
+        }
         report.state_error = store.remove_pod(&meta.id).err().map(|e| format!("{e:#}"));
     }
     Ok(report)
@@ -119,40 +148,43 @@ fn phase(r: &ResourceState) -> u8 {
     }
 }
 
+/// `kept` becomes where an edited copy was moved to instead of being deleted.
 fn destroy(
     store: &Store,
     meta: &PodMeta,
     r: &ResourceState,
     supervisor: Option<&supervisor::Record>,
+    saved: &Saved,
+    kept: &mut Vec<PathBuf>,
     ledger: &mut Ledger,
 ) -> Result<()> {
     match r.kind {
         Kind::Service => {
             let record: services::Record = data(r)?;
             stop_service(supervisor, &r.name, &record)
-                .with_context(|| format!("service {:?}", r.name))
+                .with_context(|| format!("service {:?}", r.name))?;
         }
-        Kind::Supervisor => stop_supervisor(&data(r)?),
+        Kind::Supervisor => stop_supervisor(&data(r)?)?,
         Kind::File => {
             let record: files::Record = data(r)?;
-            files::remove(&record, |moved| {
+            files::remove(&record, saved, kept, |moved| {
                 let data = serde_json::to_value(moved)?;
                 ledger.record(r.kind, &r.name, Event::Moved { data })
-            })
+            })?;
         }
-        Kind::Port => ports::Registry::new(store.home())
-            .release(&meta.id, &r.name)
-            .map(drop),
+        Kind::Port => {
+            ports::Registry::new(store.home()).release(&meta.id, &r.name)?;
+        }
         Kind::Command => {
             let record: commands::Record = data(r)?;
             commands::destroy(&record, &command_cwd(store, meta)?)
-                .map(drop)
-                .with_context(|| format!("command {:?}", r.name))
+                .with_context(|| format!("command {:?}", r.name))?;
         }
         Kind::Git => {
             bail!("teardown of {} resources is not supported yet", r.kind)
         }
     }
+    Ok(())
 }
 
 /// Asks the supervisor to stop the service. When it is gone, the service's process tree is
@@ -233,7 +265,6 @@ fn command_cwd(store: &Store, meta: &PodMeta) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
     use std::time::Duration;
 
     use serde_json::{Value, json};
@@ -273,6 +304,20 @@ mod tests {
     }
 
     impl Setup {
+        fn teardown(&self) -> Result<Report> {
+            teardown(&self.store, &self.meta, |_, _| ())
+        }
+
+        /// With the contents of the files it says were kept.
+        fn teardown_kept(&self) -> (Report, Vec<String>) {
+            let mut kept = Vec::new();
+            let report = teardown(&self.store, &self.meta, |name, path| {
+                assert_eq!(name, ".env");
+                kept.push(fs::read_to_string(path).unwrap());
+            });
+            (report.unwrap(), kept)
+        }
+
         fn record(&self, kind: Kind, name: &str, events: Vec<Event>) {
             let mut ledger = Ledger::open(&self.store.ledger_path(&self.meta.id)).unwrap();
             for e in events {
@@ -323,7 +368,7 @@ mod tests {
             json!({ "create": ["x"], "stdout": "abc", "destroy": delete(&marker) }),
         );
 
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert_eq!(
             report
@@ -360,7 +405,7 @@ mod tests {
         s.live(Kind::Service, "vite", json!({ "pid": 1 }));
         s.live(Kind::Port, "web", Value::Null);
 
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(!report.is_clean());
         let failed: Vec<&str> = report.leftovers().map(|s| s.name.as_str()).collect();
         assert_eq!(failed, ["vite", "app"]);
@@ -377,7 +422,7 @@ mod tests {
         assert!(s.store.pod_dir(&s.meta.id).join("pod.json").exists());
 
         // The next run visits only what is left.
-        let again = teardown(&s.store, &s.meta).unwrap();
+        let again = s.teardown().unwrap();
         let names: Vec<&str> = again.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["vite", "app"]);
     }
@@ -397,7 +442,7 @@ mod tests {
             ".env",
             file_record(&s.meta.worktree, ".env", "file"),
         );
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(!marker.exists());
         assert!(!s.store.pod_dir(&s.meta.id).exists());
@@ -413,9 +458,101 @@ mod tests {
         let mut moved = file_record(wt, "vendor", "dir");
         moved["trash"] = json!(trash);
         s.record(Kind::File, "vendor", vec![Event::Moved { data: moved }]);
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(!trash.exists());
+    }
+
+    /// An edited file in `s`, recorded as `bp up` would have with other content.
+    fn edited(s: &Setup) -> PathBuf {
+        let path = s.meta.worktree.join(".env");
+        fs::write(&path, "A=2").unwrap();
+        let mut data = file_record(&s.meta.worktree, ".env", "file");
+        data["fingerprint"] = json!({ "size": 3, "sha256": "00" });
+        s.live(Kind::File, ".env", data);
+        path
+    }
+
+    #[test]
+    fn an_edited_file_is_kept_and_the_pod_is_clean() {
+        let s = setup(true);
+        let path = edited(&s);
+        let (report, kept) = s.teardown_kept();
+        assert!(report.is_clean(), "{report:?}");
+        assert!(report.steps[0].kept);
+        assert_eq!(kept, ["A=2"]);
+        assert!(!path.exists());
+        assert!(!s.store.pod_dir(&s.meta.id).exists());
+    }
+
+    #[test]
+    fn an_edited_file_that_cannot_be_kept_is_left_until_it_can() {
+        let s = setup(true);
+        let path = edited(&s);
+        s.live(Kind::Port, "web", Value::Null);
+        let saved = s.store.home().join("saved");
+        fs::write(&saved, "in the way").unwrap();
+        for _ in 0..2 {
+            let (report, kept) = s.teardown_kept();
+            let left: Vec<&str> = report.leftovers().map(|s| s.name.as_str()).collect();
+            assert_eq!(left, [".env"]);
+            assert!(kept.is_empty());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "A=2");
+        }
+        fs::remove_file(&saved).unwrap();
+        let (report, kept) = s.teardown_kept();
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(kept, ["A=2"]);
+    }
+
+    /// Killed before anybody read its output, at any point: the run that finishes tells.
+    #[test]
+    fn a_kept_file_is_told_until_the_pod_is_gone() {
+        for destroyed in [false, true] {
+            let s = setup(true);
+            let pod = s.store.home().join("saved").join(&s.meta.id);
+            let target = pod.join("1").join(".env");
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, "A=2").unwrap();
+            fs::write(pod.join("unfinished"), "A").unwrap();
+            let mut data = file_record(&s.meta.worktree, ".env", "file");
+            s.live(Kind::File, ".env", data.clone());
+            data["saved"] = json!([target]);
+            s.record(Kind::File, ".env", vec![Event::Moved { data }]);
+            if destroyed {
+                s.record(Kind::File, ".env", vec![Event::Destroyed]);
+            }
+            // Not finished yet: only what the run itself deals with.
+            s.live(
+                Kind::Command,
+                "app",
+                json!({ "create": ["x"], "destroy": fail(3, "boom") }),
+            );
+            let (report, kept) = s.teardown_kept();
+            assert!(!report.is_clean());
+            assert_eq!(kept.len(), if destroyed { 0 } else { 1 });
+
+            s.record(Kind::Command, "app", vec![Event::Destroyed]);
+            let (report, kept) = s.teardown_kept();
+            assert!(report.is_clean(), "{report:?}");
+            assert_eq!(kept, ["A=2"]);
+            assert!(!pod.join("unfinished").exists());
+        }
+    }
+
+    /// A kept file is told before the ledger says that it is done.
+    #[test]
+    fn a_kept_file_is_told_before_it_counts_as_destroyed() {
+        let s = setup(true);
+        edited(&s);
+        let mut told = 0;
+        teardown(&s.store, &s.meta, |_, _| {
+            told += 1;
+            let state = s.store.resources(&s.meta.id).unwrap();
+            assert_eq!(state[0].status, Status::Live);
+        })
+        .unwrap();
+        assert_eq!(told, 1);
     }
 
     #[test]
@@ -436,7 +573,7 @@ mod tests {
             }
             s.record(Kind::Command, name, vec![Event::Intent { data }]);
         }
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert_eq!(report.steps.len(), 2);
         assert!(!marker.exists());
@@ -448,7 +585,7 @@ mod tests {
         let s = setup(true);
         s.live(Kind::Port, "web", Value::Null);
         s.record(Kind::Port, "web", vec![Event::Destroyed]);
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean() && report.steps.is_empty());
         assert!(!s.store.pod_dir(&s.meta.id).exists());
     }
@@ -495,7 +632,7 @@ mod tests {
     fn services_are_stopped_through_the_supervisor() {
         let s = setup(true);
         let (sup, web, _reaper) = supervised(&s);
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(!proc::is_running(web.process.unwrap()));
         assert!(!proc::is_running(sup.process.unwrap()));
@@ -517,7 +654,7 @@ mod tests {
             );
         }
 
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(proc::wait_gone(web_process, Duration::from_secs(5)));
     }
@@ -537,7 +674,7 @@ mod tests {
                 data: serde_json::to_value(&intent).unwrap(),
             }],
         );
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
     }
 
@@ -545,7 +682,7 @@ mod tests {
     fn unreadable_data_is_a_leftover_not_a_crash() {
         let s = setup(true);
         s.live(Kind::File, ".env", json!({ "nonsense": true }));
-        let report = teardown(&s.store, &s.meta).unwrap();
+        let report = s.teardown().unwrap();
         let err = report.steps[0].error.as_deref().unwrap();
         assert!(err.contains("unreadable ledger data"), "{err}");
     }
