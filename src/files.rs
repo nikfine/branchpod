@@ -616,8 +616,8 @@ fn remove_file(
 
     // Recorded by an earlier attempt that did not get to use it.
     let absent = |t: &&PathBuf| fs::symlink_metadata(t).is_err_and(|e| saved::is_absent(&e));
-    let recorded = record.saved.iter().filter(|t| saved.contains(t));
-    let target = match { recorded }.find(absent) {
+    let mut recorded = record.saved.iter().filter(|t| saved.contains(t));
+    let target = match recorded.find(absent) {
         Some(target) => target.clone(),
         None => {
             let target = saved.choose(path.strip_prefix(&record.root)?)?;
