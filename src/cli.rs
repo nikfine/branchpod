@@ -206,7 +206,8 @@ fn print_logs(
         );
     };
 
-    let log = services::log_path(&store.pod_dir(&meta.id), service);
+    let record = record_of(resource);
+    let log = services::recorded_log(record.as_ref(), &store.pod_dir(&meta.id), service);
     let mut out = console::Output::stdout();
     let cursor = match read::Snapshot::open(&log)? {
         Some(mut snapshot) => {
@@ -229,7 +230,7 @@ fn print_logs(
     if !follow {
         return Ok(out.finish()?);
     }
-    let started = process_of(resource);
+    let started = record.and_then(|r| r.process);
     let mut failure = None;
     if resource.status == Status::Pending && started.is_none() {
         eprintln!("bp: service {service} has not started yet; waiting");
@@ -267,10 +268,8 @@ fn find_service<'a>(resources: &'a [ResourceState], name: &str) -> Option<&'a Re
         .find(|r| r.kind == Kind::Service && r.name == name)
 }
 
-fn process_of(resource: &ResourceState) -> Option<ProcId> {
-    serde_json::from_value::<services::Record>(resource.data.clone())
-        .ok()?
-        .process
+fn record_of(resource: &ResourceState) -> Option<services::Record> {
+    serde_json::from_value(resource.data.clone()).ok()
 }
 
 /// What the followed service is doing now. `started` is its process when following began: with
@@ -294,7 +293,7 @@ fn service_state(
     let Some(resource) = find_service(&resources, service) else {
         return Ok(read::State::Gone);
     };
-    let process = process_of(resource);
+    let process = record_of(resource).and_then(|r| r.process);
     if started.is_some() && process != started {
         return Ok(read::State::Gone);
     }

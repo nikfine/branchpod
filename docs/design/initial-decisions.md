@@ -139,10 +139,9 @@ One supervisor process per worktree, no global daemon; control over a local sock
   (`supervisor`: endpoint, pid + start time); each service records its pid + start time. The start
   time is the OS's own token (Linux `/proc/<pid>/stat` field 22, macOS `proc_pidinfo`, Windows
   `GetProcessTimes`), not wall-clock time; a pid with another start time is another process.
-- **Services** are not restarted; one that exits keeps its status until it is stopped. Their stdout and
-  stderr go to `pods/<id>/logs/<service>.log` through an inherited handle, not through the supervisor,
-  so output keeps flowing if the supervisor dies. Rotation and `bp logs` are #17. The environment is
-  passed to the supervisor but not recorded (it may hold secrets).
+- **Services** are not restarted; one that exits keeps its status until it is stopped. Their output goes
+  to files through the supervisor, see "Service logs". The environment is passed to the supervisor but
+  not recorded (it may hold secrets).
 - **Stop.** `bp down` asks the supervisor to stop each service, then to shut down, and waits for it to
   exit (killing it after 10 s). A stopped service gets `SIGTERM` to its group and 10 s before `SIGKILL`
   (Unix); on Windows its job is terminated at once, and 10 s is the limit for all of it to be gone.
@@ -158,6 +157,38 @@ One supervisor process per worktree, no global daemon; control over a local sock
 - macOS: process group + kqueue (#16); if the supervisor is SIGKILLed, `gc` finishes the group.
 - Known limitation: while a supervisor runs, Windows keeps the `bp` executable in use, so replacing it
   in place (an upgrade) may fail until the pods with services are down.
+
+### Service logs
+
+- **Files.** `pods/<id>/logs/service-<name>.log` (recorded in the ledger) and the segments rotated away
+  from it, `service-<name>.log.<seq>`. Bytes as the service wrote them, never decoded; on Unix readable
+  by the owner only. The prefix keeps a service named `supervisor` away from `supervisor.log`. They are
+  removed with the pod's state by a clean `bp down`.
+- **Writing.** stdout and stderr of a service are one pipe, so their order is kept. A thread of the
+  supervisor moves it into the file. Before, the service inherited a handle to the file, so that output
+  kept flowing if the supervisor died; that was given up because such a file cannot be rotated on Windows.
+  With an append-only handle programs based on MSYS (Git Bash) write nothing at all (#72), and behind any
+  other handle truncation leaves the service writing at its old offset, after a gap of NUL bytes. Copying
+  and truncating also loses what is written in between.
+- **Rotation.** At 10 MB the live file is renamed to the next segment; two segments are kept. Constants, not
+  configuration. If it cannot be renamed (on Windows, somebody has it open without sharing deletion), it is
+  tried again after every further 1 MB; at 50 MB the live file is emptied, as the newest output is worth
+  more than the oldest. Output that cannot be written (a full disk) is dropped. Such problems are reported
+  in `supervisor.log`, at most once a minute per service.
+- **The price.** A service whose supervisor is gone fails at its next write (`SIGPIPE` / `EPIPE`), and
+  lives on while it writes nothing. On Windows it dies with the supervisor anyway; on Unix this is worse
+  than before until #15 and #16 tie services to the supervisor's life. Known limitation: a supervisor that
+  is stopped (not killed) blocks a service once the pipe is full. A program that writes to pipes
+  asynchronously can lose its last output when it exits abruptly, which it would not with a file
+  ([Node.js on POSIX](https://nodejs.org/api/process.html#a-note-on-process-io)).
+- **Stopping** does not wait for the end of the pipe, which a process that left the service's tree can hold
+  open: `stop` and `shutdown` give the last output 500 ms, once per request.
+- **`bp logs`** opens the files for a moment only and locks none of them, so a reader cannot affect the
+  service. With `-f` it ends with exit code `0` when the service is gone and its log read to the end, or
+  when the pod is torn down; a process left behind that still writes is mentioned, not waited for. A
+  service not started yet is waited for while `bp up` runs, told by the pod lock: it is probed with a
+  shared lock that is given up at once. A busy lock is not touched; in the moment a free one is held, a
+  starting `up` / `down` reports that it waits, and goes on.
 
 ### Services on Windows
 

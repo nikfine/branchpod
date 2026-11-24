@@ -9,6 +9,47 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+const WORKTREE_ENV: &str = "BP_TEST_LOGS_WORKTREE";
+
+/// `bp up` of the worktree in [`WORKTREE_ENV`]: this test binary re-running [`up_process`].
+fn up_command() -> Command {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "up_process",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    cmd
+}
+
+/// Not a test by itself. On Windows `bp up` refuses to run in the job of `cargo test`, which would
+/// kill the supervisor; here, where everything ends with the test run anyway, it runs in a job of
+/// our own that is only warned about.
+#[test]
+#[ignore = "a process of the tests here, which start it themselves"]
+fn up_process() {
+    let Some(worktree) = std::env::var_os(WORKTREE_ENV) else {
+        return;
+    };
+    #[cfg(windows)]
+    // SAFETY: plain calls; the handle is left to the system, which closes it when this process ends.
+    unsafe {
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        assert!(!job.is_null());
+        assert!(AssignProcessToJobObject(job, GetCurrentProcess()) != 0);
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_branchpod"))
+        .arg("up")
+        .arg(worktree)
+        .status()
+        .unwrap();
+    std::process::exit(status.code().unwrap());
+}
+
 struct Pod {
     _tmp: tempfile::TempDir,
     home: PathBuf,
@@ -52,6 +93,10 @@ impl Pod {
 
     /// A pod brought up for real, with the service `web`.
     fn up(run: &[&str]) -> Pod {
+        Pod::up_as("web", run)
+    }
+
+    fn up_as(service: &str, run: &[&str]) -> Pod {
         let pod = Pod::new();
         let git = Command::new("git")
             .arg("-C")
@@ -61,13 +106,26 @@ impl Pod {
         assert!(git.unwrap().success());
         let run: Vec<String> = run.iter().map(|arg| json!(arg).to_string()).collect();
         let config = format!(
-            "version = 1\n[[service]]\nname = \"web\"\nrun = [{}]\n",
+            "version = 1\n[[service]]\nname = \"{service}\"\nrun = [{}]\n",
             run.join(", ")
         );
         fs::write(pod.worktree.join("branchpod.toml"), config).unwrap();
-        let out = pod.bp(&["up".as_ref(), pod.worktree.as_os_str()]);
-        assert!(out.status.success(), "{}", text(&out.stderr));
+        pod.run_up();
         pod
+    }
+
+    /// Output goes to a file, not to a pipe, for the reasons given in `tests/job.rs` (#76).
+    fn run_up(&self) {
+        let path = self.home.with_file_name("up.log");
+        let log = fs::File::create(&path).unwrap();
+        let status = up_command()
+            .env(WORKTREE_ENV, &self.worktree)
+            .env("BRANCHPOD_HOME", &self.home)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{}", text(&fs::read(&path).unwrap()));
     }
 
     fn dir(&self) -> PathBuf {
@@ -114,6 +172,30 @@ impl Pod {
         let mut cmd = self.command(&["logs".as_ref()]);
         cmd.args(args).arg("web").arg(&self.worktree);
         cmd
+    }
+
+    /// Waits until the log of `service` contains `text`.
+    fn wait_for(&self, service: &str, text: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let args = ["logs".as_ref(), service.as_ref(), self.worktree.as_os_str()];
+            let out = String::from_utf8_lossy(&self.bp(&args).stdout).into_owned();
+            if out.contains(text) {
+                return out;
+            }
+            assert!(Instant::now() < deadline, "no {text:?} in {out:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The only file in the pods' log directories whose name is `name`.
+    fn log_file(&self, name: &str) -> String {
+        let pod = fs::read_dir(self.home.join("pods"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        text(&fs::read(pod.path().join("logs").join(name)).unwrap())
     }
 
     fn down(&self) -> Output {
@@ -327,6 +409,58 @@ fn killing_a_follower_leaves_the_service_running_and_down_ends_one() {
     stdout.read_to_string(&mut line).unwrap();
     assert_eq!(exit_code(&mut child), Some(0));
     assert!(!is_there(&pod.home.join("pods")));
+}
+
+/// stdout and stderr share a pipe, so a log has them in the order they were written.
+#[test]
+fn stdout_and_stderr_keep_their_order() {
+    let pod = Pod::up(&if cfg!(windows) {
+        vec![
+            "cmd",
+            "/d",
+            "/c",
+            "echo o1& echo e2 1>&2& echo o3& echo e4 1>&2& ping -n 300 127.0.0.1 > nul",
+        ]
+    } else {
+        vec![
+            "sh",
+            "-c",
+            "echo o1; echo e2 >&2; echo o3; echo e4 >&2; exec sleep 300",
+        ]
+    });
+    let out = pod.wait_for("web", "e4");
+    let words: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(words, ["o1", "e2", "o3", "e4"]);
+    assert!(pod.log_file("service-web.log").contains("o1"));
+}
+
+/// #73: its log is not the supervisor's own.
+#[test]
+fn a_service_named_supervisor_has_a_log_of_its_own() {
+    let pod = Pod::up_as("supervisor", &ticking());
+    pod.wait_for("supervisor", "tick");
+    assert!(pod.log_file("service-supervisor.log").contains("tick"));
+    assert!(!pod.log_file("supervisor.log").contains("tick"));
+}
+
+/// #72: MSYS programs cannot write to an append-only handle. Skipped without an MSYS `bash`.
+#[cfg(windows)]
+#[test]
+fn msys_programs_have_a_log() {
+    let exec_path = Command::new("git").arg("--exec-path").output().unwrap();
+    let exec_path = PathBuf::from(text(&exec_path.stdout).trim());
+    let Some(bash) = exec_path
+        .ancestors()
+        .map(|dir| dir.join("usr").join("bin").join("bash.exe"))
+        .find(|bash| bash.is_file())
+    else {
+        eprintln!("skipped: no bash next to git");
+        return;
+    };
+    let script = "echo from-bash; echo err-bash >&2; sleep 300";
+    let pod = Pod::up(&[bash.to_str().unwrap(), "-c", script]);
+    let out = pod.wait_for("web", "err-bash");
+    assert!(out.contains("from-bash"), "{out}");
 }
 
 /// Whether any pod is left.

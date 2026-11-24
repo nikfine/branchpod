@@ -12,10 +12,6 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "for the supervisor (#17), once #14 is in")
-)]
 pub(crate) mod pump;
 pub(crate) mod read;
 
