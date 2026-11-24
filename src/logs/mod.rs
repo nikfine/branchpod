@@ -5,13 +5,18 @@
 //! what the service wrote; nothing is decoded on the way to the file.
 //!
 //! [`read`] knows nothing about who writes the files: it opens them for a moment, takes no lock and
-//! so cannot disturb the service.
+//! so cannot disturb the service. [`pump`] is the writer.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the supervisor (#17), once #14 is in")
+)]
+pub(crate) mod pump;
 pub(crate) mod read;
 
 /// Path of segment `seq` of `log`.

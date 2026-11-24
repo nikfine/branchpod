@@ -135,6 +135,17 @@ pub(crate) fn is_transient(_: &io::Error) -> bool {
     false
 }
 
+/// Makes a file created with `options` readable and writable by its owner only. On Windows it
+/// inherits the protection of its directory.
+#[cfg(unix)]
+pub(crate) fn owner_only(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn owner_only(_: &mut fs::OpenOptions) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
