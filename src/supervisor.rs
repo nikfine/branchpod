@@ -28,7 +28,7 @@ use serde_json::Value;
 use crate::commands;
 use crate::control::{self, Conn, Server};
 use crate::logs::pump::Pump;
-use crate::proc::{self, ProcId, Tether, Tree};
+use crate::proc::{self, ProcId, Program, Tether, Tree};
 
 /// How long a stopped service gets to exit before it is killed.
 pub(crate) const GRACE: Duration = Duration::from_secs(10);
@@ -123,10 +123,10 @@ struct Ready {
     warning: Option<String>,
 }
 
-/// Builds the command that runs a supervisor for an endpoint: `bp supervise <endpoint>`, or the
+/// Builds the program that runs a supervisor for an endpoint: `bp supervise <endpoint>`, or the
 /// test binary re-running itself in tests.
 pub(crate) struct Launcher {
-    build: Box<dyn Fn(&str) -> Command + Send + Sync>,
+    build: Box<dyn Fn(&str) -> Program + Send + Sync>,
     check: TetherCheck,
 }
 
@@ -167,7 +167,7 @@ impl Launcher {
     /// Starts supervisors that do not check whether they outlive the caller; they must run
     /// [`serve`] with [`TetherCheck::Off`] too.
     #[cfg(test)]
-    pub(crate) fn unchecked(build: impl Fn(&str) -> Command + Send + Sync + 'static) -> Launcher {
+    pub(crate) fn unchecked(build: impl Fn(&str) -> Program + Send + Sync + 'static) -> Launcher {
         Launcher {
             build: Box::new(build),
             check: TetherCheck::Off,
@@ -184,10 +184,9 @@ impl Launcher {
     pub(crate) fn current_exe() -> Result<Launcher> {
         let exe = std::env::current_exe().context("cannot locate the bp binary")?;
         Ok(Launcher {
-            build: Box::new(move |endpoint| {
-                let mut cmd = Command::new(&exe);
-                cmd.arg("supervise").arg(endpoint);
-                cmd
+            build: Box::new(move |endpoint| Program {
+                exe: exe.clone(),
+                args: vec!["supervise".into(), endpoint.into()],
             }),
             check: TetherCheck::On,
         })
@@ -198,13 +197,9 @@ impl Launcher {
     /// outlives us.
     pub(crate) fn launch(&self, endpoint: &str, cwd: &Path, log: &Path) -> Result<Launched> {
         let log = open_log(log)?;
-        let mut cmd = (self.build)(endpoint);
-        cmd.current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(log);
-        let mut child = proc::spawn_detached(&mut cmd).context("cannot start the supervisor")?;
-        let stdout = child.stdout.take().expect("stdout is piped");
+        let program = (self.build)(endpoint);
+        let (mut child, stdout) =
+            proc::spawn_detached(&program, cwd, log).context("cannot start the supervisor")?;
         let mut lines = BufReader::new(stdout);
         let mut line = String::new();
         loop {
@@ -220,7 +215,7 @@ impl Launcher {
             let ready: Ready = serde_json::from_str(text.trim())
                 .with_context(|| format!("unexpected answer from the supervisor: {text:?}"))?;
             return match (ready.process, ready.error) {
-                (Some(process), None) if process.pid == child.id() => Ok(Launched {
+                (Some(process), None) if process.pid == child.pid() => Ok(Launched {
                     process,
                     warning: ready.warning,
                 }),

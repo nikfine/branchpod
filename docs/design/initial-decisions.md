@@ -118,9 +118,19 @@ One supervisor process per worktree, no global daemon; control over a local sock
   console window, its own process group and, when the caller's Job Object allows it, outside that job
   (Windows; "The caller's Job Object" below is about when it does not). `bp`'s
   standard handles are not inherited: an IDE hook waiting for the end of `bp`'s output must not wait for
-  the supervisor. Known gap on Windows (#76): other inheritable handles of `bp` still are, and some callers
-  leave it one on their output; those do wait. Its working directory is the `bp` home, never the worktree or the pod directory, which
-  Windows could then not remove.
+  the supervisor. On Windows nothing else is either: the supervisor gets NUL, the readiness pipe and its log,
+  as an explicit list (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), because some callers (`cmd` with redirections,
+  PowerShell) leave `bp` one more inheritable handle to their output. If that list cannot be applied, the
+  start fails. On Unix a descriptor above 2 that the caller left open for `bp` is still inherited (#80). Its
+  working directory is the `bp` home, never the worktree or the pod directory, which Windows could then not
+  remove.
+- **Starting it on Windows** takes a `CreateProcessW` of our own: stable `std` has no handle list, and its
+  `CommandExt::inherit_handles` (announced for Rust 1.101) is all or nothing, while redirected standard
+  handles need inheritance on. What speaks against it for services (below) does not count here: the program
+  is `bp` itself, by absolute path, with two arguments and our own environment, so there is no program lookup
+  or environment block to replace, only quoting. Rejected: finding all handles of `bp` and clearing their
+  inherit flag first. That changes the state of the whole process and races with other threads that open
+  handles or start processes; the list is exact.
 - **Readiness.** The supervisor prints one line once it listens (or why it cannot) and `bp up` reads it.
   No time limit: if the supervisor dies first, the pipe closes and `up` fails.
 - **Control.** One JSON line per request and per answer, one connection per request, versioned:
@@ -288,6 +298,10 @@ Rules for file resources:
 - A program given as a relative path with a directory part (`./scripts/up.sh`) is resolved against the
   command's working directory on every platform; Windows would otherwise resolve it against `bp`'s own.
   A bare name is searched on `PATH`.
+- Known limitation on Windows: a command is started with every inheritable handle of `bp`, its own standard
+  handles included. A process that the command leaves running (a daemon) keeps them, even with its own output
+  redirected, and whoever waits for the end of `bp`'s output waits for it. The handle list of the supervisor
+  ("Process supervision") does not cover commands.
 - `output = "file"` keeps the output in a file instead, see "Command output in a file".
 - On Windows a `.cmd` / `.bat` program is named with its extension (`npx.cmd`): spawning without a
   shell does not resolve it through `PATHEXT`.

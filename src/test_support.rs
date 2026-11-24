@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::pod::Store;
-use crate::proc::{self, ProcId};
+use crate::proc::{self, ProcId, Program};
 use crate::supervisor::{self, Launcher, TetherCheck};
 
 /// Runs `git` in `dir`; it must succeed.
@@ -30,23 +30,26 @@ pub(crate) fn fail(code: i32, message: &str) -> Vec<String> {
     }
 }
 
-/// Name of the env var that makes [`supervisor_process`] run.
-const ENDPOINT_ENV: &str = "BP_TEST_SUPERVISOR_ENDPOINT";
+/// Comes right before the endpoint among the arguments of [`supervisor_process`]. To the test
+/// runner both are names of further tests to run, which do not exist.
+const ENDPOINT_MARK: &str = "bp-test-endpoint";
 
 /// Starts supervisors as this test binary re-running [`supervisor_process`].
 pub(crate) fn launcher() -> Launcher {
     let exe = std::env::current_exe().unwrap();
-    Launcher::unchecked(move |endpoint| {
-        let mut cmd = Command::new(&exe);
-        cmd.args([
+    Launcher::unchecked(move |endpoint| Program {
+        exe: exe.clone(),
+        args: [
             "--exact",
             "test_support::supervisor_process",
             "--ignored",
             "--nocapture",
             "--test-threads=1",
-        ])
-        .env(ENDPOINT_ENV, endpoint);
-        cmd
+            ENDPOINT_MARK,
+            endpoint,
+        ]
+        .map(Into::into)
+        .into(),
     })
 }
 
@@ -80,8 +83,9 @@ pub(crate) fn reap_pod(store: &Store, id: &str) -> Reaper {
 #[test]
 #[ignore = "the supervisor process of other tests, which start it themselves"]
 fn supervisor_process() {
-    if let Some(endpoint) = std::env::var_os(ENDPOINT_ENV) {
-        supervisor::serve(endpoint.to_str().unwrap(), TetherCheck::Off).unwrap();
+    let mut args = std::env::args().skip_while(|arg| arg != ENDPOINT_MARK);
+    if let Some(endpoint) = args.nth(1) {
+        supervisor::serve(&endpoint, TetherCheck::Off).unwrap();
     }
 }
 

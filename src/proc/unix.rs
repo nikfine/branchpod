@@ -1,12 +1,14 @@
 //! Process groups, sessions and start times on Unix.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, PipeWriter};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{POLL, ProcId, Tether, identify};
+use super::{POLL, ProcId, Program, Tether, identify};
 
 /// The leader of a process group.
 pub(crate) struct Tree(Child);
@@ -120,7 +122,31 @@ pub(crate) fn kill(id: ProcId) -> io::Result<()> {
     }
 }
 
-pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
+pub(crate) struct Detached(Child);
+
+impl Detached {
+    pub(crate) fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Waits for it to exit.
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.0.wait()
+    }
+}
+
+pub(crate) fn spawn_detached(
+    program: &Program,
+    cwd: &Path,
+    stdout: PipeWriter,
+    stderr: File,
+) -> io::Result<Detached> {
+    let mut cmd = Command::new(&program.exe);
+    cmd.args(&program.args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
     // SAFETY: `setsid` is async-signal-safe, as `pre_exec` requires.
     unsafe {
         cmd.pre_exec(|| {
@@ -130,7 +156,7 @@ pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
             Ok(())
         });
     }
-    cmd.spawn()
+    cmd.spawn().map(Detached)
 }
 
 /// Clock ticks since boot at which the process started (`/proc/<pid>/stat`, field 22).

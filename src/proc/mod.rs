@@ -12,7 +12,10 @@
 //!   ([`contain`]); both kill what is in them when the supervisor is gone, however it ended.
 //!   Stopping terminates the job at once and waits until nothing runs in it.
 
-use std::io;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{self, PipeReader};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -125,13 +128,33 @@ pub(crate) fn kill(id: ProcId) -> io::Result<()> {
     sys::kill(id)
 }
 
-/// Spawns `cmd` detached from the caller, to outlive it: its own session (Unix); no console
+/// A program to start and its arguments. Its environment is ours.
+#[derive(Debug)]
+pub(crate) struct Program {
+    /// Absolute.
+    pub(crate) exe: PathBuf,
+    pub(crate) args: Vec<OsString>,
+}
+
+/// A process started with [`spawn_detached`]. Dropping it leaves the process running.
+pub(crate) use sys::Detached;
+
+/// Spawns `program` detached from the caller, to outlive it: its own session (Unix); no console
 /// window, its own process group and, where the caller's Job Object allows it, outside that job
-/// (Windows; [`Tether`] tells where it does not). Our own standard handles are not inherited,
-/// so that a caller waiting for the end of our output (an IDE hook) is not kept waiting by the
-/// detached process. On Windows any other inheritable handle we have still is (#76).
-pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
-    sys::spawn_detached(cmd)
+/// (Windows; [`Tether`] tells where it does not). Its stdin is empty, its stdout the pipe whose
+/// other end is returned, its stderr the given file.
+///
+/// Our own standard handles are not inherited, so that a caller waiting for the end of our output
+/// (an IDE hook) is not kept waiting by the detached process. On Windows nothing else is either;
+/// on Unix a descriptor above 2 that the caller left open for us still is (#80).
+pub(crate) fn spawn_detached(
+    program: &Program,
+    cwd: &Path,
+    stderr: File,
+) -> io::Result<(Detached, PipeReader)> {
+    let (reader, writer) = io::pipe()?;
+    let process = sys::spawn_detached(program, cwd, writer, stderr)?;
+    Ok((process, reader))
 }
 
 #[cfg(test)]

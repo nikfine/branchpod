@@ -1,20 +1,26 @@
 //! Process handles, Job Objects, creation flags and start times on Windows.
 
-use std::io;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{self, PipeWriter};
+use std::iter;
+use std::marker::PhantomData;
 use std::mem;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
-use std::os::windows::process::CommandExt;
-use std::process::{Child, Command};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle,
+};
+use std::os::windows::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus};
 use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED,
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -29,17 +35,22 @@ use windows_sys::Win32::System::JobObjects::{
     TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
-    WaitForSingleObject,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenThread, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_SUSPEND_RESUME, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
-use super::{POLL, ProcId, Tether};
+use super::{POLL, ProcId, Program, Tether};
 
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+const NUL: &str = r"\\.\NUL";
 
 /// How long [`kill`] waits for a process that is already being terminated.
 const EXITING_WAIT: Duration = Duration::from_secs(10);
@@ -384,30 +395,264 @@ fn terminate(id: ProcId, limit: Duration) -> io::Result<Option<Process>> {
     Ok(Some(process))
 }
 
-pub(crate) fn spawn_detached(cmd: &mut Command) -> io::Result<Child> {
-    // Our standard handles may be an IDE hook's pipes: inherited by a process that outlives
-    // us, they would keep the hook waiting for the end of our output.
-    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        // SAFETY: plain calls on our own standard handles; failures leave the flag as it was.
+pub(crate) struct Detached {
+    process: OwnedHandle,
+    pid: u32,
+}
+
+impl Detached {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Waits for it to exit.
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        let process = self.process.as_raw_handle();
+        // SAFETY: a valid handle with all access, and an out-parameter.
         unsafe {
-            let handle = GetStdHandle(which);
-            if !handle.is_null() && handle as isize != -1 {
-                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            if WaitForSingleObject(process, INFINITE) != WAIT_OBJECT_0 {
+                return Err(io::Error::last_os_error());
             }
+            let mut code = 0;
+            check(GetExitCodeProcess(process, &mut code))?;
+            Ok(ExitStatus::from_raw(code))
         }
     }
+}
+
+/// `CreateProcessW` by hand: std's `Command` passes on every inheritable handle we have (a handle
+/// list is unstable there), and `bp` may have some that it knows nothing about: `cmd` and
+/// PowerShell can leave one on their own output to what they start. Held by a process that
+/// outlives us, it would keep whoever waits for the end of that output waiting.
+pub(crate) fn spawn_detached(
+    program: &Program,
+    cwd: &Path,
+    stdout: PipeWriter,
+    stderr: File,
+) -> io::Result<Detached> {
+    let stdin = File::open(NUL)?;
+    // Copies, closed when we return, started or not. Meanwhile they are inheritable: a process
+    // that another thread starts just then with std's `Command` gets them too, as std's lock does
+    // not cover us. `bp` starts processes from one thread only; the tests from several, and a
+    // readiness pipe or a log held open a little longer does them no harm.
+    let stdio = [
+        inheritable(stdin.as_handle())?,
+        inheritable(stdout.as_handle())?,
+        inheritable(stderr.as_handle())?,
+    ];
     let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
     // Leave the caller's Job Object if it allows that, so that the job closing (a hook's
     // process tree being cleaned up) does not take the supervisor with it. Where it does not,
     // the supervisor finds out (`own_tether`) and refuses or warns.
-    cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
-    match cmd.spawn() {
+    match create_process(program, cwd, &stdio, flags | CREATE_BREAKAWAY_FROM_JOB) {
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-            cmd.creation_flags(flags);
-            cmd.spawn()
+            create_process(program, cwd, &stdio, flags)
         }
         result => result,
     }
+}
+
+/// A copy of `handle` that processes we start can inherit.
+fn inheritable(handle: BorrowedHandle) -> io::Result<OwnedHandle> {
+    let mut copy = ptr::null_mut();
+    // SAFETY: a valid handle and an out-parameter; the copy is owned by the returned value.
+    unsafe {
+        let this = GetCurrentProcess();
+        check(DuplicateHandle(
+            this,
+            handle.as_raw_handle(),
+            this,
+            &mut copy,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        ))?;
+        Ok(OwnedHandle::from_raw_handle(copy))
+    }
+}
+
+/// Starts `program` with `stdio` as its standard handles and nothing else inherited. Handles that
+/// are not inheritable, or twice the same one, are an error.
+fn create_process(
+    program: &Program,
+    cwd: &Path,
+    stdio: &[OwnedHandle; 3],
+    flags: u32,
+) -> io::Result<Detached> {
+    let exe = wide(&executable(&program.exe))?;
+    let mut command_line = command_line(program)?;
+    let cwd = wide(&working_directory(cwd))?;
+    let handles = stdio.each_ref().map(AsRawHandle::as_raw_handle);
+    let mut attributes = Attributes::inherit_only(&handles)?;
+    // SAFETY: plain data for which zeroes are valid.
+    let (mut startup, mut created): (STARTUPINFOEXW, PROCESS_INFORMATION) =
+        unsafe { (mem::zeroed(), mem::zeroed()) };
+    startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    [
+        startup.StartupInfo.hStdInput,
+        startup.StartupInfo.hStdOutput,
+        startup.StartupInfo.hStdError,
+    ] = handles;
+    startup.lpAttributeList = attributes.as_mut_ptr();
+    // SAFETY: NUL-terminated strings, the command line writable; a startup structure of the size
+    // it says, whose attribute list and the handles in it outlive the call; both handles returned
+    // are owned. No environment: the child gets ours.
+    unsafe {
+        check(CreateProcessW(
+            exe.as_ptr(),
+            command_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1,
+            flags | EXTENDED_STARTUPINFO_PRESENT,
+            ptr::null(),
+            cwd.as_ptr(),
+            (&raw const startup).cast(),
+            &mut created,
+        ))?;
+        drop(OwnedHandle::from_raw_handle(created.hThread));
+        Ok(Detached {
+            process: OwnedHandle::from_raw_handle(created.hProcess),
+            pid: created.dwProcessId,
+        })
+    }
+}
+
+/// Attributes of a process to start.
+struct Attributes<'a> {
+    /// `usize` for the alignment.
+    list: Vec<usize>,
+    /// The list points to them.
+    handles: PhantomData<&'a [HANDLE]>,
+}
+
+impl<'a> Attributes<'a> {
+    /// Only `handles` are inherited.
+    fn inherit_only(handles: &'a [HANDLE]) -> io::Result<Attributes<'a>> {
+        let mut size = 0;
+        // SAFETY: asks for the size only, by failing.
+        unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
+        let mut list = vec![0usize; size.div_ceil(mem::size_of::<usize>())];
+        // SAFETY: a buffer of the size asked for.
+        check(unsafe {
+            InitializeProcThreadAttributeList(list.as_mut_ptr().cast(), 1, 0, &mut size)
+        })?;
+        // Initialized: from here on it is deleted on drop.
+        let mut attributes = Attributes {
+            list,
+            handles: PhantomData,
+        };
+        // SAFETY: an initialized list, and a value of the size passed that outlives it.
+        check(unsafe {
+            UpdateProcThreadAttribute(
+                attributes.as_mut_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                mem::size_of_val(handles),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        })?;
+        Ok(attributes)
+    }
+
+    fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.list.as_mut_ptr().cast()
+    }
+}
+
+impl Drop for Attributes<'_> {
+    fn drop(&mut self) {
+        // SAFETY: an initialized list.
+        unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+    }
+}
+
+fn wide(text: &OsStr) -> io::Result<Vec<u16>> {
+    terminated(text.encode_wide().collect())
+}
+
+/// Adds the terminating NUL; one that is there already is an error.
+fn terminated(mut text: Vec<u16>) -> io::Result<Vec<u16>> {
+    if text.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a NUL character in a path or an argument",
+        ));
+    }
+    text.push(0);
+    Ok(text)
+}
+
+/// `exe` in the form that may be longer than `MAX_PATH`, if it is long.
+fn executable(exe: &Path) -> OsString {
+    /// Well below `MAX_PATH` (260).
+    const LONG: usize = 240;
+    let path: Vec<u16> = exe.as_os_str().encode_wide().collect();
+    // A device path (`\\.\`) only looks like a UNC path: it is left as it is.
+    if path.len() < LONG || starts_with(&path, r"\\?\") || starts_with(&path, r"\\.\") {
+        return exe.as_os_str().to_owned();
+    }
+    let (prefix, rest) = if starts_with(&path, r"\\") {
+        (r"\\?\UNC\", &path[2..])
+    } else {
+        (r"\\?\", &path[..])
+    };
+    let mut verbatim = OsString::from(prefix);
+    verbatim.push(OsString::from_wide(rest));
+    verbatim
+}
+
+/// `cwd` without a `\\?\` prefix, which a working directory cannot have.
+fn working_directory(cwd: &Path) -> OsString {
+    const UNC: &str = r"\\?\UNC\";
+    let path: Vec<u16> = cwd.as_os_str().encode_wide().collect();
+    if starts_with(&path, UNC) {
+        let mut plain = OsString::from(r"\\");
+        plain.push(OsString::from_wide(&path[UNC.len()..]));
+        return plain;
+    }
+    dunce::simplified(cwd).as_os_str().to_owned()
+}
+
+fn starts_with(path: &[u16], prefix: &str) -> bool {
+    path.len() >= prefix.len()
+        && prefix
+            .encode_utf16()
+            .eq(path[..prefix.len()].iter().copied())
+}
+
+/// The command line from which a program that follows the
+/// [usual rules](https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments)
+/// reads its own path and these arguments; NUL-terminated.
+fn command_line(program: &Program) -> io::Result<Vec<u16>> {
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    // The path is read up to the next quote, whatever is before it; a file name has none.
+    let mut line = vec![QUOTE];
+    line.extend(program.exe.as_os_str().encode_wide());
+    line.push(QUOTE);
+    for arg in &program.args {
+        line.extend([b' ' as u16, QUOTE]);
+        // Backslashes are only special before a quote: there they are doubled.
+        let mut backslashes = 0;
+        for unit in arg.encode_wide() {
+            match unit {
+                BACKSLASH => backslashes += 1,
+                QUOTE => {
+                    line.extend(iter::repeat_n(BACKSLASH, backslashes + 1));
+                    backslashes = 0;
+                }
+                _ => backslashes = 0,
+            }
+            line.push(unit);
+        }
+        line.extend(iter::repeat_n(BACKSLASH, backslashes));
+        line.push(QUOTE);
+    }
+    terminated(line)
 }
 
 /// `None` also when the process is not ours to query: then it is not one we started.
@@ -478,6 +723,14 @@ impl Drop for Process {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::{BufRead, BufReader};
+
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
     use super::*;
 
     #[test]
@@ -587,5 +840,210 @@ mod tests {
             child.wait().unwrap();
         }
         assert_eq!(listed, children.len());
+    }
+
+    /// Comes right before the arguments that [`reporting_process`] is to report.
+    const REPORT_MARK: &str = "bp-test-report";
+
+    /// Not a test by itself: reports its working directory, its arguments after [`REPORT_MARK`]
+    /// and how many inheritable handles it has besides its standard ones.
+    #[test]
+    #[ignore = "a process of other tests, which start it themselves"]
+    fn reporting_process() {
+        let mut args = std::env::args_os().skip_while(|arg| arg != REPORT_MARK);
+        if args.next().is_none() {
+            return;
+        }
+        println!("cwd {:?}", std::env::current_dir().unwrap());
+        for arg in args {
+            println!("arg {:?}", arg.encode_wide().collect::<Vec<_>>());
+        }
+        // SAFETY: plain calls; a value that is no handle is an error.
+        let (standard, inheritable) = unsafe {
+            let standard =
+                [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|w| GetStdHandle(w));
+            // The values of handles are small multiples of four.
+            let inheritable: Vec<HANDLE> = (4..0x10000)
+                .step_by(4)
+                .map(ptr::without_provenance_mut)
+                .filter(|&handle| {
+                    let mut flags = 0;
+                    GetHandleInformation(handle, &mut flags) != 0
+                        && flags & HANDLE_FLAG_INHERIT != 0
+                })
+                .collect();
+            (standard, inheritable)
+        };
+        let of_standard = standard.iter().filter(|h| inheritable.contains(h)).count();
+        println!(
+            "standard {of_standard} other {}",
+            inheritable.len() - of_standard
+        );
+        eprintln!("stderr");
+        println!("end");
+    }
+
+    /// What [`reporting_process`], run as `exe` in `cwd`, reports on stdout and stderr.
+    fn report(exe: &Path, args: &[OsString], cwd: &Path) -> (String, String) {
+        let log = cwd.join("stderr.log");
+        let program = Program {
+            exe: exe.to_owned(),
+            args: [
+                "--exact",
+                "proc::windows::tests::reporting_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+                // What follows are names of tests to run, whatever it looks like.
+                "--",
+                REPORT_MARK,
+            ]
+            .iter()
+            .map(OsString::from)
+            .chain(args.iter().cloned())
+            .collect(),
+        };
+        let (mut child, stdout) =
+            super::super::spawn_detached(&program, cwd, File::create(&log).unwrap()).unwrap();
+        assert!(child.pid() != 0);
+        // Up to its last line, not to the end: a process that another test starts just then may
+        // hold the pipe too.
+        let out: Vec<String> = BufReader::new(&stdout)
+            .lines()
+            .map(Result::unwrap)
+            .take_while(|line| line != "end")
+            .collect();
+        let out = out.join("\n");
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}: {out}");
+        (out, fs::read_to_string(log).unwrap())
+    }
+
+    fn temp_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        (tmp, dir)
+    }
+
+    #[test]
+    fn a_detached_process_inherits_only_its_standard_handles() {
+        // NUL: whoever else inherits it does not matter.
+        let nul = File::open(NUL).unwrap();
+        let _stray = inheritable(nul.as_handle()).unwrap();
+        let (_tmp, dir) = temp_dir();
+        let (out, err) = report(&std::env::current_exe().unwrap(), &[], &dir);
+        assert!(out.contains("standard 3 other 0"), "{out}");
+        assert!(err.contains("stderr"), "{err}");
+    }
+
+    #[test]
+    fn handles_that_are_not_inheritable_are_an_error() {
+        let (_tmp, dir) = temp_dir();
+        let program = Program {
+            exe: std::env::current_exe().unwrap(),
+            args: vec!["--list".into()],
+        };
+        let nul = || OwnedHandle::from(File::options().read(true).write(true).open(NUL).unwrap());
+        let plain = [nul(), nul(), nul()];
+        let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        let error = create_process(&program, &dir, &plain, flags).err().unwrap();
+        assert_eq!(error.raw_os_error(), Some(ERROR_INVALID_PARAMETER as i32));
+        // With one that is, still.
+        let one = [inheritable(plain[0].as_handle()).unwrap(), nul(), nul()];
+        assert!(create_process(&program, &dir, &one, flags).is_err());
+        let all = plain.map(|handle| inheritable(handle.as_handle()).unwrap());
+        let mut child = create_process(&program, &dir, &all, flags).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn arguments_and_directory_arrive_as_they_are() {
+        let args: Vec<OsString> = [
+            "plain",
+            "",
+            " ",
+            "with space",
+            "caf\u{e9} \u{43f}\u{443}\u{442}\u{44c} \u{1f980}",
+            r#"""#,
+            r#"a"b"#,
+            r#"a" b"#,
+            r#"\""#,
+            r#"\\""#,
+            r#"a\\\"b c"#,
+            r"\",
+            r"ends with\",
+            r"ends with\\",
+            r"C:\dir\file",
+            r"\\.\pipe\branchpod-x-y",
+            "%PATH% ^& | > 'x' *?",
+            "tab\tnew\nline",
+            "--option",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let (_tmp, dir) = temp_dir();
+        let cwd = dir.join("caf\u{e9} dir");
+        fs::create_dir(&cwd).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        // Without and with a `\\?\` prefix.
+        for given in [cwd.clone(), fs::canonicalize(&cwd).unwrap()] {
+            let (out, _) = report(&exe, &args, &given);
+            let expected: Vec<String> = args
+                .iter()
+                .map(|arg| format!("arg {:?}", arg.encode_wide().collect::<Vec<_>>()))
+                .collect();
+            let got: Vec<&str> = out.lines().filter(|l| l.starts_with("arg ")).collect();
+            assert_eq!(got, expected);
+            assert!(out.contains(&format!("cwd {cwd:?}")), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_nul_is_an_error() {
+        let (_tmp, dir) = temp_dir();
+        let program = Program {
+            exe: std::env::current_exe().unwrap(),
+            args: vec!["a\0b".into()],
+        };
+        let log = File::create(dir.join("log")).unwrap();
+        let error = super::super::spawn_detached(&program, &dir, log).err();
+        assert_eq!(error.unwrap().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_long_path_of_the_program_works() {
+        let (_tmp, dir) = temp_dir();
+        let mut long = dir.clone();
+        while long.as_os_str().len() < 300 {
+            long.push("caf\u{e9} and some more to make it long");
+        }
+        fs::create_dir_all(&long).unwrap();
+        let exe = long.join("program with space.exe");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let args = ["a b".into()];
+        let (out, _) = report(&exe, &args, &dir);
+        assert!(out.contains("arg [97, 32, 98]"), "{out}");
+    }
+
+    #[test]
+    fn long_and_verbatim_paths_take_the_form_the_system_wants() {
+        let long = "x".repeat(300);
+        let executable = |path: &str| executable(Path::new(path)).into_string().unwrap();
+        assert_eq!(executable(r"C:\a\b.exe"), r"C:\a\b.exe");
+        let exe = format!(r"C:\{long}\b.exe");
+        assert_eq!(executable(&exe), format!(r"\\?\{exe}"));
+        assert_eq!(executable(&format!(r"\\?\{exe}")), format!(r"\\?\{exe}"));
+        assert_eq!(
+            executable(&format!(r"\\server\share\{long}")),
+            format!(r"\\?\UNC\server\share\{long}")
+        );
+        let device = format!(r"\\.\C:\{long}\b.exe");
+        assert_eq!(executable(&device), device);
+        let directory = |path: &str| working_directory(Path::new(path)).into_string().unwrap();
+        assert_eq!(directory(r"C:\a"), r"C:\a");
+        assert_eq!(directory(r"\\?\C:\a"), r"C:\a");
+        assert_eq!(directory(r"\\?\UNC\server\share\a"), r"\\server\share\a");
+        assert_eq!(directory(r"\\server\share\a"), r"\\server\share\a");
     }
 }
