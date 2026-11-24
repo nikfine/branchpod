@@ -100,12 +100,13 @@ impl Vars {
     }
 
     fn missing(&self, name: &str, filters: &[&str]) -> String {
+        let foreign_filter = filters.iter().any(|filter| Filter::parse(filter).is_none());
+        let hint = |foreign: bool| if foreign { ESCAPE_HINT } else { "" };
         if let Some(reason) = self.unavailable.get(name) {
-            return format!("variable `{name}` is not available: {reason}");
+            let hint = hint(foreign_filter);
+            return format!("variable `{name}` is not available: {reason}{hint}");
         }
-        let foreign =
-            looks_foreign(name) || filters.iter().any(|filter| Filter::parse(filter).is_none());
-        let hint = if foreign { ESCAPE_HINT } else { "" };
+        let hint = hint(foreign_filter || looks_foreign(name));
         format!("unknown variable `{name}`{hint}")
     }
 
@@ -174,16 +175,32 @@ fn json(value: &str) -> String {
 }
 
 /// Writes a Windows path with `/`. On Unix `\` is an ordinary character of a file name, so nothing
-/// changes there. Windows does not accept `/` in a `\\?\` path, so that is an error.
+/// changes there. Windows does not accept `/` in a `\\?\` path, so that is an error, except for
+/// `\\?\UNC\server\share`, which has the plain form `//server/share`: it is how the path of a
+/// worktree on a network share is spelled.
 fn slash(value: &str, windows: bool) -> Result<String, String> {
     if !windows {
         return Ok(value.to_owned());
     }
+    let (prefix, rest) = match verbatim_unc(value) {
+        Some(rest) => ("//", rest),
+        None => ("", value),
+    };
     // The value is not quoted: template errors do not show content.
-    if value.contains(r"\\?\") {
+    if rest.contains(r"\\?\") {
         return Err(r"filter `slash`: a `\\?\` path cannot be written with `/`".to_owned());
     }
-    Ok(value.replace('\\', "/"))
+    Ok(format!("{prefix}{}", rest.replace('\\', "/")))
+}
+
+/// `server\share...` of a value that starts with `\\?\UNC\server\share`. A server named `?` or `.`
+/// would turn into the prefix of another kind of path.
+fn verbatim_unc(value: &str) -> Option<&str> {
+    let rest = value.strip_prefix(r"\\?\UNC\")?;
+    let mut parts = rest.split('\\');
+    let server = parts.next().filter(|s| !matches!(*s, "" | "?" | "."));
+    let share = parts.next().filter(|s| !s.is_empty());
+    server.and(share).map(|_| rest)
 }
 
 /// Whether an undeclared `name` looks like a Go template action (`docker --format`,
@@ -410,6 +427,17 @@ mod tests {
     }
 
     #[test]
+    fn json_also_fits_a_toml_basic_string() {
+        let value: String = ('\0'..='\u{1f}').chain("\"\\ü".chars()).collect();
+        let document = format!("x = \"{}\"", json(&value));
+        let parsed: toml::Table = document.parse().unwrap();
+        assert_eq!(parsed["x"].as_str(), Some(value.as_str()));
+        // The exception: TOML wants U+007F escaped, JSON does not.
+        let document = format!("x = \"{}\"", json("\u{7f}"));
+        assert!(document.parse::<toml::Table>().is_err());
+    }
+
+    #[test]
     fn slash_changes_windows_paths_only() {
         for (value, expected) in [
             (r"C:\work\feature-x", "C:/work/feature-x"),
@@ -420,8 +448,28 @@ mod tests {
             assert_eq!(slash(value, true).unwrap(), expected);
             assert_eq!(slash(value, false).unwrap(), value);
         }
-        for verbatim in [r"\\?\C:\work", r"\\?\UNC\server\share"] {
-            assert!(slash(verbatim, true).unwrap_err().contains(r"`\\?\` path"));
+        // A share has a plain form; any other `\\?\` path does not, wherever it is in the value.
+        for (value, expected) in [
+            (r"\\?\UNC\server\share", "//server/share"),
+            (r"\\?\UNC\server\C$\путь\x", "//server/C$/путь/x"),
+        ] {
+            assert_eq!(slash(value, true).unwrap(), expected);
+            assert_eq!(slash(value, false).unwrap(), value);
+        }
+        for verbatim in [
+            r"\\?\C:\work",
+            r"\\?\Volume{0}\x",
+            r"C:\a;\\?\C:\b",
+            r"C:\a;\\?\UNC\server\share",
+            r"\\?\UNC\server\share;\\?\UNC\server\other",
+            r"\\?\UNC\server",
+            r"\\?\UNC\server\",
+            r"\\?\UNC\\share",
+            r"\\?\UNC\?\C:\x",
+            r"\\?\UNC\.\pipe\x",
+        ] {
+            let err = slash(verbatim, true).unwrap_err();
+            assert!(err.contains(r"`\\?\` path"), "{verbatim}: {err}");
             assert_eq!(slash(verbatim, false).unwrap(), verbatim);
         }
     }
@@ -491,7 +539,15 @@ mod tests {
         }
         // The variable comes first.
         let err = error(&v, "{{branch | upper}}");
-        assert!(err.contains("HEAD is detached"), "{err}");
+        assert!(
+            err.contains("HEAD is detached") && err.contains("for a literal `{{`"),
+            "{err}"
+        );
+        let err = error(&v, "{{branch | json}}");
+        assert!(
+            err.contains("HEAD is detached") && !err.contains("literal"),
+            "{err}"
+        );
         let err = error(&v, "{{port.vite | json}}");
         assert!(err.starts_with("unknown variable `port.vite` in"), "{err}");
         let err = v.render_text("a\n{{port.web | upper}}").unwrap_err();
