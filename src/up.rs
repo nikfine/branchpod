@@ -43,6 +43,8 @@ pub(crate) struct Report {
     pub(crate) pod: PodMeta,
     /// What this run did, in creation order.
     pub(crate) items: Vec<Item>,
+    /// For the user: the pod is up, but may not stay so.
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +139,9 @@ pub(crate) fn up(
 
     let mut vars = builtin_vars(&id, wt);
     check(config, wt, main, &vars, &store.pod_dir(&id))?;
+    if !config.service.is_empty() {
+        launcher.preflight().context("cannot run services")?;
+    }
 
     let meta = PodMeta {
         v: META_VERSION,
@@ -151,6 +156,7 @@ pub(crate) fn up(
         wrote: false,
     };
     let mut items = Vec::new();
+    let mut warnings = Vec::new();
     let result = provision(
         store,
         &id,
@@ -161,9 +167,14 @@ pub(crate) fn up(
         &mut journal,
         &mut vars,
         &mut items,
+        &mut warnings,
     );
     match result {
-        Ok(()) => Ok(Report { pod: meta, items }),
+        Ok(()) => Ok(Report {
+            pod: meta,
+            items,
+            warnings,
+        }),
         Err(error) if !journal.wrote => Err(error),
         Err(error) => {
             let recorded = store.resources(&id).map(live).unwrap_or_default();
@@ -219,6 +230,7 @@ fn provision(
     journal: &mut Journal,
     vars: &mut Vars,
     items: &mut Vec<Item>,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
     // The pod lock is held: the registry lock is taken after it, as the lock order requires.
     let registry = Registry::new(store.home());
@@ -296,9 +308,10 @@ fn provision(
         serde_json::to_value(&intent)?,
         || {
             let log = pod_dir.join("logs").join("supervisor.log");
-            let process = launcher.launch(&intent.endpoint, &cwd, &log)?;
+            let launched = launcher.launch(&intent.endpoint, &cwd, &log)?;
+            warnings.extend(launched.warning);
             Ok(supervisor::Record {
-                process: Some(process),
+                process: Some(launched.process),
                 ..intent.clone()
             })
         },
@@ -836,6 +849,41 @@ mod tests {
         assert!(!crate::proc::is_running(web_process));
         assert!(!crate::proc::is_running(sup_process));
         assert!(!r.store.pod_dir(&meta.id).exists());
+    }
+
+    #[test]
+    fn a_pod_whose_supervisor_was_killed_goes_down_and_up_again() {
+        let r = repo();
+        let text = format!(
+            "version = 1\n[port.web]\nrange = [41000, 41999]\n{}",
+            service_config("web", &long_running("web-up"))
+        );
+        let process = |kind| -> ProcId {
+            let state = resources(&r);
+            let found = state.iter().rfind(|s| s.kind == kind).unwrap();
+            serde_json::from_value(found.data["process"].clone()).unwrap()
+        };
+        let down = || {
+            let meta = r.store.find_by_worktree(&r.linked).unwrap().unwrap();
+            let teardown = crate::down::teardown(&r.store, &meta).unwrap();
+            assert!(teardown.is_clean(), "{teardown:?}");
+        };
+
+        let result = run(&r, &text);
+        let _reaper = reap_pod(&r.store, &pod::pod_id(&r.linked));
+        result.unwrap();
+        let (sup, web) = (process(Kind::Supervisor), process(Kind::Service));
+        // `down` right after it, without waiting for anything to be gone.
+        crate::proc::kill(sup).unwrap();
+        down();
+        assert!(!crate::proc::is_running(sup));
+        assert!(!crate::proc::is_running(web));
+
+        let result = run(&r, &text);
+        let _reaper = reap_pod(&r.store, &pod::pod_id(&r.linked));
+        result.unwrap();
+        assert!(crate::proc::is_running(process(Kind::Service)));
+        down();
     }
 
     #[test]

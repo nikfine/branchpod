@@ -35,14 +35,17 @@ tempfile = "3.27.0"
 # Directory links without admin rights or developer mode.
 junction = { version = "2.1.0", default-features = false }
 # Restart Manager: names the processes holding a file that teardown cannot remove. Named pipes
-# and process queries: the supervisor's control channel and pid + start time checks.
+# and process queries: the supervisor's control channel and pid + start time checks. Job Objects
+# and the thread snapshot: services that die with their supervisor.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_RestartManager",
     "Win32_System_Threading",

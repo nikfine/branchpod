@@ -7,6 +7,7 @@
 //! left, the pod's state is removed as well.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -16,6 +17,9 @@ use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
 use crate::pod::{PodMeta, Store};
 use crate::supervisor::{self, Request};
 use crate::{commands, control, ports, proc, services};
+
+/// How long a supervisor whose channel broke gets to be gone.
+const DYING_WAIT: Duration = Duration::from_secs(1);
 
 /// Outcome of tearing down one resource.
 #[derive(Debug)]
@@ -165,7 +169,7 @@ fn stop_service(
         };
         match supervisor::request(&sup.endpoint, &stop) {
             Ok(_) => {}
-            Err(e) if supervisor::is_unreachable(&e) => {}
+            Err(e) if is_gone(sup, &e) => {}
             Err(e) => return Err(e),
         }
     }
@@ -176,12 +180,27 @@ fn stop_service(
     Ok(())
 }
 
+/// Whether a request failed with `error` because there is no supervisor any more. The channel of
+/// one that is being killed can outlive it for a moment, and then breaks: that counts only if the
+/// recorded process is gone, too.
+fn is_gone(supervisor: &supervisor::Record, error: &anyhow::Error) -> bool {
+    if supervisor::is_unreachable(error) {
+        return true;
+    }
+    if supervisor::is_answer(error) {
+        return false;
+    }
+    supervisor
+        .process
+        .is_some_and(|process| proc::wait_gone(process, DYING_WAIT))
+}
+
 /// Shuts the supervisor down (it stops whatever still runs) and waits for it to exit; kills it if
 /// it does not answer or does not exit.
 fn stop_supervisor(record: &supervisor::Record) -> Result<()> {
     let answered = match supervisor::request(&record.endpoint, &Request::Shutdown) {
         Ok(_) => true,
-        Err(e) if supervisor::is_unreachable(&e) => false,
+        Err(e) if is_gone(record, &e) => false,
         Err(e) => return Err(e),
     };
     if let Some(process) = record.process {
@@ -414,7 +433,8 @@ mod tests {
         let endpoint = control::new_endpoint(&s.meta.id).unwrap();
         let process = launcher()
             .launch(&endpoint, &s.tmp, &s.tmp.join("supervisor.log"))
-            .unwrap();
+            .unwrap()
+            .process;
         let mut reaper = Reaper(vec![process]);
         let sup = supervisor::Record {
             endpoint,
@@ -462,10 +482,12 @@ mod tests {
         proc::kill(sup_process).unwrap();
         assert!(proc::wait_gone(sup_process, supervisor::EXIT_WAIT));
         let web_process = web.process.unwrap();
-        assert!(
-            proc::is_running(web_process),
-            "a service outlives a killed supervisor"
-        );
+        if cfg!(unix) {
+            assert!(
+                proc::is_running(web_process),
+                "a service outlives a killed supervisor"
+            );
+        }
 
         let report = teardown(&s.store, &s.meta).unwrap();
         assert!(report.is_clean(), "{report:?}");

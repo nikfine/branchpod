@@ -124,6 +124,16 @@ git -C "$trial/main" commit --allow-empty -m init
 git -C "$trial/main" worktree add "$trial/wt"
 ```
 
-Create `branchpod.local.toml` in `main` of that repository with what you want to try, and run
-`cargo run -- up "$trial/wt"`, `cargo run -- status "$trial/wt"` and `cargo run -- down "$trial/wt"`. After a
-clean `down`, delete the trial directory and close the terminal.
+Create `branchpod.local.toml` in `main` of that repository with what you want to try. Build, and run the
+binary itself:
+
+```
+cargo build
+target/debug/branchpod up "$trial/wt"
+target/debug/branchpod status "$trial/wt"
+target/debug/branchpod down "$trial/wt"
+```
+
+Not `cargo run -- up`: on Windows Cargo runs programs in a Job Object that kills them when Cargo itself is
+killed, and `up` refuses to start services there. After a clean `down`, delete the trial directory and close
+the terminal.

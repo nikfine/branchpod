@@ -6,13 +6,46 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{POLL, ProcId, identify};
+use super::{POLL, ProcId, Tether, identify};
 
-pub(crate) fn new_tree(cmd: &mut Command) {
-    cmd.process_group(0);
+/// The leader of a process group.
+pub(crate) struct Tree(Child);
+
+impl Tree {
+    pub(crate) fn spawn(cmd: &mut Command) -> io::Result<Tree> {
+        cmd.process_group(0).spawn().map(Tree)
+    }
+
+    pub(crate) fn child(&mut self) -> &mut Child {
+        &mut self.0
+    }
+
+    /// Once the leader is reaped its pid may be reused, so what is left of its tree is then
+    /// stopped by its recorded identity, never by the bare pid.
+    pub(crate) fn stop(&mut self, leader: ProcId, grace: Duration) -> io::Result<()> {
+        if self.0.try_wait().ok().flatten().is_some() {
+            stop_recorded_tree(leader, grace)
+        } else {
+            stop_tree(&mut self.0, grace)
+        }
+    }
 }
 
-pub(crate) fn stop_tree(child: &mut Child, grace: Duration) -> io::Result<()> {
+/// Not yet: #15 (Linux), #16 (macOS).
+pub(crate) fn contain() -> io::Result<()> {
+    Ok(())
+}
+
+/// A session of its own is all it takes.
+pub(crate) fn detached_tether() -> io::Result<Tether> {
+    Ok(Tether::Free)
+}
+
+pub(crate) fn own_tether() -> io::Result<Tether> {
+    Ok(Tether::Free)
+}
+
+fn stop_tree(child: &mut Child, grace: Duration) -> io::Result<()> {
     let group = child.id() as libc::pid_t;
     stop_group(group, grace, || {
         // Reap the leader as soon as it exits: a zombie still counts as a group member.
