@@ -17,7 +17,7 @@ use super::{segment, segments};
 use crate::fsutil::retry;
 
 /// How often a follower looks for new output.
-const POLL: Duration = Duration::from_millis(200);
+pub(crate) const POLL: Duration = Duration::from_millis(200);
 
 /// Once the service is gone, how long the log must stay unchanged to count as read to the end. The
 /// writer may be a moment behind the process that produced the output.
@@ -144,7 +144,15 @@ impl Snapshot {
                 let start = end.saturating_sub(CHUNK as u64);
                 let block = &mut buf[..(end - start) as usize];
                 part.file.seek(SeekFrom::Start(start))?;
-                part.file.read_exact(block)?;
+                match part.file.read_exact(block) {
+                    Ok(()) => {}
+                    // Emptied behind our back: nothing of it is left to print.
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        part.len = 0;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
                 for (k, &byte) in block.iter().enumerate().rev() {
                     if byte == b'\n' && !at_end {
                         newlines += 1;
@@ -323,7 +331,7 @@ pub(crate) fn follow(
 impl Cursor {
     /// Whether less than a chunk of the live file is left to read.
     fn caught_up(&self) -> io::Result<bool> {
-        if segments(&self.log)?
+        if retry(|| segments(&self.log))?
             .iter()
             .any(|&seq| seq >= self.generation)
         {
@@ -494,6 +502,21 @@ mod tests {
         fs::remove_file(segment(&l.path, 1)).unwrap();
         fs::remove_file(segment(&l.path, 2)).unwrap();
         assert_eq!(drain(&mut cursor), (b"34".to_vec(), 2));
+    }
+
+    #[test]
+    fn a_log_emptied_after_it_was_opened_has_no_last_lines() {
+        let l = log(&[b"old\n"], Some(b"a\nb\n"));
+        let mut snapshot = Snapshot::open(&l.path).unwrap().unwrap();
+        fs::write(&l.path, "").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        snapshot
+            .tail(Lines::Last(1), |b| {
+                out.extend(b);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(out, b"old\n");
     }
 
     #[test]

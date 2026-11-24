@@ -352,6 +352,62 @@ fn a_service_that_was_never_started_is_waited_for_only_while_up_runs() {
 }
 
 #[test]
+fn a_service_not_recorded_yet_is_waited_for_only_while_up_runs() {
+    let pod = Pod::recorded();
+    fs::remove_file(pod.dir().join("ledger.jsonl")).unwrap();
+    let locks = pod.home.join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let lock = fs::File::create(locks.join("wt-00000000.lock")).unwrap();
+    lock.lock().unwrap();
+    let follower = || {
+        pod.logs_command(&["-f"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let stderr = |child: &mut Child| {
+        let mut err = String::new();
+        let mut pipe = child.stderr.take().unwrap();
+        pipe.read_to_string(&mut err).unwrap();
+        err
+    };
+    // Without `-f` there is nothing to wait for.
+    assert_eq!(pod.logs(&[]).status.code(), Some(1));
+
+    // `up` ends without having recorded the service.
+    let mut never = follower();
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(never.try_wait().unwrap().is_none());
+    lock.unlock().unwrap();
+    assert_eq!(exit_code(&mut never), Some(1));
+    let err = stderr(&mut never);
+    assert!(
+        err.contains("no service web yet") && err.contains("has no services"),
+        "{err}"
+    );
+
+    // The service is recorded, and then fails.
+    lock.lock().unwrap();
+    let mut failed = follower();
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(failed.try_wait().unwrap().is_none());
+    pod.ledger(&[("intent", json!({ "run": ["x"], "cwd": pod.worktree }))]);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(failed.try_wait().unwrap().is_none());
+    pod.ledger(&[("failed", Value::Null)]);
+    assert_eq!(exit_code(&mut failed), Some(1));
+    let err = stderr(&mut failed);
+    assert!(err.contains("boom"), "{err}");
+
+    // `down` holds the lock: nothing will be recorded.
+    fs::remove_file(pod.dir().join("ledger.jsonl")).unwrap();
+    let holder = json!({ "v": 1, "pid": 1, "command": "down", "since": 1 });
+    fs::write(locks.join("wt-00000000.holder"), holder.to_string()).unwrap();
+    assert_eq!(exit_code(&mut follower()), Some(1));
+}
+
+#[test]
 fn a_reader_that_has_seen_enough_is_not_an_error() {
     let pod = Pod::recorded();
     // More than a pipe holds.

@@ -98,6 +98,8 @@ struct Output {
     /// Size at which to rotate next; more than `rotate_at` after a failure.
     rotate_at: u64,
     reported: Option<Instant>,
+    /// Bytes dropped since the last successful write.
+    dropped: u64,
 }
 
 impl Output {
@@ -114,6 +116,7 @@ impl Output {
             size,
             rotate_at: limits.rotate_at,
             reported: None,
+            dropped: 0,
         })
     }
 
@@ -133,16 +136,26 @@ impl Output {
             && let Err(e) = self.empty()
         {
             self.report(&format!("the log is full, dropping output: {e}"));
+            self.dropped += len;
             return;
         }
         match self.file.write_all(bytes) {
-            Ok(()) => self.size += len,
+            Ok(()) => {
+                self.size += len;
+                if self.dropped > 0 {
+                    // Even if the failure was reported: on a full disk that report is lost too.
+                    self.say(&format!("{} bytes of output were dropped", self.dropped));
+                    self.dropped = 0;
+                }
+            }
             Err(e) => {
                 self.report(&format!("cannot write, dropping output: {e}"));
                 // Part of it may have been written.
+                let before = self.size;
                 if let Ok(meta) = self.file.metadata() {
                     self.size = meta.len();
                 }
+                self.dropped += len.saturating_sub(self.size.saturating_sub(before));
             }
         }
     }
@@ -161,7 +174,8 @@ impl Output {
         match open_append(&self.log) {
             Ok(file) => self.file = file,
             Err(e) => {
-                // We go on writing to the old file: readers must find it under its old name.
+                // We go on writing to the old file: readers must find it under its old name. A
+                // follower that took it for a finished segment in between reads it once more.
                 let _ = fs::rename(&next, &self.log);
                 return Err(e);
             }
@@ -183,18 +197,18 @@ impl Output {
         Ok(())
     }
 
-    /// Goes to the supervisor's own log.
+    /// Says it in the supervisor's own log, but not too often.
     fn report(&mut self, problem: &str) {
         if self.reported.is_some_and(|at| at.elapsed() < REPORT_EVERY) {
             return;
         }
         self.reported = Some(Instant::now());
+        self.say(problem);
+    }
+
+    fn say(&self, text: &str) {
         // Not `eprintln!`, which panics if stderr cannot be written to.
-        let _ = writeln!(
-            io::stderr(),
-            "bp supervise: {}: {problem}",
-            self.log.display()
-        );
+        let _ = writeln!(io::stderr(), "bp supervise: {}: {text}", self.log.display());
     }
 }
 
@@ -231,6 +245,18 @@ mod tests {
         out
     }
 
+    /// The end of a pipe is not waited for on macOS: there std creates a pipe and marks it
+    /// close-on-exec in two steps, so a process that another test starts in between would hold it.
+    const ENDS: bool = cfg!(not(target_os = "macos"));
+
+    fn wait_for(log: &Path, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read(log).unwrap() != expected {
+            assert!(Instant::now() < deadline, "{:?}", fs::read(log));
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn moves_everything_until_the_last_writer_is_gone() {
         let dir = tempfile::tempdir().unwrap();
@@ -243,15 +269,15 @@ mod tests {
         second.write_all(b"err \xff\n").unwrap();
         assert!(!pump.wait(Instant::now() + Duration::from_millis(50)));
         drop(second);
-        assert!(pump.wait(Instant::now() + Duration::from_secs(10)));
-        assert_eq!(fs::read(&log).unwrap(), b"out\nerr \xff\n");
+        wait_for(&log, b"out\nerr \xff\n");
+        assert!(!ENDS || pump.wait(Instant::now() + Duration::from_secs(10)));
 
         // Appended to by the next run.
         let (pump, mut writer) = Pump::start(&log).unwrap();
         writer.write_all(b"again\n").unwrap();
         drop(writer);
-        assert!(pump.wait(Instant::now() + Duration::from_secs(10)));
-        assert_eq!(fs::read(&log).unwrap(), b"out\nerr \xff\nagain\n");
+        wait_for(&log, b"out\nerr \xff\nagain\n");
+        assert!(!ENDS || pump.wait(Instant::now() + Duration::from_secs(10)));
     }
 
     #[cfg(unix)]
@@ -380,16 +406,30 @@ mod tests {
 
     /// Writing fails on a handle that cannot write, the stand-in for a full disk.
     #[test]
-    fn output_that_cannot_be_written_is_dropped_and_the_pipe_read_on() {
+    fn output_that_cannot_be_written_is_dropped_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("web.log");
+        let mut out = Output::open(&log, SMALL).unwrap();
+        out.write(b"before ");
+        let file = std::mem::replace(&mut out.file, File::open(&log).unwrap());
+        out.write(b"lost");
+        out.write(b" too");
+        assert_eq!(out.dropped, 8);
+        out.file = file;
+        out.write(b"after");
+        assert_eq!(out.dropped, 0);
+        assert_eq!(fs::read(&log).unwrap(), b"before after");
+    }
+
+    #[test]
+    fn the_pipe_is_read_on_when_output_cannot_be_written() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("web.log");
         let mut out = Output::open(&log, SMALL).unwrap();
         out.file = File::open(&log).unwrap();
         let (reader, mut writer) = io::pipe().unwrap();
-        let pump = thread::spawn(move || run(reader, &mut out));
+        thread::spawn(move || run(reader, &mut out));
         // More than any pipe holds: this would block if nobody read.
         writer.write_all(&vec![b'x'; 1 << 20]).unwrap();
-        drop(writer);
-        pump.join().unwrap();
     }
 }

@@ -174,7 +174,8 @@ One supervisor process per worktree, no global daemon; control over a local sock
   configuration. If it cannot be renamed (on Windows, somebody has it open without sharing deletion), it is
   tried again after every further 1 MB; at 50 MB the live file is emptied, as the newest output is worth
   more than the oldest. Output that cannot be written (a full disk) is dropped. Such problems are reported
-  in `supervisor.log`, at most once a minute per service.
+  in `supervisor.log`, at most once a minute per service; how much was dropped is added once writing works
+  again, as `supervisor.log` is usually on the same full disk. The log itself does not show the gap.
 - **The price.** A service whose supervisor is gone fails at its next write (`SIGPIPE` / `EPIPE`), and
   lives on while it writes nothing. On Windows it dies with the supervisor anyway; on Unix this is worse
   than before until #15 and #16 tie services to the supervisor's life. Known limitation: a supervisor that
@@ -185,10 +186,14 @@ One supervisor process per worktree, no global daemon; control over a local sock
   open: `stop` and `shutdown` give the last output 500 ms, once per request.
 - **`bp logs`** opens the files for a moment only and locks none of them, so a reader cannot affect the
   service. With `-f` it ends with exit code `0` when the service is gone and its log read to the end, or
-  when the pod is torn down; a process left behind that still writes is mentioned, not waited for. A
-  service not started yet is waited for while `bp up` runs, told by the pod lock: it is probed with a
-  shared lock that is given up at once. A busy lock is not touched; in the moment a free one is held, a
-  starting `up` / `down` reports that it waits, and goes on.
+  when the pod is torn down; a process left behind that still writes is mentioned, not waited for. Known
+  limitation: a clean `bp down` removes the log, so a follower can miss what was written in its last
+  200 ms.
+- **Waiting for a start.** While `bp up` runs, `bp logs -f` waits for a service that is not recorded yet or
+  not started yet, and says so; a misspelled name is noticed only when `up` ends. Whether `up` runs is told
+  by the pod lock (and its holder not being `down`), and only for such a service: a busy lock is not
+  touched, a free one is held for a moment (shared), in which a starting `up` / `down` reports that it
+  waits, and goes on.
 
 ### Services on Windows
 

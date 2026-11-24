@@ -26,8 +26,7 @@ pub(crate) fn write_atomic_private(dst: &Path, bytes: &[u8]) -> io::Result<()> {
         remove_file_if_exists(tmp)?;
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        owner_only(&mut options);
         options.open(tmp)
     })
 }
