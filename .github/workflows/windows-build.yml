@@ -1,14 +1,20 @@
 # A Windows release build from a clean machine and clean sources.
 #
 # - Started by hand: builds and checks, and keeps the files as an artifact. Not a release.
-# - A pushed tag `v*`: the same with stricter checks, then a draft of the release with the files attached.
+# - A pushed tag `v<version>`: the same with stricter checks, then a draft of the release with the files attached.
 #   Nothing is public until the draft is published by hand.
 name: Windows build
 
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    # Not `v*`: other tags are for other things, such as releases of a plugin.
+    tags: ["v[0-9]*"]
+
+# One run at a time for a tag or a branch; a run that has started is never cancelled.
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -18,30 +24,41 @@ jobs:
     name: build
     runs-on: windows-latest
     timeout-minutes: 30
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
     defaults:
       run:
         shell: pwsh
     env:
       CARGO_TERM_COLOR: always
-      # An exact version, installed by the rustup of the runner image.
-      RUSTUP_TOOLCHAIN: 1.92.0
+      # Pinned, so that a release does not depend on the day it is built; installed by the rustup of the
+      # runner image. Raise it to the current stable, which CI tests with, before a release.
+      RUSTUP_TOOLCHAIN: 1.100.0
       TARGET: x86_64-pc-windows-msvc
       EXE: target/x86_64-pc-windows-msvc/release/branchpod.exe
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The whole history: a tag must be a commit of `main`.
           fetch-depth: 0
           persist-credentials: false
 
+      - id: commit
+        name: Remember the commit
+        run: |
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "commit=$commit" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Check the tag
         if: github.event_name == 'push'
         run: |
-          $version = (cargo metadata --no-deps --locked --format-version 1 | ConvertFrom-Json).packages[0].version
-          if (-not $version) {
+          $metadata = cargo metadata --no-deps --locked --format-version 1
+          if ($LASTEXITCODE -ne 0) {
             '::error::The version cannot be read from Cargo.toml.'
             exit 1
           }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
           if ($env:GITHUB_REF_NAME -cne "v$version") {
             "::error::The tag is $env:GITHUB_REF_NAME, but Cargo.toml says $version."
             exit 1
@@ -121,7 +138,12 @@ jobs:
 
       - name: Check the version
         run: |
-          $version = (cargo metadata --no-deps --locked --format-version 1 | ConvertFrom-Json).packages[0].version
+          $metadata = cargo metadata --no-deps --locked --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+            '::error::The version cannot be read from Cargo.toml.'
+            exit 1
+          }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
           $head = git rev-parse HEAD
           $output = & $env:EXE --version
           if ($LASTEXITCODE -ne 0) {
@@ -168,7 +190,7 @@ jobs:
           $summary
           @('```') + $summary + @('```') | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: branchpod-windows
           path: ${{ runner.temp }}/dist/*
@@ -193,8 +215,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
+      COMMIT: ${{ needs.build.outputs.commit }}
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: branchpod-windows
           path: dist
@@ -211,9 +234,24 @@ jobs:
         run: |
           tags=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name')
           if grep -Fxq -- "$TAG" <<< "$tags"; then
-            echo "::error::There already is a release or a draft for $TAG. Delete the draft to have it made again."
+            echo "::error::There already is a release or a draft for $TAG. A draft of a failed run may be incomplete: delete it, do not publish it."
+            exit 1
+          fi
+
+      # The tag may have been moved since, or this may be a run from before that, started again.
+      - name: Check that the tag is still at the commit that was built
+        run: |
+          # With `refs/`: `tags/<tag>` does not find the commit of an annotated tag.
+          commit=$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" --jq .sha)
+          if [[ -z $COMMIT || $commit != "$COMMIT" ]]; then
+            echo "::error::The binary was built from ${COMMIT:-an unknown commit}, but $TAG is at $commit now."
             exit 1
           fi
 
       - name: Create the draft
-        run: gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes "" -- *.exe *.sha256
+        run: |
+          options=(--draft --verify-tag --title "$TAG" --notes "")
+          if [[ $TAG == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$TAG" "${options[@]}" -- *.exe *.sha256

@@ -28,7 +28,8 @@ The executable is not signed, and few people have downloaded it. So Windows Smar
 publisher, and a heuristic antivirus may flag it. A warning does not tell whether the file is harmless.
 
 - If the hash does not match, delete the file.
+- If SmartScreen warns, compare the hash and decide for yourself, or build it from source, see the
+  [README](../README.md#installation).
 - If an antivirus blocks the file or flags it, do not run it. [Report it](https://github.com/nikfine/branchpod/issues)
   with the name of the antivirus, its verdict and the SHA256 of the file. Look through what you paste for user names
   and paths.
-- You can also build it from source, see the [README](../README.md#installation).
