@@ -427,10 +427,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::at(tmp.path().to_path_buf());
         let dir = pod(&store, "x");
+        let log = dir.join("logs").join("a.log");
+        fs::create_dir(dir.join("logs")).unwrap();
+        fs::write(&log, "log").unwrap();
         let in_the_way = tmp.path().join("history");
         fs::write(&in_the_way, "").unwrap();
         let err = store.remove_pod("p").unwrap_err();
         assert!(format!("{err:#}").contains("cannot move"), "{err:#}");
+        // The ledger goes after everything else but `pod.json`.
+        assert!(!log.exists());
         assert_eq!(fs::read_to_string(store.ledger_path("p")).unwrap(), "x");
         assert_eq!(store.list().unwrap().len(), 1);
         fs::remove_file(&in_the_way).unwrap();

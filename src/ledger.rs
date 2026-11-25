@@ -301,6 +301,7 @@ pub(crate) fn state(entries: &[Entry]) -> Vec<ResourceState> {
     resources
 }
 
+/// Now, in milliseconds since the Unix epoch.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
