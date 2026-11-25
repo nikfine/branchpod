@@ -39,7 +39,6 @@
   (a Job Object that kills its processes on close). `cargo run` is such a caller.
 - **Windows: a daemon that a command leaves running keeps whoever waits for the end of the output of `up` or
   `down` waiting** ([#82](https://github.com/nikfine/branchpod/issues/82)).
-
 - **`up` does not know whether a container runs.** It only runs the `start` of its command, and `status` does not look
   at commands at all.
 - **`up` on a pod that is there keeps its ports.** If another program has taken one meanwhile, whoever needs it fails,

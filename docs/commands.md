@@ -37,8 +37,11 @@ started.
 - Ports stay as they are and are not checked. Files stay as they are, and deleted ones are not brought back.
 
 It refuses, with `already has resources recorded` and the reason, if the config has changed since (other than in
-comments), if an earlier `up` or `down` did not finish, or if this is not the worktree the pod was created for but a new one at
-the same path. Then run `down` first.
+comments), if an earlier `up` or `down` did not finish, if version 0.1.0 created the pod, or if this is not the
+worktree the pod was created for but a new one at the same path. Then run `down` first.
+
+It also refuses, with `cannot be used as it is`, if the pod has services and their supervisor runs but does not answer.
+The message says what to do.
 
 ## Status
 
