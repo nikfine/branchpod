@@ -49,5 +49,6 @@
   with services is up, so replacing it may fail.
 - **A bare repository or a separate git dir** (a submodule's) has no main checkout: file rules other than `ignore`
   and `{{main}}` do not work there.
-- **Heuristic antivirus scanners may flag a local build on Windows.** It happened to one of ours; the vendor's own
-  online check then reported the same file as clean.
+- **The Windows binary is not signed**: SmartScreen or an antivirus may object, see
+  [The Windows binary](windows.md). A build of your own can be flagged, too: it happened to one of ours, and the
+  vendor's online check then reported the same file as clean.

@@ -1,39 +1,242 @@
-# A Windows release build from a clean machine, without paths of a developer's computer in it: to
-# compare with a local build, or to have it checked by an antivirus vendor. Not a release.
+# A Windows release build from a clean machine and clean sources.
+#
+# - Started by hand: builds and checks, and keeps the files as an artifact. Not a release.
+# - A pushed tag `v<version>`: the same with stricter checks, then a draft of the release with the files attached.
+#   Nothing is public until the draft is published by hand.
 name: Windows build
 
 on:
   workflow_dispatch:
+  push:
+    # Not `v*`: other tags are for other things, such as releases of a plugin.
+    tags: ["v[0-9]*"]
+
+# One run at a time for a tag or a branch; a run that has started is never cancelled.
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   build:
     name: build
     runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      # The compiler of the local build it is compared with.
-      - uses: dtolnay/rust-toolchain@1.92
-      # No cache: everything is compiled from the locked sources.
-      - run: cargo build --release --locked
-      - name: Versions and hashes
+    timeout-minutes: 30
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
+    defaults:
+      run:
         shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      # Pinned, so that a release does not depend on the day it is built; installed by the rustup of the
+      # runner image. Raise it to the current stable, which CI tests with, before a release.
+      RUSTUP_TOOLCHAIN: 1.100.0
+      TARGET: x86_64-pc-windows-msvc
+      EXE: target/x86_64-pc-windows-msvc/release/branchpod.exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history: a tag must be a commit of `main`.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: commit
+        name: Remember the commit
         run: |
-          rustc -vV
-          git rev-parse HEAD
-          $exe = Get-Item target/release/branchpod.exe
-          "size $($exe.Length)"
-          foreach ($algorithm in 'SHA256', 'MD5') {
-            "$algorithm $((Get-FileHash $exe -Algorithm $algorithm).Hash)"
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "commit=$commit" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Check the tag
+        if: github.event_name == 'push'
+        run: |
+          $metadata = cargo metadata --no-deps --locked --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+            '::error::The version cannot be read from Cargo.toml.'
+            exit 1
           }
-      - uses: actions/upload-artifact@v4
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            "::error::The tag is $env:GITHUB_REF_NAME, but Cargo.toml says $version."
+            exit 1
+          }
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) {
+            "::error::The commit of the tag $env:GITHUB_REF_NAME is not in main."
+            exit 1
+          }
+
+      # No cache: everything is compiled from the locked sources.
+      - name: Build
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          # With a separator that cannot be part of a path. The flags are not applied to build scripts and
+          # procedural macros, because of `--target`.
+          $env:CARGO_ENCODED_RUSTFLAGS = @(
+            # Without it the binary needs VCRUNTIME140.dll, which a clean Windows does not have.
+            '-Ctarget-feature=+crt-static'
+            # Panic messages name source files.
+            "--remap-path-prefix=$cargoHome=cargo"
+            "--remap-path-prefix=$env:GITHUB_WORKSPACE=branchpod"
+          ) -join [char]0x1f
+          rustc -vV
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo build --release --locked --target $env:TARGET
+          exit $LASTEXITCODE
+
+      - name: Check that no C runtime has to be installed
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
+            Select-Object -Last 1
+          if (-not $dumpbin) {
+            '::error::dumpbin.exe was not found on the runner.'
+            exit 1
+          }
+          $output = & $dumpbin /nologo /dependents $env:EXE
+          $dlls = @($output | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\S+\.dll$' })
+          $dlls
+          # Every program imports it: without it the output was not understood.
+          if ($dlls -notcontains 'kernel32.dll') {
+            '::error::The imported libraries could not be read.'
+            exit 1
+          }
+          $runtime = @($dlls -match '^(vcruntime|msvcp|msvcr|concrt|ucrtbase|api-ms-win-crt)')
+          if ($runtime) {
+            "::error::The binary needs the C runtime: $($runtime -join ', ')."
+            exit 1
+          }
+
+      - name: Check that no paths of the build machine are in the binary
+        run: |
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $env:EXE).Path)
+          # UTF-16 text can start at an even or an odd offset.
+          $texts = @(
+            [Text.Encoding]::Latin1.GetString($bytes)
+            [Text.Encoding]::Unicode.GetString($bytes)
+            [Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1)
+          )
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $patterns = @('[a-z]:[\\/]+Users[\\/]', [regex]::Escape($env:USERNAME))
+          foreach ($path in $cargoHome, $env:USERPROFILE, $env:GITHUB_WORKSPACE, $env:RUNNER_TEMP) {
+            $patterns += ($path -split '[\\/]+' | ForEach-Object { [regex]::Escape($_) }) -join '[\\/]+'
+          }
+          $found = foreach ($text in $texts) {
+            foreach ($pattern in $patterns) {
+              # With what follows, to see where it comes from.
+              [regex]::Matches($text, "(?i)$pattern[ -~]{0,80}") | ForEach-Object Value
+            }
+          }
+          if ($found) {
+            $found | Sort-Object -Unique | Select-Object -First 20
+            "::error::The binary contains paths of the build machine or its user name ($(@($found).Count) matches)."
+            exit 1
+          }
+
+      - name: Check the version
+        run: |
+          $metadata = cargo metadata --no-deps --locked --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+            '::error::The version cannot be read from Cargo.toml.'
+            exit 1
+          }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          $output = & $env:EXE --version
+          if ($LASTEXITCODE -ne 0) {
+            "::error::branchpod --version failed with exit code $LASTEXITCODE."
+            exit 1
+          }
+          $output
+          if ("$output" -cne "bp $version") {
+            "::error::The binary says `"$output`", Cargo.toml says version $version."
+            exit 1
+          }
+
+      - name: Name and hash
+        run: |
+          $label = if ($env:GITHUB_EVENT_NAME -eq 'push') { $env:GITHUB_REF_NAME } else { git rev-parse --short=9 HEAD }
+          $name = "branchpod-$label-$env:TARGET.exe"
+          $dist = New-Item -ItemType Directory "$env:RUNNER_TEMP/dist"
+          Copy-Item $env:EXE "$dist/$name"
+          $sha256 = (Get-FileHash "$dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          # The format of sha256sum.
+          [IO.File]::WriteAllText("$dist/$name.sha256", "$sha256  $name`n")
+          $summary = @(
+            $name
+            "commit $(git rev-parse HEAD)"
+            "size   $((Get-Item "$dist/$name").Length)"
+            "SHA256 $sha256"
+            # Antivirus vendors ask for it.
+            "MD5    $((Get-FileHash "$dist/$name" -Algorithm MD5).Hash.ToLowerInvariant())"
+          )
+          $summary
+          @('```') + $summary + @('```') | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: branchpod-windows
-          path: target/release/branchpod.exe
+          path: ${{ runner.temp }}/dist/*
           if-no-files-found: error
           retention-days: 7
+
+  # The only job that can write. It runs no code of the project: there is no checkout, and the binary is
+  # only passed on.
+  draft-release:
+    name: draft-release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: dist
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      COMMIT: ${{ needs.build.outputs.commit }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: branchpod-windows
+          path: dist
+
+      - name: Check the hash
+        run: |
+          if ! sha256sum --check --strict -- *.sha256; then
+            echo "::error::The files are not the ones that were built."
+            exit 1
+          fi
+
+      # Drafts included: neither a draft nor a published release is ever overwritten.
+      - name: Check that there is no such release yet
+        run: |
+          tags=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name')
+          if grep -Fxq -- "$TAG" <<< "$tags"; then
+            echo "::error::There already is a release or a draft for $TAG. A draft of a failed run may be incomplete: delete it, do not publish it."
+            exit 1
+          fi
+
+      # The tag may have been moved since, or this may be a run from before that, started again.
+      - name: Check that the tag is still at the commit that was built
+        run: |
+          # With `refs/`: `tags/<tag>` does not find the commit of an annotated tag.
+          commit=$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" --jq .sha)
+          if [[ -z $COMMIT || $commit != "$COMMIT" ]]; then
+            echo "::error::The binary was built from ${COMMIT:-an unknown commit}, but $TAG is at $commit now."
+            exit 1
+          fi
+
+      - name: Create the draft
+        run: |
+          options=(--draft --verify-tag --title "$TAG" --notes "")
+          if [[ $TAG == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$TAG" "${options[@]}" -- *.exe *.sha256
