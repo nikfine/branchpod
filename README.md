@@ -16,7 +16,7 @@ worktree is already gone. Any tool can create the worktree and call them. For Wi
 elsewhere). Either way it needs `git` 2.31 or newer on `PATH` at run time.
 
 ```
-cargo install --locked --git https://github.com/nikfine/branchpod
+cargo install --locked --git https://github.com/nikfine/branchpod --tag v0.2.0
 ```
 
 ## Usage
@@ -32,7 +32,8 @@ file = [{ path = ".env", mode = "copy", optional = true }]
 service = [{ name = "web", run = ["your-dev-server", "--port", "{{port.web}}"] }]
 ```
 
-- `branchpod up ../feature` creates everything the config describes.
+- `branchpod up ../feature` creates everything the config describes. Run it again after a reboot: it starts what does
+  not run any more.
 - `branchpod status ../feature` shows what is there, whether it still runs, and what to do if not.
 - `branchpod logs web ../feature` prints the output of a service.
 - `branchpod down ../feature` removes everything that was created.
