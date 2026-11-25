@@ -133,6 +133,45 @@ fn tree_process() {
     }
 }
 
+/// Comes right before the arguments of [`args_process`]; to the test runner they are names of
+/// further tests, so none may start with `-`.
+#[cfg(windows)]
+const ARGS_MARK: &str = "bp-test-args";
+
+/// Prints `args` as it got them, a line `arg <escaped>` for each: this test binary re-running
+/// [`args_process`].
+#[cfg(windows)]
+pub(crate) fn print_args(args: &[String]) -> Vec<String> {
+    let exe = std::env::current_exe().unwrap();
+    let mut run = vec![exe.to_str().unwrap().to_owned()];
+    run.extend(
+        [
+            "--exact",
+            "test_support::args_process",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+            ARGS_MARK,
+        ]
+        .map(str::to_owned),
+    );
+    run.extend_from_slice(args);
+    run
+}
+
+/// Not a test by itself: the program behind [`print_args`].
+#[cfg(windows)]
+#[test]
+#[ignore = "a program of other tests, which start it themselves"]
+fn args_process() {
+    let args = std::env::args().skip_while(|arg| arg != ARGS_MARK);
+    // The test runner left a line unfinished.
+    println!();
+    for arg in args.skip(1) {
+        println!("arg {}", arg.escape_default());
+    }
+}
+
 /// Prints a line, then sleeps for a long time, using what every CI runner has.
 pub(crate) fn long_running(marker: &str) -> Vec<String> {
     if cfg!(windows) {

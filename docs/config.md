@@ -184,8 +184,9 @@ Anything created by one command and removed by another: a container, a volume, a
 - `create` runs in the root of the worktree. `destroy` too while it exists, otherwise in the
   [state directory](commands.md#state): have it use absolute paths, such as `{{main}}`.
 - A bare program name is searched on `PATH`. A relative one with a directory (`./scripts/up.sh`) is taken from the
-  working directory. On Windows a `.cmd` or `.bat` script is named with its extension (`npx.cmd`), which other
-  systems do not have: call the program behind it if the config is to work everywhere.
+  working directory. On Windows either may be a script named without its extension: `npx` runs `npx.cmd` (`.com`,
+  `.bat` or `.cmd`, in the order of `PATHEXT`), but an `npx.exe` anywhere on `PATH` comes first. An argument of a
+  `.cmd` or `.bat` script cannot contain a line break.
 - On Windows, a process that a command leaves running keeps the output of `up` or `down` open
   ([#82](https://github.com/nikfine/branchpod/issues/82)).
 
@@ -326,7 +327,7 @@ does not stop the others.
 | `printed nothing`, `printed several lines` | Output that `destroy` needs, or that goes to a file, cannot be used. |
 | `output is not valid UTF-8` | Output of a command without `output = "file"`. |
 | `no free port` | Every port of the range is taken. |
-| `program not found` | Not on `PATH`, or a Windows script without its extension. |
+| `program not found` | Not on `PATH`; on Windows, as an `.exe`, `.com`, `.bat` or `.cmd`. |
 | `already has resources recorded` | The pod is up, or an earlier `up` failed: run `down` first. If the worktree is a new one at a path used before, `down` takes what is at the recorded paths for its own, even if it is yours: it deletes directories and moves changed files to `saved`. Move them away first. |
 | `looks like an unexpanded variable` | The caller passed `%NAME%` or `$NAME` as the path. |
 
