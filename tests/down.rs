@@ -32,6 +32,13 @@ fn entry(kind: &str, name: &str, op: &str, data: serde_json::Value) -> serde_jso
     serde_json::json!({ "v": 1, "ts_ms": 1, "kind": kind, "name": name, "op": op, "data": data })
 }
 
+/// The ledgers of the pods that are gone.
+fn history(home: &Path) -> Vec<String> {
+    let entries = fs::read_dir(home.join("history"));
+    let paths = entries.into_iter().flatten().map(|e| e.unwrap().path());
+    paths.map(|p| fs::read_to_string(p).unwrap()).collect()
+}
+
 #[test]
 fn exit_code_tells_clean_from_leftovers() {
     let tmp = tempfile::tempdir().unwrap();
@@ -53,21 +60,24 @@ fn exit_code_tells_clean_from_leftovers() {
     assert_eq!(code, 3, "{stdout}{stderr}");
     assert!(stderr.contains("service vite"), "{stderr}");
     assert!(dir.join("pod.json").exists());
+    assert!(history(&home).is_empty());
 
     // Once the leftover is gone (here: by hand), `down` finishes and removes the pod.
     let destroyed = entry("service", "vite", "destroyed", serde_json::Value::Null);
     let mut ledger = fs::read_to_string(dir.join("ledger.jsonl")).unwrap();
     ledger.push_str(&format!("{destroyed}\n"));
-    fs::write(dir.join("ledger.jsonl"), ledger).unwrap();
+    fs::write(dir.join("ledger.jsonl"), &ledger).unwrap();
     let (code, stdout, stderr) = bp(&home, &["down".as_ref(), worktree.as_os_str()]);
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(stdout.contains("clean"), "{stdout}");
     assert!(!dir.exists());
+    assert_eq!(history(&home), [ledger.as_str()]);
 
     // Nothing recorded any more: still a success.
     let (code, stdout, _) = bp(&home, &["down".as_ref(), worktree.as_os_str()]);
     assert_eq!(code, 0);
     assert!(stdout.contains("no pod"), "{stdout}");
+    assert_eq!(history(&home), [ledger]);
 }
 
 /// The pod records the canonical path; a hook may spell it with `..`, an 8.3 name (Windows

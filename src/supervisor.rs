@@ -22,7 +22,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use serde_json::Value;
 
 use crate::commands;
 use crate::control::{self, Conn, Server};
+use crate::ledger::now_ms;
 use crate::logs::pump::Pump;
 use crate::proc::{self, LeaderExit, ProcId, Program, Tether, Tree};
 
@@ -417,14 +418,6 @@ fn watch(name: &str, exit: io::Result<LeaderExit>) -> Arc<OnceLock<u64>> {
         eprintln!("bp supervise: cannot wait for service {name:?} to exit: {e}");
     }
     at
-}
-
-/// Now, in milliseconds since the Unix epoch.
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// The supervisor process: listens on `endpoint` and serves requests until `shutdown`.

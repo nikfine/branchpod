@@ -9,7 +9,7 @@ use std::str::FromStr;
 use anyhow::{Result, bail};
 use serde_json::json;
 
-use crate::ledger::{Kind, ResourceState, Status};
+use crate::ledger::{self, Kind, ResourceState, Status};
 use crate::logs::read;
 use crate::proc::{self, ProcId};
 use crate::{config, console, down, fsutil, pod, services, status, supervisor, up, worktree};
@@ -116,7 +116,7 @@ pub fn status(path: Option<&OsStr>, json: bool) -> Result<ExitCode> {
         });
         print_out(&serde_json::to_string_pretty(&out)?)?;
     } else {
-        print_out(report.text(supervisor::now_ms()).trim_end())?;
+        print_out(report.text(ledger::now_ms()).trim_end())?;
     }
     Ok(match report.health.state {
         status::Health::Healthy => ExitCode::SUCCESS,

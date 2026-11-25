@@ -65,4 +65,17 @@ fn a_git_hook_finds_the_same_pod() {
         assert!(run("down", hook_first).contains("clean"));
         assert!(!main.join(".git/worktrees/wt/.branchpod").exists());
     }
+
+    // One ledger for each time the pod was there, with nothing of the other.
+    let history = fs::read_dir(base.join("home/history")).unwrap();
+    let ledgers: Vec<String> = history
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(ledgers.len(), 2);
+    for ledger in ledgers {
+        for op in ["intent", "created", "destroyed"] {
+            let op = format!(r#""op":"{op}""#);
+            assert_eq!(ledger.matches(&op).count(), 1, "{ledger}");
+        }
+    }
 }

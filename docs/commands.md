@@ -91,6 +91,13 @@ tell the worktree from a later one at the same path. `down` removes it.
 Every command must see the same state directory. Arguments of commands and services are recorded there as they were run, so do
 not pass secrets in them.
 
+When `down` removes a pod, it keeps the ledger, the record of what was created and removed, as
+`history/<pod id>-<time>.jsonl`, where `<time>` is in milliseconds since 1970. `up` at the same path starts a new one.
+Each line has its time in `ts_ms`: from the `intent` of a resource to its `created` (or `failed`) is how long it took.
+No command reads the history, and nothing cleans it up: delete what you do not need. A ledger may hold arguments of
+commands and services, command output (not that of `output = "file"`), error messages with what a command printed to
+stderr, paths, and hashes of copied files, which give short secrets away: look through it before you pass it on.
+
 Edited files that `down` kept are in `saved/<pod id>/<time>/`, where `<time>` is in milliseconds since 1970, under
 the path they had in the worktree. `down` never removes them: do it yourself once you do not need them, and mind that
 they may hold secrets.
