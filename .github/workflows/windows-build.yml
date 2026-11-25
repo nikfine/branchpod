@@ -144,29 +144,14 @@ jobs:
             exit 1
           }
           $version = ($metadata | ConvertFrom-Json).packages[0].version
-          $head = git rev-parse HEAD
           $output = & $env:EXE --version
           if ($LASTEXITCODE -ne 0) {
             "::error::branchpod --version failed with exit code $LASTEXITCODE."
             exit 1
           }
           $output
-          if ("$output" -cnotmatch '^bp (?<version>\S+)(?: \((?<commit>[^()]+)\))?$') {
-            "::error::Unexpected output of branchpod --version: $output"
-            exit 1
-          }
-          $commit = $Matches.commit
-          if ($Matches.version -cne $version) {
-            "::error::The binary says version $($Matches.version), Cargo.toml says $version."
-            exit 1
-          }
-          # A mark for uncommitted changes (`-dirty`) is rejected here as well.
-          if ($commit -and ($commit -cnotmatch '^[0-9a-f]{7,40}$' -or -not $head.StartsWith($commit))) {
-            "::error::The binary says commit $commit, but it was built from $head."
-            exit 1
-          }
-          if (-not $commit -and $env:GITHUB_EVENT_NAME -eq 'push') {
-            '::error::The binary does not say which commit it was built from.'
+          if ("$output" -cne "bp $version") {
+            "::error::The binary says `"$output`", Cargo.toml says version $version."
             exit 1
           }
 
