@@ -1,6 +1,6 @@
 [package]
 name = "branchpod"
-version = "0.2.0"
+version = "0.3.0-dev"
 edition = "2024"
 # 1.89: std::fs::File::lock
 rust-version = "1.89"
