@@ -614,6 +614,17 @@ the Orca plugin catalog).
   means "not set".
 - **Pod id** is `<slug>-<8 hex of the path hash>`, limited to `[a-z0-9-]` for use in labels.
 - The binary is installed as `branchpod`; `bp` is an optional alias (see "Name").
+- **The commit in `--version`:** `bp 0.1.0 (abc123456)`; `-V` is the bare version, for scripts. Found out by
+  `build.rs`, which runs `git` and needs no crates: a variable set by whoever installs `bp` would leave
+  `cargo install --git` without the commit.
+  - The build never fails because of git. Without it, or when the sources are not the top of a repository
+    (an archive unpacked inside another one), the version is the bare one.
+  - `-dirty` is appended when `src`, `Cargo.toml`, `Cargo.lock` or `build.rs` differ from the commit, new files
+    in `src` included. Nothing else goes into the binary, so nothing else marks it or causes a rebuild.
+  - A rebuild after a commit or a checkout updates it. The price: `bp` itself is compiled again then, and
+    while the ref of the branch is packed, also after commits to other branches.
+  - Known limitation: a repository that appears (or a git that starts to work) after a build without one is
+    noticed at the next change of the sources.
 
 ## Name
 

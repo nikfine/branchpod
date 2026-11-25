@@ -12,6 +12,9 @@ The path is optional and defaults to the current directory.
 
 A usage error exits with `2`.
 
+`branchpod --version` prints the commit of the build, too, when it is known: `bp 0.1.0 (abc123456)`, or
+`bp 0.1.0 (abc123456-dirty)` if the sources differed from that commit. `-V` prints the version alone, for scripts.
+
 **`down` with code `0` is not proof that something was torn down.** It prints `clean` when it did, and
 `no pod for ...` when it found none: the path is wrong, `BRANCHPOD_HOME` is another one, the worktree was moved, or
 the pod is already gone.

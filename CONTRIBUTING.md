@@ -22,7 +22,11 @@ on, so a broken branch cannot break its own environment. Run this in an up-to-da
 cargo install --locked --path .
 ```
 
-The command is `branchpod`. Messages call it `bp`, which is only an optional alias.
+The command is `branchpod`. Messages call it `bp`, which is only an optional alias. `branchpod --version` shows
+the commit it was built from.
+
+The build script (`build.rs`) runs `git` to find that commit. On a machine with an antivirus, better check your
+changes in a container or in CI.
 
 Then create `branchpod.local.toml` in the **main checkout**. It is git-ignored, and it is read from there
 only: a copy inside a worktree has no effect.

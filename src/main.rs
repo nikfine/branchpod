@@ -8,7 +8,13 @@ use branchpod::cli;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "bp", version, about = "A resource runtime for git worktrees")]
+// `-V` is the bare version, for scripts; `--version` adds the commit (see `build.rs`).
+#[command(
+    name = "bp",
+    version,
+    long_version = env!("BRANCHPOD_LONG_VERSION"),
+    about = "A resource runtime for git worktrees"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
