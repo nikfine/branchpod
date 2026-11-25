@@ -1,11 +1,12 @@
 # Commands
 
-The path is optional and defaults to the current directory.
+The path is the root of a worktree. Without one, the worktree around the current directory is meant. `status`, `down`
+and `logs` refuse a directory inside a worktree that has a pod, with code `1`.
 
 | Command | What it does | Exit codes |
 |---|---|---|
 | `branchpod up [PATH]` | Creates what the config describes. Refuses if the pod already has anything recorded: run `down` first. | `0` everything was created, `1` failed |
-| `branchpod status [PATH] [--json]` | Shows what is recorded for the pod and whether it still runs, see [Status](#status). Only looks. | `0` healthy, or there is no pod; `4` degraded; `5` busy; `1` failed, for example outside a git worktree |
+| `branchpod status [PATH] [--json]` | Shows what is recorded for the pod and whether it still runs, see [Status](#status). Only looks. | `0` healthy, or there is no pod; `4` degraded; `5` busy; `1` failed, for example without a path outside a git worktree |
 | `branchpod down [PATH]` | Tears down everything recorded, in reverse order. | `0` nothing is left, or there is no pod (see below); `3` something is left: fix the cause and run it again; `1` could not run |
 | `branchpod logs SERVICE [PATH] [-f] [-n N]` | Prints the output of a service: the last 200 lines, `-n N` or `-n all`. `-f` follows it until the service is gone. | `0`; `1` no such pod, service or log, or failed |
 | `branchpod config [PATH] [--json]` | Prints the effective configuration. Does not render or check variables. Creates nothing. | `0`; `1` no configuration, or it is invalid |

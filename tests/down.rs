@@ -93,6 +93,108 @@ fn a_gone_worktree_is_found_however_its_path_is_spelled() {
     assert!(dir.join("pod.json").exists());
 }
 
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git").arg("-C").arg(dir).args(args).status();
+    assert!(status.unwrap().success(), "git {args:?}");
+}
+
+/// What `down`, `status` and `logs` say about `path`.
+fn assert_no_pod(home: &Path, path: &Path) {
+    for command in ["down", "status"] {
+        let (code, stdout, stderr) = bp(home, &[command.as_ref(), path.as_os_str()]);
+        let what = format!("{command} {}: {stdout}{stderr}", path.display());
+        assert_eq!((code, stderr.as_str()), (0, ""), "{what}");
+        assert!(stdout.starts_with("no pod for "), "{what}");
+    }
+    let args = ["status".as_ref(), "--json".as_ref(), path.as_os_str()];
+    let (code, stdout, stderr) = bp(home, &args);
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!((code, &status["pod"]), (0, &serde_json::Value::Null));
+    assert_eq!(stderr, "");
+    // There is nothing to print.
+    let (code, _, stderr) = bp(home, &["logs".as_ref(), "web".as_ref(), path.as_os_str()]);
+    assert_eq!(code, 1);
+    assert!(stderr.starts_with("bp: no pod for "), "{stderr}");
+}
+
+/// `git worktree remove --force` may leave the directory behind, with or without its `.git`.
+#[test]
+fn what_is_left_of_a_worktree_has_no_pod() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let left = tmp.path().join("left-\u{e9}");
+    fs::create_dir(&left).unwrap();
+    assert_no_pod(&home, &left);
+    let nowhere = tmp.path().join("no such directory");
+    let gitdir = format!("gitdir: {}\n", nowhere.display());
+    fs::write(left.join(".git"), gitdir).unwrap();
+    assert_no_pod(&home, &left);
+    // These need a worktree.
+    for command in ["up", "config"] {
+        let (code, _, stderr) = bp(&home, &[command.as_ref(), left.as_os_str()]);
+        assert_eq!(code, 1, "{command}");
+        assert!(stderr.contains("is not inside a git worktree"), "{stderr}");
+    }
+
+    // Inside a repository that has no pod.
+    let main = tmp.path().join("main");
+    let inside = main.join(".worktrees").join("x");
+    fs::create_dir_all(&inside).unwrap();
+    git(&main, &["init", "-q"]);
+    assert_no_pod(&home, &inside);
+}
+
+#[test]
+fn the_pod_around_a_path_is_not_its_pod() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let main = dunce::canonicalize(tmp.path()).unwrap().join("main");
+    let below = main.join("sub");
+    let deep = main.join(".worktrees").join("x").join("node_modules");
+    let own = main.join(".worktrees").join("own");
+    let dangling = main.join(".worktrees").join("dangling");
+    for dir in [&below, &deep, &own, &dangling] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    git(&main, &["init", "-q"]);
+    let intent = entry("service", "vite", "intent", serde_json::Value::Null);
+    let dir = pod(&home, &main, &[intent]);
+    let state =
+        || ["pod.json", "ledger.jsonl"].map(|name| fs::read_to_string(dir.join(name)).unwrap());
+    let before = state();
+
+    for path in [&below, &deep] {
+        for args in [&["down"][..], &["status"], &["logs", "vite"]] {
+            let mut args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
+            args.push(path.as_os_str());
+            let (code, stdout, stderr) = bp(&home, &args);
+            assert_eq!((code, stdout.as_str()), (1, ""), "{args:?}: {stderr}");
+            assert!(stderr.contains("is not a worktree root"), "{stderr}");
+        }
+    }
+    // These are roots, or were: a worktree without a pod, and what is left of one.
+    git(&own, &["init", "-q"]);
+    let nowhere = format!("gitdir: {}\n", main.join("nowhere").display());
+    fs::write(dangling.join(".git"), nowhere).unwrap();
+    assert_no_pod(&home, &own);
+    assert_no_pod(&home, &dangling);
+    // As is a worktree that is gone completely.
+    assert_no_pod(&home, &main.join(".worktrees").join("gone"));
+    assert_eq!(state(), before);
+
+    // The current directory stands for the worktree it is in.
+    for (command, code) in [("status", 4), ("down", 3)] {
+        let out = Command::new(env!("CARGO_BIN_EXE_branchpod"))
+            .arg(command)
+            .current_dir(&below)
+            .env("BRANCHPOD_HOME", &home)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{command}: {stderr}");
+    }
+}
+
 #[test]
 fn a_damaged_ledger_means_teardown_could_not_run() {
     let tmp = tempfile::tempdir().unwrap();

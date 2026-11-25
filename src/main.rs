@@ -36,7 +36,7 @@ enum Cmd {
     /// is none, 4 when it is degraded (a hint says what to do), 5 when it is busy (`bp up` or
     /// `bp down` is at work: wait), 1 when its state cannot be read.
     Status {
-        /// Worktree path; defaults to the current directory.
+        /// Root of the worktree; by default the one the current directory is in.
         path: Option<OsString>,
         #[arg(long)]
         json: bool,
@@ -50,7 +50,7 @@ enum Cmd {
     /// resources are left behind (run it again once their cause is fixed), 1 when teardown could
     /// not run.
     Down {
-        /// Worktree path; defaults to the current directory.
+        /// Root of the worktree; by default the one the current directory is in.
         path: Option<OsString>,
     },
     /// Print the output of a service.
@@ -61,7 +61,7 @@ enum Cmd {
     Logs {
         /// Name of the service.
         service: String,
-        /// Worktree path; defaults to the current directory.
+        /// Root of the worktree; by default the one the current directory is in.
         path: Option<OsString>,
         /// Keep printing what the service writes.
         #[arg(short, long)]

@@ -76,6 +76,13 @@ Rules:
   started by `destroy` would keep it as its working directory). A path given for a deleted worktree is
   matched in canonical form (deepest existing ancestor canonicalized, `..` resolved), so `..`, 8.3 names
   and `/var` vs `/private/var` still find the pod.
+- A path given to `down`, `status` or `logs` is the root of a worktree, and git is not asked about it: what
+  `git worktree remove` left behind may be in no repository, in a broken one, or in the main checkout, whose
+  pod must not be taken for its own. Without a path it is the worktree around the current directory.
+- A path inside a worktree that has a pod, with no `.git` in between, is an error, not "no pod": `up` takes it
+  for that worktree, so a hook that passes it to both would leave everything running. The message does not
+  suggest `down` of that worktree. The price: a repeated `down` of what is left, without its `.git`, inside a
+  main checkout that has a pod fails with `1`.
 - Every resource that is not destroyed is visited, pending and failed ones included. Each outcome is
   recorded (`destroyed`, or `failed` with the error and the data kept for the next attempt); a failure
   never stops the other steps.

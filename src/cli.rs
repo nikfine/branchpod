@@ -458,9 +458,13 @@ pub fn supervise(endpoint: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Finds the pod of `path` (default: the current directory). A recorded pod is preferred, so a
-/// worktree that is already gone is still found, however the caller spells its path (recorded
-/// paths are canonical); a path that does not exist has no other pod.
+/// Finds the pod of the worktree whose root is `path`; without a path, of the worktree the current
+/// directory is in. A recorded pod is preferred, so a worktree that is already gone is still found,
+/// however the caller spells its path (recorded paths are canonical); a path that does not exist has
+/// no other pod.
+///
+/// Git is not asked about a path: what `git worktree remove` leaves behind may be in no repository,
+/// in a broken one, or in the main checkout, whose pod is not the one that is meant.
 fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option<pod::PodMeta>)> {
     let target = match path {
         Some(p) => {
@@ -480,9 +484,28 @@ fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option
     if !target.exists() {
         return Ok((target, None));
     }
-    let wt = worktree::Worktree::resolve(Some(target.as_os_str()))?;
-    let meta = store.find_by_worktree(&wt.root)?;
-    Ok((target, meta))
+    if path.is_none() {
+        let wt = worktree::Worktree::resolve(Some(target.as_os_str()))?;
+        let meta = store.find_by_worktree(&wt.root)?;
+        return Ok((target, meta));
+    }
+    // `up` takes a directory inside a worktree for that worktree. "No pod" would make whoever passes
+    // the same to `down` believe that nothing is left.
+    let pods = store.list()?;
+    for dir in target.ancestors() {
+        if pods.iter().any(|p| pod::same_path(&p.worktree, dir)) {
+            bail!(
+                "{} is not a worktree root; it lies inside {}, which has a pod",
+                target.display(),
+                dir.display()
+            );
+        }
+        // The root of another worktree, or what is left of one: `up` goes no further either.
+        if dir.join(".git").symlink_metadata().is_ok() {
+            break;
+        }
+    }
+    Ok((target, None))
 }
 
 #[cfg(test)]
