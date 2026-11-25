@@ -173,6 +173,31 @@ pub(crate) fn normalize(path: &Path) -> Result<PathBuf> {
     Ok(abs)
 }
 
+/// Whether `dir` is surely in no repository at all: git says so, and there is no `.git` in it or
+/// above (git passes over one that it cannot recognize). Anything that keeps git from telling, git
+/// missing included, is a `false`.
+pub(crate) fn outside_any_repository(dir: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--git-dir"])
+        .env("LC_ALL", "C") // the message is translated, and `LANGUAGE` counts unless this is `C`
+        .output()
+    else {
+        return false;
+    };
+    // "(or any of the parent directories)" or "(or any parent up to mount point ...)". Without it,
+    // what is not a repository is where `.git` or `GIT_DIR` points to.
+    !output.status.success()
+        && String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line.starts_with("fatal: not a git repository (or any "))
+        && dir.ancestors().all(|ancestor| {
+            std::fs::symlink_metadata(ancestor.join(".git"))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+}
+
 /// Runs git without a shell and returns stdout. Git prints paths as UTF-8 on every platform, so
 /// the output is never decoded with the console code page.
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {

@@ -460,7 +460,11 @@ pub fn supervise(endpoint: &str) -> Result<ExitCode> {
 
 /// Finds the pod of `path` (default: the current directory). A recorded pod is preferred, so a
 /// worktree that is already gone is still found, however the caller spells its path (recorded
-/// paths are canonical); a path that does not exist has no other pod.
+/// paths are canonical); a path that does not exist has no other pod, and neither has a directory
+/// outside any repository, such as what `git worktree remove` left behind.
+///
+/// Only the current directory stands for the worktree it is in. Such a leftover directory may lie
+/// inside another worktree, the main checkout for example, whose pod is not the one that is meant.
 fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option<pod::PodMeta>)> {
     let target = match path {
         Some(p) => {
@@ -480,8 +484,20 @@ fn find_pod(store: &pod::Store, path: Option<&OsStr>) -> Result<(PathBuf, Option
     if !target.exists() {
         return Ok((target, None));
     }
-    let wt = worktree::Worktree::resolve(Some(target.as_os_str()))?;
+    let wt = match worktree::Worktree::resolve(Some(target.as_os_str())) {
+        Ok(wt) => wt,
+        Err(_) if worktree::outside_any_repository(&target) => return Ok((target, None)),
+        Err(e) => return Err(e),
+    };
     let meta = store.find_by_worktree(&wt.root)?;
+    if path.is_some() && meta.is_some() && !pod::same_path(&wt.root, &target) {
+        notice(format_args!(
+            "{} is not a worktree itself; the pod of the one it is in is that of {}",
+            target.display(),
+            wt.root.display()
+        ));
+        return Ok((target, None));
+    }
     Ok((target, meta))
 }
 
