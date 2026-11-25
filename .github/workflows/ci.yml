@@ -41,28 +41,6 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  bench:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Get-MpComputerStatus | Format-List AMServiceEnabled, AntivirusEnabled, RealTimeProtectionEnabled, OnAccessProtectionEnabled, IsTamperProtected
-          Get-MpPreference | Format-List DisableRealtimeMonitoring, ExclusionPath
-          Get-Volume | Format-Table DriveLetter, FileSystem, Size
-      - run: cargo test --release --lib bench -- --ignored --nocapture
-        env:
-          BP_BENCH_DIR: ${{ runner.temp }}
-          BP_BENCH_COLD: ${{ runner.os == 'Linux' && '1' || '' }}
-
   # The job name is a required status check: keep it free of the version number.
   msrv:
     name: msrv
