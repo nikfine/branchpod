@@ -8,8 +8,12 @@ worktree is already gone. Any tool can create the worktree and call them. For Wi
 
 ## Installation
 
-There are no prebuilt binaries: build it with Rust 1.89 or newer and a linker (Build Tools for Visual Studio on
-Windows, `cc` elsewhere). At run time it needs `git` 2.31 or newer on `PATH`.
+**Windows (x86_64):** download the `.exe` and its `.sha256` from
+[Releases](https://github.com/nikfine/branchpod/releases), [check the hash](docs/windows.md), rename the file to
+`branchpod.exe` and put it in a directory on `PATH`. It is not signed: SmartScreen or an antivirus may object.
+
+**Anywhere, from source:** with Rust 1.89 or newer and a linker (Build Tools for Visual Studio on Windows, `cc`
+elsewhere). Either way it needs `git` 2.31 or newer on `PATH` at run time.
 
 ```
 cargo install --locked --git https://github.com/nikfine/branchpod
@@ -44,6 +48,6 @@ service = [{ name = "web", run = ["your-dev-server", "--port", "{{port.web}}"] }
 
 - [Commands](docs/commands.md) with exit codes, [configuration](docs/config.md)
 - [Design decisions](docs/design/initial-decisions.md), including what is not built yet; [contributing](CONTRIBUTING.md)
-<!-- The skill for agents goes here (#55). -->
+- What comes next: [milestones](https://github.com/nikfine/branchpod/milestones)
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.

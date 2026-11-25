@@ -614,6 +614,10 @@ the Orca plugin catalog).
   means "not set".
 - **Pod id** is `<slug>-<8 hex of the path hash>`, limited to `[a-z0-9-]` for use in labels.
 - The binary is installed as `branchpod`; `bp` is an optional alias (see "Name").
+- **Releases.** A tag `v<version>` on a commit of `main` makes CI build the Windows binary and attach it, with its
+  SHA256, to a draft; publishing is done by hand. Only the job that makes the draft can write, and it runs no code
+  of the project. The C runtime is linked statically: a clean Windows does not have `VCRUNTIME140.dll`. The
+  binary is not signed; the hash next to it shows a damaged download, not where the file comes from.
 
 ## Name
 
