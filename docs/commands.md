@@ -36,8 +36,8 @@ started.
   `left as it is`.
 - Ports stay as they are and are not checked. Files stay as they are, and deleted ones are not brought back.
 
-It refuses, with `already has resources recorded` and the reason, if the config is not what the pod was created from,
-if an earlier `up` or `down` did not finish, or if this is not the worktree the pod was created for but a new one at
+It refuses, with `already has resources recorded` and the reason, if the config has changed since (other than in
+comments), if an earlier `up` or `down` did not finish, or if this is not the worktree the pod was created for but a new one at
 the same path. Then run `down` first.
 
 ## Status

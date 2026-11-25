@@ -327,7 +327,7 @@ fn a_service_that_was_never_started_is_waited_for_only_while_up_runs() {
     let out = pod.logs(&["-f"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        text(&out.stderr).contains("bp down"),
+        text(&out.stderr).contains("bp status"),
         "{}",
         text(&out.stderr)
     );

@@ -285,6 +285,10 @@ Rules for file resources:
   without passing through a link; otherwise it is left in place and reported. A copied directory is removed
   with whatever was written into it; parent directories created for it are removed while empty. A single file
   whose content changed is kept, see "Edited copies".
+- A directory is copied on 8 threads, whatever the number of CPUs; not configurable. One thread lists the
+  source, creates directories and links, and passes files on through a short queue, so that little time passes
+  between listing a file and copying it. The first error stops all threads, and they are waited for before the
+  failure is recorded: nothing is written after that. On Unix directories get their permissions at the end.
 - `link`: symlink on Unix; on Windows a junction for directories (no privileges needed) and a symlink for
   files. Without the right to create a file symlink (Developer Mode or admin) it is an error with a hint,
   not a silent copy: a copy would quietly stop propagating edits. Hard links are rejected (editors that
@@ -459,6 +463,8 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
   detached HEAD, a bare repository, a path that is not UTF-8), a reference to it fails and says why.
 - `up` returns once every service is started (its process exists), not once it is ready: readiness
   hooks are #18.
+- The text output tells how long each resource took: planning, creating and recording it. After a failure
+  nothing is listed but what is recorded, without times.
 
 ### A pod that is there already
 
@@ -467,20 +473,26 @@ and destroys nothing. It used to refuse any pod that was there, which left `down
 that deletes copied directories with what was changed in them, and the data of containers. A command of its own
 (`bp start`) was rejected: callers know `up`, and what it is asked for is that the pod is up.
 
-- **What is resumed.** A pod that `up` finished, in the worktree it was created for, that has the resources of
-  the config and no others: the same names, ports within their ranges, the same rendered `create`, `run` and
-  `cwd`. Otherwise `up` refuses with `already has resources recorded` and the reason, and asks for `down`. `env`
-  is not recorded, so the one of the config is used. Not compared: the contents of files, the rules they come
-  from, `destroy` and `start`. Files that were deleted are not brought back.
+- **What is resumed.** A pod that `up` finished, in the worktree it was created for (see "The mark"), from the
+  config as it is now. Otherwise `up` refuses with `already has resources recorded` and the reason, and asks for
+  `down`. Files are not looked at: edited ones are the normal case, and deleted ones are not brought back.
+- **The config** is told by a hash that `up` records in `pod.json`: of the TOML, both files together, before it is
+  turned into our own types, so that comments do not count and a field added by a later version does not refuse
+  every pod. The price: any change, adding `start` included, takes `down` and `up`. Rejected: comparing names, ranges
+  and rendered commands with the ledger. That was much more code and took an edited `env` or template rule for no
+  change. `status --json` does not show the hash.
+- **The branch** is not part of it. After another one is checked out (with the same config), `{{branch}}` in `start`,
+  `run` and `env` is the new one, while what was created keeps the old one. Nothing is destroyed by that: `destroy` is
+  as recorded.
 - **Commands.** `bp` cannot tell whether what a command created runs, so the optional `start` of each is run, in
   config order and before the services; it must do no harm if there is nothing to start (`docker start`). One
   with `destroy` but without `start` is left as it is, which the output says; it is no warning, as volumes and
-  the like need no `start`. `start` is rendered from the current config and is not recorded: it can be added to
-  a pod that is there. Rejected: `destroy` and `create` anew. That loses what is in a container and volumes that
+  the like need no `start`. `start` is rendered when it is run and not recorded. Rejected: `destroy` and `create` anew. That loses what is in a container and volumes that
   survived the reboot, and takes a healthy container down when only a service failed.
 - **Services.** One that runs is not touched. One that does not is stopped, as `down` would, for what is left of
   its tree, and started again: under its supervisor if that answers, otherwise under a new one with an endpoint
-  of its own. A supervisor that neither answers nor is gone is refused.
+  of its own. A supervisor that neither answers nor is gone is refused, before anything is started. It is asked
+  again after the commands, which take their time.
 - **Ports** are not checked: the pod's own container may hold them, and `bp` could not tell it from a stranger.
   Who needs a port that is taken fails and says so; another one takes `down` and `up`.
 - **Interruption.** Services and their supervisor are recorded as in a first `up`, so `down` works at any point
@@ -537,7 +549,7 @@ The ledger says what was created; `bp status` adds what has become of it. It onl
   each service being stopped, happens under the pod lock and is reported as `busy`. The request runs on a
   thread that is left behind, because connecting can hang too (a full backlog, no free pipe instance).
 - **The hint** names the worktree, as the caller may be in another one. It is `bp up` if all that is wrong is that
-  processes do not run, otherwise `bp down` and `bp up`: two commands, not `a && b`, which Windows PowerShell does
+  processes do not run and `up` would know the worktree, otherwise `bp down` and `bp up`: two commands, not `a && b`, which Windows PowerShell does
   not have. For a supervisor that took the request and does not answer it says to end
   that process first, also while the pod is busy: `bp down` waits for the answer.
 - **The end of the log** of a service that is not running: 10 lines, at most 4 KB, also in the text output.

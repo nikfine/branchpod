@@ -207,9 +207,7 @@ fn look_with(
         let (state, hint) = match work {
             Some(work) => (Health::Busy, Some(busy_hint(&work, &pod, hang))),
             None if good => (Health::Healthy, None),
-            None if pod.unfinished.is_none() && startable(&problems) => {
-                (Health::Degraded, Some(up_hint(&pod)))
-            }
+            None if startable(&pod, &problems) => (Health::Degraded, Some(up_hint(&pod))),
             None => (Health::Degraded, Some(down_hint(&pod, hang))),
         };
         return Ok(Some(Report {
@@ -388,13 +386,17 @@ pub(crate) fn hang(supervisor: &Supervisor, process: Option<ProcId>) -> Option<S
     ))
 }
 
-/// Whether `bp up` can deal with the problems of a pod that is not unfinished.
-fn startable(problems: &[Problem]) -> bool {
-    problems.iter().all(|p| match (p.kind, &p.is) {
-        (Kind::Service, is) => *is != Is::State(State::Unknown),
-        (Kind::Supervisor, is) => matches!(is, Is::State(State::Gone | State::NotStarted)),
-        _ => false,
-    })
+/// Whether `bp up` can deal with the problems of a pod. Not if its worktree is gone, or if an older
+/// version created it: `up` would refuse, or be about another worktree.
+fn startable(pod: &PodMeta, problems: &[Problem]) -> bool {
+    let known = pod.unfinished.is_none() && pod.mark.is_some() && pod.config_hash.is_some();
+    known
+        && pod.worktree.join(".git").exists()
+        && problems.iter().all(|p| match (p.kind, &p.is) {
+            (Kind::Service, is) => *is != Is::State(State::Unknown),
+            (Kind::Supervisor, is) => matches!(is, Is::State(State::Gone | State::NotStarted)),
+            _ => false,
+        })
 }
 
 /// The next step for a pod of which only processes do not run. With the path: the caller may be in
@@ -625,6 +627,7 @@ mod tests {
             main_checkout: None,
             unfinished,
             mark: None,
+            config_hash: None,
         }
     }
 
@@ -895,8 +898,36 @@ mod tests {
             is,
         };
         use Kind::{Command, Service, Supervisor};
+        let worktree = tempfile::tempdir().unwrap();
+        fs::write(worktree.path().join(".git"), "gitdir: x").unwrap();
+        let pod = PodMeta {
+            worktree: worktree.path().to_path_buf(),
+            mark: Some(serde_json::from_value(json!({ "path": "x", "id": "1" })).unwrap()),
+            config_hash: Some("x".into()),
+            ..meta(None)
+        };
+        let exited = || vec![p(Service, Is::State(State::Exited))];
+        for pod in [
+            pod.with(Some(Unfinished::Up)),
+            PodMeta {
+                mark: None,
+                ..pod.clone()
+            },
+            PodMeta {
+                config_hash: None,
+                ..pod.clone()
+            },
+            // Something is left there, but it is no worktree any more.
+            PodMeta {
+                worktree: worktree.path().join("left"),
+                ..pod.clone()
+            },
+        ] {
+            fs::create_dir_all(&pod.worktree).unwrap();
+            assert!(!startable(&pod, &exited()), "{pod:?}");
+        }
         for (problems, expected) in [
-            (vec![p(Service, Is::State(State::Exited))], true),
+            (exited(), true),
             (vec![p(Service, Is::Status(Status::Pending))], true),
             (
                 vec![
@@ -918,7 +949,7 @@ mod tests {
                 false,
             ),
         ] {
-            assert_eq!(startable(&problems), expected, "{problems:?}");
+            assert_eq!(startable(&pod, &problems), expected, "{problems:?}");
         }
     }
 

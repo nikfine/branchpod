@@ -130,16 +130,16 @@ pub(crate) struct ResourceState {
     pub(crate) error: Option<String>,
 }
 
-/// Field of a resource's data that stays in the ledger: the state is printed by `bp status --json`,
-/// and the hash of a short secret gives it away.
-pub(crate) const PRIVATE_DATA: &str = "fingerprint";
+/// Fields of a resource's data that stay in the ledger. The state is printed by `bp status --json`,
+/// and the hash of a short secret (`fingerprint`) gives it away; `boot` tells nobody else anything.
+pub(crate) const PRIVATE_DATA: [&str; 2] = ["fingerprint", "boot"];
 
 fn without_private_data<S: Serializer>(data: &Value, serializer: S) -> Result<S::Ok, S::Error> {
     match data {
         Value::Object(fields) => serializer.collect_map(
             fields
                 .iter()
-                .filter(|(name, _)| name.as_str() != PRIVATE_DATA),
+                .filter(|(name, _)| !PRIVATE_DATA.contains(&name.as_str())),
         ),
         _ => data.serialize(serializer),
     }
@@ -480,7 +480,7 @@ mod tests {
         let path = dir.path().join("ledger.jsonl");
         let mut ledger = Ledger::open(&path).unwrap();
         ledger.record(Kind::File, ".env", Event::intent()).unwrap();
-        let data = json!({"path": "/wt/.env", "fingerprint": {"size": 3, "sha256": "abc"}});
+        let data = json!({"path": "/wt/.env", "boot": "b", "fingerprint": {"size": 3}});
         let created = Event::Created { data: data.clone() };
         ledger.record(Kind::File, ".env", created).unwrap();
         drop(ledger);

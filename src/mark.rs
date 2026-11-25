@@ -45,6 +45,11 @@ impl Mark {
 
     /// Removes the mark; nothing to do if it is gone, or another one is in its place.
     pub(crate) fn remove(&self) -> Result<()> {
+        // Of a write that was interrupted, maybe halfway.
+        let tmp = self.path.with_file_name(format!("{NAME}.tmp"));
+        if fs::read(&tmp).is_ok_and(|text| self.id.as_bytes().starts_with(text.trim_ascii())) {
+            let _ = fsutil::remove_file_if_exists(&tmp);
+        }
         if self.is_in(&self.path)? {
             fsutil::remove_file_if_exists(&self.path)
                 .with_context(|| format!("cannot remove {}", self.path.display()))?;
@@ -83,8 +88,15 @@ mod tests {
         one.write().unwrap();
         assert!(one.is_in(&path).unwrap() && !two.is_in(&path).unwrap());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-        one.remove().unwrap();
-        assert!(!path.exists());
+        // Writing it again was interrupted; the other one is somebody else's.
+        let tmp = dir.path().join(".branchpod.tmp");
+        for (text, left) in [("", 0), ("1", 0), ("2\n", 1)] {
+            one.write().unwrap();
+            fs::write(&tmp, text).unwrap();
+            one.remove().unwrap();
+            assert!(!path.exists());
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), left, "{text}");
+        }
 
         // The git directory is gone.
         let gone = Mark {

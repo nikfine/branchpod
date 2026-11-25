@@ -303,6 +303,7 @@ mod tests {
             main_checkout: None,
             unfinished: None,
             mark: None,
+            config_hash: None,
         };
         store.write_meta(&meta).unwrap();
         Setup {

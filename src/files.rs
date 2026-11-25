@@ -14,6 +14,10 @@
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
@@ -307,15 +311,14 @@ fn create_inner(plan: &Plan, record: &mut Record) -> Result<()> {
     let path = &record.path;
     match &plan.action {
         Action::Copy { source, reflink } => {
-            let mut cloned = None;
-            if record.entry == EntryType::Dir {
+            let cloned = if record.entry == EntryType::Dir {
                 fs::create_dir(path)?;
-                copy_tree(source, path, *reflink, &mut cloned)?;
+                copy_tree(source, path, *reflink)?
             } else {
                 let copied = copy_file(source, path, *reflink, true)?;
-                cloned = Some(copied.cloned);
                 record.fingerprint = copied.fingerprint;
-            }
+                Some(copied.cloned)
+            };
             // `None` for a reflink of a tree without files: nothing was cloned or copied.
             record.cloned = if *reflink { cloned } else { None };
         }
@@ -373,9 +376,72 @@ fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Re
     })
 }
 
-/// Copies the contents of `source` into the existing, empty `dest`. Links inside the tree are
-/// recreated as links to the same target, never followed.
-fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut Option<bool>) -> Result<()> {
+/// Whatever the number of CPUs: measured on 4 of them, 8 threads were faster than 4 on Windows and about
+/// as fast on Linux. 16 were hardly faster than 8 anywhere.
+const COPY_THREADS: usize = 8;
+
+/// Files waiting to be copied. Kept short, so that a file is copied soon after it was listed.
+const COPY_QUEUE: usize = 64;
+
+/// Source and destination.
+type Pair = (PathBuf, PathBuf);
+
+/// Copies the contents of `source` into the existing, empty `dest`; files on threads of their own, the
+/// rest on this one. Links inside the tree are recreated as links to the same target, never followed.
+/// Returns whether every file was cloned, `None` without files.
+///
+/// The first error stops the other threads. Nothing is written any more when this returns.
+fn copy_tree(source: &Path, dest: &Path, reflink: bool) -> Result<Option<bool>> {
+    let stop = AtomicBool::new(false);
+    let mut dirs = vec![(source.to_path_buf(), dest.to_path_buf())];
+    let cloned = thread::scope(|scope| -> Result<Option<bool>> {
+        let (files, queue) = sync_channel(COPY_QUEUE);
+        // Owned by the threads alone: once the last one is gone, sending fails instead of waiting.
+        let queue = Arc::new(Mutex::new(queue));
+        let workers = (0..COPY_THREADS)
+            .map(|_| {
+                let (queue, stop) = (Arc::clone(&queue), &stop);
+                thread::Builder::new()
+                    .spawn_scoped(scope, move || copy_queued(&queue, reflink, stop))
+            })
+            .collect::<io::Result<Vec<_>>>()
+            .context("cannot start a thread")?;
+        drop(queue);
+
+        let listed = list_tree(source, dest, &files, &mut dirs);
+        if listed.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        drop(files);
+
+        let mut cloned = None;
+        // Every thread is waited for by the scope, also after an error.
+        for worker in workers {
+            let this = worker
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+            cloned = both(cloned, this);
+        }
+        // Last: when a thread failed, listing fails only because of that.
+        listed.map(|()| cloned)
+    })?;
+
+    // Last, so that a read-only source directory does not block writing its contents; the inner
+    // ones first.
+    for (source, dest) in dirs.iter().rev() {
+        copy_dir_mode(source, dest)
+            .with_context(|| format!("cannot set the permissions of {}", dest.display()))?;
+    }
+    Ok(cloned)
+}
+
+/// Creates the directories and links of the tree and queues its files.
+fn list_tree(
+    source: &Path,
+    dest: &Path,
+    files: &SyncSender<Pair>,
+    dirs: &mut Vec<Pair>,
+) -> Result<()> {
     let entries =
         fs::read_dir(source).with_context(|| format!("cannot read {}", source.display()))?;
     for entry in entries {
@@ -386,24 +452,62 @@ fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut Option<bool
         if file_type.is_symlink() {
             copy_link(&from, &to)?;
         } else if file_type.is_dir() {
-            fs::create_dir(&to)?;
-            copy_tree(&from, &to, reflink, cloned)?;
+            fs::create_dir(&to).with_context(|| format!("cannot create {}", to.display()))?;
+            dirs.push((from.clone(), to.clone()));
+            list_tree(&from, &to, files, dirs)?;
         } else if file_type.is_file() {
-            let this = copy_file(&from, &to, reflink, false)
-                .with_context(|| format!("cannot copy {}", from.display()))?;
-            *cloned = Some(cloned.unwrap_or(true) && this.cloned);
+            files.send((from, to)).context("copying has stopped")?;
         } else {
             bail!("{} is not a file, directory or link", from.display());
         }
     }
-    // Last, so that a read-only source directory does not block writing its contents. The owner
-    // keeps write access: in a read-only directory nothing could be removed on teardown.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(source)?.permissions().mode() | 0o200;
-        fs::set_permissions(dest, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Copies queued files until there are no more or `stop` is set, which it does itself on an error.
+fn copy_queued(
+    queue: &Mutex<Receiver<Pair>>,
+    reflink: bool,
+    stop: &AtomicBool,
+) -> Result<Option<bool>> {
+    let mut cloned = None;
+    loop {
+        // A statement of its own: the lock must not be held while copying.
+        let next = queue.lock().expect("no thread panics with the lock").recv();
+        let Ok((from, to)) = next else {
+            return Ok(cloned);
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(cloned);
+        }
+        match copy_file(&from, &to, reflink, false) {
+            Ok(this) => cloned = both(cloned, Some(this.cloned)),
+            Err(e) => {
+                stop.store(true, Ordering::Relaxed);
+                return Err(e.context(format!("cannot copy {}", from.display())));
+            }
+        }
     }
+}
+
+/// Whether all were cloned; `None` is nothing to clone.
+fn both(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a && b),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The owner keeps write access: in a read-only directory nothing could be removed on teardown.
+#[cfg(unix)]
+fn copy_dir_mode(source: &Path, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(source)?.permissions().mode() | 0o200;
+    Ok(fs::set_permissions(dest, fs::Permissions::from_mode(mode))?)
+}
+
+#[cfg(windows)]
+fn copy_dir_mode(_source: &Path, _dest: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -797,6 +901,7 @@ fn parents_below(root: &Path, path: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::config::Replace;
+    use std::collections::BTreeMap;
 
     struct Tree {
         _tmp: tempfile::TempDir,
@@ -918,6 +1023,125 @@ mod tests {
         rm(&record).unwrap();
         assert!(!t.wt.join("deep").exists());
         assert!(t.wt.exists());
+    }
+
+    /// What is below `dir`, by relative path: the text of a file, where a link leads, or a directory.
+    fn contents(dir: &Path) -> BTreeMap<PathBuf, String> {
+        fn visit(base: &Path, dir: &Path, found: &mut BTreeMap<PathBuf, String>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let file_type = fs::symlink_metadata(&path).unwrap().file_type();
+                let what = if file_type.is_symlink() {
+                    format!("link to {}", fs::canonicalize(&path).unwrap().display())
+                } else if file_type.is_dir() {
+                    visit(base, &path, found);
+                    "directory".to_owned()
+                } else {
+                    format!("file {}", fs::read_to_string(&path).unwrap())
+                };
+                found.insert(path.strip_prefix(base).unwrap().to_path_buf(), what);
+            }
+        }
+        let mut found = BTreeMap::new();
+        visit(dir, dir, &mut found);
+        found
+    }
+
+    #[test]
+    fn a_tree_of_many_files_is_copied_whole() {
+        let t = tree();
+        let source = t.main.join("vendor");
+        for i in 0..600 {
+            let dir = format!("pkg-{}/caf\u{e9}/{}", i % 7, i % 5);
+            write(&source.join(dir).join(format!("{i}.txt")), &i.to_string());
+        }
+        write(&source.join("pkg-0/empty.txt"), "");
+        fs::create_dir(source.join("empty")).unwrap();
+        write(&t.main.join("shared/sentinel.txt"), "keep me");
+        dir_link(&t.main.join("shared"), &source.join("pkg-3/lib"));
+
+        for mode in [FileMode::Copy, FileMode::Reflink] {
+            let record = up(&t, &spec("vendor", mode));
+            assert_eq!(record.cloned.is_some(), mode == FileMode::Reflink);
+            let copied = contents(&t.wt.join("vendor"));
+            assert_eq!(copied, contents(&source), "{mode:?}");
+            assert_eq!(copied.values().filter(|w| w.starts_with("link")).count(), 1);
+            rm(&record).unwrap();
+            assert!(!t.wt.join("vendor").exists());
+        }
+        assert!(t.main.join("shared/sentinel.txt").exists());
+    }
+
+    /// With more files than the queue holds. Not returning is a failure, too: nobody might be left to
+    /// take from a full queue.
+    fn copy_tree_in_time(source: &Path, dest: &Path) -> Result<Option<bool>> {
+        let (done, result) = sync_channel(1);
+        let (source, dest) = (source.to_path_buf(), dest.to_path_buf());
+        thread::spawn(move || done.send(copy_tree(&source, &dest, false)));
+        result
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("copying does not end")
+    }
+
+    #[test]
+    fn the_first_error_stops_copying_and_names_the_file() {
+        const FILES: usize = 4000;
+        let t = tree();
+        let source = t.main.join("vendor");
+        fs::create_dir(&source).unwrap();
+        for i in 0..FILES {
+            fs::write(source.join(format!("{i}.txt")), "from main").unwrap();
+        }
+        let plan = plan(&spec("vendor", FileMode::Copy), &t.main, &t.wt, &vars());
+        let record = plan.unwrap().unwrap().record;
+
+        // In the way of the file that comes first.
+        let first = fs::read_dir(&source).unwrap().next().unwrap().unwrap();
+        let dest = t.wt.join("vendor");
+        fs::create_dir(&dest).unwrap();
+        let planted = dest.join(first.file_name());
+        fs::write(&planted, "user data").unwrap();
+
+        let err = format!("{:#}", copy_tree_in_time(&source, &dest).unwrap_err());
+        let expected = format!("cannot copy {}", first.path().display());
+        assert!(err.contains(&expected), "{err}");
+        assert_eq!(fs::read_to_string(&planted).unwrap(), "user data");
+        let copied = files_in(&dest);
+        assert!(copied < FILES, "the other threads went on: {copied}");
+
+        // What was copied by then goes as after any failure.
+        rm(&record).unwrap();
+        assert!(!dest.exists());
+        assert_eq!(files_in(&source), FILES);
+    }
+
+    /// The error is about what cannot be copied, not about the threads.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_cannot_be_copied_stops_copying() {
+        let t = tree();
+        let source = t.main.join("vendor");
+        for i in 0..200 {
+            write(&source.join(format!("{i}.txt")), "x");
+        }
+        let pipe = source.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        assert!(made.unwrap().success());
+        let dest = t.wt.join("vendor");
+        fs::create_dir(&dest).unwrap();
+        let err = format!("{:#}", copy_tree_in_time(&source, &dest).unwrap_err());
+        let expected = format!("{} is not a file, directory or link", pipe.display());
+        assert!(err.contains(&expected), "{err}");
+    }
+
+    #[test]
+    fn a_tree_is_cloned_only_if_all_of_it_is() {
+        assert_eq!(both(None, None), None);
+        assert_eq!(both(Some(true), None), Some(true));
+        assert_eq!(both(None, Some(false)), Some(false));
+        assert_eq!(both(Some(true), Some(true)), Some(true));
+        assert_eq!(both(Some(false), Some(true)), Some(false));
+        assert_eq!(both(Some(true), Some(false)), Some(false));
     }
 
     #[test]
@@ -1085,11 +1309,14 @@ mod tests {
     fn an_interrupted_creation_is_undone_from_the_plan() {
         let t = tree();
         write(&t.main.join("d/a.txt"), "a");
+        write(&t.main.join("d/sub/b.txt"), "b");
         let mut s = spec("p/d", FileMode::Copy);
         s.source = Some("d".into());
         let plan = plan(&s, &t.main, &t.wt, &vars()).unwrap().unwrap();
-        // Crash halfway: parents and part of the tree exist, `create` never returned.
+        // Crash halfway: parents and part of the tree exist, `create` never returned. Directories
+        // are ahead of their files.
         write(&t.wt.join("p/d/a.txt"), "half");
+        fs::create_dir(t.wt.join("p/d/sub")).unwrap();
         rm(&plan.record).unwrap();
         assert!(!t.wt.join("p").exists());
 
@@ -1694,12 +1921,12 @@ mod tests {
         let t = tree();
         write(&t.main.join("bin/run.sh"), "#!/bin/sh\n");
         write(&t.main.join("tpl.sh"), "#!/bin/sh\necho {{port.web}}\n");
-        for p in ["bin/run.sh", "tpl.sh"] {
+        for p in ["bin/run.sh", "bin", "tpl.sh"] {
             fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o750)).unwrap();
         }
         up(&t, &spec("bin", FileMode::Copy));
         up(&t, &template("tpl.sh"));
-        for p in ["bin/run.sh", "tpl.sh"] {
+        for p in ["bin/run.sh", "bin", "tpl.sh"] {
             let mode = fs::metadata(t.wt.join(p)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o750, "{p}");
         }
@@ -1733,6 +1960,11 @@ mod tests {
             fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o555)).unwrap();
         }
         let record = up(&t, &spec("modcache", FileMode::Copy));
+        // As the source, but writable by the owner.
+        for p in ["modcache/pkg", "modcache"] {
+            let mode = fs::metadata(t.wt.join(p)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{p}");
+        }
         let result = rm(&record);
         // Let the temporary directory clean up the source either way.
         for p in ["modcache", "modcache/pkg"] {

@@ -215,9 +215,9 @@ destroy = ["docker", "rm", "-f", "-v", "example-{{pod.id}}"]
 
 **`start`** is run whenever `up` finds the pod there already, for a container that a reboot stopped:
 `["docker", "start", "example-{{pod.id}}"]`. Whether it is needed is not known, so it must succeed and do nothing if
-what `create` made runs. It may use what `destroy` may, its own output included. It is not recorded: it can be added
-or changed while the pod is there. If it fails, so does `up`, and no service is started. Without it, the command is
-left alone.
+what `create` made runs. It may use what `destroy` may, its own output included. Like any change of the config, adding
+it to a pod that is there takes `down` and `up`. If it fails, so does `up`, and no service is started. Without it, the
+command is left alone.
 
 **`destroy`** is rendered at `up` and recorded, so changing the config later does not change it. It may use the
 built-in variables, ports, the output of earlier commands, and its own output. `create` cannot use its own.

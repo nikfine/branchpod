@@ -1,21 +1,21 @@
 //! `bp up` on a pod that is there already: starts what does not run any more, after a reboot or a
 //! crash, and destroys nothing.
 //!
-//! Only a pod that a `bp up` finished and that is still what the config says is resumed
-//! ([`plan`]); for any other one `up` asks for `bp down` first. Files and ports stay as they are.
+//! Only a pod that a `bp up` finished, from the config as it is now and in this very worktree, is
+//! resumed ([`plan`]); for any other one `up` asks for `bp down` first. Files and ports stay as they are.
 //! Whether a command's resource runs is unknown, so its `start` is run every time, and one without
 //! it is left alone. Services are started again under their supervisor, or under a new one if it is
 //! gone; those that run are not touched.
 //!
 //! Interrupted or failed at any point, what is recorded can be torn down, and resumed again.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, FileMode};
+use crate::config::Config;
 use crate::ledger::{Kind, ResourceState, Status};
 use crate::pod::{PodMeta, Store, Unfinished};
 use crate::supervisor::{self, Launcher};
@@ -89,12 +89,8 @@ pub(crate) fn resume(
         Err(e) => return Err(e),
     };
 
-    let supervised = !plan.services.is_empty();
-    let supervision = supervised
-        .then(|| Supervision::find(&meta, resources))
-        .transpose()?;
-    // Before anything is started.
-    if supervision.as_ref().is_some_and(|s| !s.alive) {
+    // Before anything is started; looked at again once the commands have been.
+    if !plan.services.is_empty() && !Supervision::find(&meta, resources)?.alive {
         launcher.preflight().context("cannot run services")?;
     }
 
@@ -104,7 +100,7 @@ pub(crate) fn resume(
         items: Vec::new(),
         warnings: Vec::new(),
     };
-    if let Err(e) = start(store, wt, launcher, plan, supervision, &mut report) {
+    if let Err(e) = start(store, wt, launcher, plan, resources, &mut report) {
         let path = up::quote(&wt.root);
         return Err(e.context(format!(
             "pod {} is not up again; fix the cause and run `bp up {path}` once more, or \
@@ -115,8 +111,8 @@ pub(crate) fn resume(
     Ok(report)
 }
 
-/// Compares what is recorded with the config and the disk, and renders what is to be started. Fails
-/// with [`Mismatch`] if the pod is not what the config describes. Nothing is changed.
+/// Renders what is to be started from the config and what is recorded. Fails with [`Mismatch`] if
+/// the pod is not of this config or not of this worktree, or is not complete. Nothing is changed.
 fn plan(
     config: &Config,
     wt: &Worktree,
@@ -131,6 +127,10 @@ fn plan(
         Some(Unfinished::Down) => return Err(mismatch("`bp down` did not finish")),
         Some(Unfinished::Other) => return Err(mismatch("another `bp` command did not finish")),
     }
+    same_worktree(meta, wt)?;
+    if meta.config_hash.as_ref() != Some(&config.hash) {
+        return Err(mismatch("the config has changed since `bp up`"));
+    }
     for r in resources {
         // Services and their supervisor can be started again, whatever came of them.
         let startable = matches!(r.kind, Kind::Service | Kind::Supervisor);
@@ -138,33 +138,21 @@ fn plan(
             return Err(mismatch(format!("{} {:?} is {}", r.kind, r.name, r.status)));
         }
     }
-    same_worktree(meta, wt)?;
-    same_names(config, resources)?;
 
     let find = |kind, name: &str| {
         let found = resources.iter().find(|r| r.kind == kind && r.name == name);
-        found.expect("every name of the config is recorded")
+        found.ok_or_else(|| mismatch(format!("{kind} {name:?} is not recorded")))
     };
     let mut ports = Vec::new();
-    for (name, spec) in &config.port {
-        let ports::Record { port } = down::data(find(Kind::Port, name))?;
-        let [first, last] = spec.range;
-        if !(first..=last).contains(&port) {
-            let reason = format!("port {name:?} is {port}, which is not in its range any more");
-            return Err(mismatch(reason));
-        }
+    for name in config.port.keys() {
+        let ports::Record { port } = down::data(find(Kind::Port, name)?)?;
         vars.set(format!("port.{name}"), port.to_string());
         ports.push((name.clone(), port));
     }
 
     let mut commands = Vec::new();
     for spec in &config.command {
-        let record: commands::Record = down::data(find(Kind::Command, &spec.name))?;
-        let now = commands::plan(spec, &wt.root, &vars, pod_dir)?.record;
-        if (&now.create, &now.file) != (&record.create, &record.file) {
-            let reason = format!("command {:?} is not the one that was run", spec.name);
-            return Err(mismatch(reason));
-        }
+        let record: commands::Record = down::data(find(Kind::Command, &spec.name)?)?;
         commands::export(&spec.name, &record, &mut vars);
         let start = match (&spec.start, &record.destroy) {
             (Some(_), _) => Start::Run(
@@ -179,17 +167,11 @@ fn plan(
 
     let mut services = Vec::new();
     for spec in &config.service {
-        let resource = find(Kind::Service, &spec.name).clone();
-        let record: services::Record = down::data(&resource)?;
-        let plan = services::plan(spec, &wt.root, &vars, pod_dir)?;
-        if (&plan.record.run, &plan.record.cwd) != (&record.run, &record.cwd) {
-            let reason = format!("service {:?} is not the one that was started", spec.name);
-            return Err(mismatch(reason));
-        }
+        let resource = find(Kind::Service, &spec.name)?.clone();
         services.push(Service {
-            plan,
+            plan: services::plan(spec, &wt.root, &vars, pod_dir)?,
+            record: down::data(&resource)?,
             resource,
-            record,
         });
     }
     Ok(Plan {
@@ -209,48 +191,6 @@ fn same_worktree(meta: &PodMeta, wt: &Worktree) -> Result<()> {
         Some(_) => Err(mismatch(
             "the worktree does not have the mark of the pod: it is probably a new one at the same path",
         )),
-    }
-}
-
-/// Whether the config has the resources that are recorded and no others.
-fn same_names(config: &Config, resources: &[ResourceState]) -> Result<()> {
-    let files = || config.file.iter().filter(|f| f.mode != FileMode::Ignore);
-    let mut configured = BTreeSet::new();
-    configured.extend(config.port.keys().map(|name| (Kind::Port, name.clone())));
-    configured.extend(files().map(|f| (Kind::File, f.name())));
-    configured.extend(
-        config
-            .command
-            .iter()
-            .map(|c| (Kind::Command, c.name.clone())),
-    );
-    configured.extend(
-        config
-            .service
-            .iter()
-            .map(|s| (Kind::Service, s.name.clone())),
-    );
-    // Not recorded if it had no source.
-    let optional: BTreeSet<_> = files().filter(|f| f.optional).map(|f| f.name()).collect();
-    let recorded: BTreeSet<_> = resources
-        .iter()
-        .filter(|r| r.kind != Kind::Supervisor)
-        .map(|r| (r.kind, r.name.clone()))
-        .collect();
-
-    if let Some((kind, name)) = recorded.difference(&configured).next() {
-        return Err(mismatch(format!(
-            "{kind} {name:?} is not in the config any more"
-        )));
-    }
-    let new = configured
-        .difference(&recorded)
-        .find(|(kind, name)| *kind != Kind::File || !optional.contains(name));
-    match new {
-        Some((kind, name)) => Err(mismatch(format!(
-            "{kind} {name:?} is in the config but was not created"
-        ))),
-        None => Ok(()),
     }
 }
 
@@ -305,35 +245,49 @@ fn start(
     wt: &Worktree,
     launcher: &Launcher,
     plan: Plan,
-    supervision: Option<Supervision>,
+    resources: &[ResourceState],
     report: &mut Report,
 ) -> Result<()> {
-    let mut item = |kind, name: &str, detail: String| {
+    let mut item = |kind, name: &str, detail: String, took| {
         report.items.push(Item {
             kind,
             name: name.to_owned(),
             detail,
+            took,
         });
     };
     for (name, port) in &plan.ports {
-        item(Kind::Port, name, port.to_string());
+        item(Kind::Port, name, port.to_string(), None);
     }
     for (name, start) in &plan.commands {
         match start {
             Start::Run(argv) => {
+                let started = Instant::now();
                 commands::start(name, argv, &wt.root)?;
-                item(Kind::Command, name, "started".into());
+                item(
+                    Kind::Command,
+                    name,
+                    "started".into(),
+                    Some(started.elapsed()),
+                );
             }
             Start::Unknown => {
-                item(Kind::Command, name, "left as it is (no `start`)".into());
+                item(
+                    Kind::Command,
+                    name,
+                    "left as it is (no `start`)".into(),
+                    None,
+                );
             }
             Start::Nothing => {}
         }
     }
 
-    let Some(supervision) = supervision else {
+    if plan.services.is_empty() {
         return Ok(());
-    };
+    }
+    // Commands take their time, and services may have ended meanwhile.
+    let supervision = Supervision::find(&report.pod, resources)?;
     let (running, stopped): (Vec<_>, Vec<_>) =
         plan.services.iter().partition(|s| supervision.runs(s));
     for service in running {
@@ -341,6 +295,7 @@ fn start(
             Kind::Service,
             &service.resource.name,
             "already running".into(),
+            None,
         );
     }
     if supervision.alive && stopped.is_empty() {
@@ -383,17 +338,31 @@ mod tests {
     use crate::ledger::{Event, Ledger};
     use crate::pod;
     use crate::proc::ProcId;
-    use crate::test_support::{Reaper, fail, git_ok, long_running, reap_pod, wait_for_log};
+    use crate::test_support::{Reaper, git_ok, long_running, reap_pod, wait_for_log};
     use crate::up::tests::{Repo, echo, repo, resources, run};
 
-    /// A command line that adds to the file `started` of the worktree.
+    /// A command line that adds to the file `started` of the worktree; before that, it runs `hook` if
+    /// that is there.
     fn note() -> Vec<String> {
-        let script = "echo x>>started".to_owned();
         if cfg!(windows) {
-            vec!["cmd".into(), "/d".into(), "/c".into(), script]
+            let script = "if exist hook.cmd (call hook.cmd) else (echo x>>started)";
+            vec!["cmd".into(), "/d".into(), "/c".into(), script.into()]
         } else {
-            vec!["sh".into(), "-c".into(), script]
+            let script = "if [ -e hook ]; then . ./hook; fi; echo x>>started";
+            vec!["sh".into(), "-c".into(), script.into()]
         }
+    }
+
+    /// The hook that makes the command fail.
+    fn failing_hook(r: &Repo) -> std::path::PathBuf {
+        let (name, text) = if cfg!(windows) {
+            ("hook.cmd", "@echo boom 1>&2\r\n@exit 3\r\n")
+        } else {
+            ("hook", "echo boom >&2; exit 3\n")
+        };
+        let path = r.linked.join(name);
+        fs::write(&path, text).unwrap();
+        path
     }
 
     fn toml(argv: &[String]) -> String {
@@ -609,9 +578,8 @@ mod tests {
         wait_for_service(&r, "web");
         end([process(&r, "supervisor"), process(&r, "web")]);
         let before = ledger(&r);
-        let bad = good.replace(&toml(&note()), &toml(&fail(3, "boom")));
-        assert_ne!(bad, good);
-        let err = format!("{:#}", run(&r, &bad).unwrap_err());
+        let hook = failing_hook(&r);
+        let err = format!("{:#}", run(&r, &good).unwrap_err());
         assert!(
             err.contains("\"app\": start") && err.contains("boom"),
             "{err}"
@@ -619,7 +587,7 @@ mod tests {
         assert!(err.contains("bp up") && err.contains("bp down"), "{err}");
         assert_eq!(ledger(&r), before);
 
-        // `start` is taken from the config, and is no reason to take the pod down.
+        fs::remove_file(hook).unwrap();
         let (again, _reaper) = up(&r, &good);
         assert_eq!(again.unwrap().outcome, Outcome::Restarted);
 
@@ -706,7 +674,7 @@ mod tests {
         assert!(!git_dir.exists());
     }
 
-    /// Nothing is started for a pod that is not what the config says, or not complete.
+    /// Nothing is started for a pod that is not of this config, or not complete.
     #[test]
     fn what_does_not_match_has_to_be_taken_down_first() {
         let r = setup();
@@ -724,79 +692,105 @@ mod tests {
             );
             assert_eq!(starts(&r), started, "{reason}");
         };
-        let service = format!(
-            "[[service]]\nname = 'web'\nrun = {}\n",
-            toml(&long_running("x"))
-        );
-        for (config, reason) in [
-            (
-                good.replace("[41000, 41999]", "[42000, 42001]"),
-                "port \"web\" is 41",
-            ),
-            (
-                format!("{good}[port.more]\nrange = [41000, 41999]\n"),
-                "port \"more\" is in the config but was not created",
-            ),
-            (
-                good.replace("path = '.env'", "path = '.env2'"),
-                "file \".env\" is not in the config any more",
-            ),
-            (
-                format!("{good}[[file]]\npath = 'more'\nmode = 'copy'\n"),
-                "file \"more\" is in the config",
-            ),
-            (
-                good.replace("id-{{port.web}}", "other-{{port.web}}"),
-                "command \"app\" is not the one",
-            ),
-            (
-                format!("{good}{service}"),
-                "service \"web\" is in the config",
-            ),
+        for changed in [
+            good.replace("[41000, 41999]", "[41000, 41998]"),
+            good.replace(&echo("gone"), &echo("other")),
+            good.replace("optional = true", "optional = false"),
+            format!("{good}[[command]]\nname = 'more'\ncreate = ['x']\n"),
         ] {
-            assert_ne!(config, good);
-            refused(&config, reason);
+            assert_ne!(changed, good);
+            refused(&changed, "the config has changed");
         }
-        // Only `start` and `destroy` differ, or an optional file that was skipped.
-        let other = good.replace(&echo("gone"), &echo("other"));
-        assert_eq!(run(&r, &other).unwrap().outcome, Outcome::AlreadyUp);
-        // A mistake in the config is no reason to take the pod down.
-        let typo = good.replace("id-{{port.web}}", "id-{{port.wbe}}");
-        let err = format!("{:#}", run(&r, &typo).unwrap_err());
-        assert!(
-            err.contains("port.wbe") && !err.contains("bp down"),
-            "{err}"
-        );
+        let same = format!("# Nothing new.\n{}", good.replace('\'', "\""));
+        assert_eq!(run(&r, &same).unwrap().outcome, Outcome::AlreadyUp);
 
         let meta = r.store.meta(&id(&r)).unwrap().unwrap();
-        for (unfinished, reason) in [
-            (Unfinished::Up, "`bp up` did not finish"),
-            (Unfinished::Down, "`bp down` did not finish"),
+        for (other, reason) in [
+            (meta.with(Some(Unfinished::Up)), "`bp up` did not finish"),
+            (
+                meta.with(Some(Unfinished::Down)),
+                "`bp down` did not finish",
+            ),
+            (
+                PodMeta {
+                    config_hash: None,
+                    ..meta.clone()
+                },
+                "the config has changed",
+            ),
         ] {
-            r.store.write_meta(&meta.with(Some(unfinished))).unwrap();
+            r.store.write_meta(&other).unwrap();
             refused(&good, reason);
         }
         r.store.write_meta(&meta).unwrap();
         assert_eq!(ledger(&r), before);
 
-        let mut journal = Ledger::open(&r.store.ledger_path(&id(&r))).unwrap();
+        let path = r.store.ledger_path(&id(&r));
+        let without: String = before
+            .lines()
+            .filter(|line| !line.contains("\"command\""))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&path, without).unwrap();
+        refused(&good, "command \"app\" is not recorded");
+        fs::write(&path, &before).unwrap();
+
+        let mut journal = Ledger::open(&path).unwrap();
         let error = "no".to_owned();
         let failed = Event::Failed { error };
         journal.record(Kind::Command, "app", failed).unwrap();
         refused(&good, "command \"app\" is failed");
     }
 
+    /// It takes the request and does not answer: `bp down` would wait for it, and a second one must
+    /// not be started beside it.
     #[test]
-    fn a_service_that_changed_is_not_started() {
+    fn a_supervisor_that_hangs_is_neither_used_nor_replaced() {
         let r = setup();
-        let good = config(&["web"]);
-        let (first, _reaper) = up(&r, &good);
+        let config = config(&["web"]);
+        let (first, _reaper) = up(&r, &config);
         first.unwrap();
+        wait_for_service(&r, "web");
+        end([process(&r, "supervisor"), process(&r, "web")]);
+
+        let endpoint = control::new_endpoint("test").unwrap();
+        let server = control::Server::bind(&endpoint).unwrap();
+        let record = supervisor::Record {
+            endpoint,
+            process: proc::identify(std::process::id()),
+        };
+        let mut journal = Ledger::open(&r.store.ledger_path(&id(&r))).unwrap();
+        let data = serde_json::to_value(&record).unwrap();
+        let created = Event::Created { data };
+        journal
+            .record(Kind::Supervisor, "supervisor", created)
+            .unwrap();
+        let before = ledger(&r);
+        let err = format!("{:#}", run(&r, &config).unwrap_err());
+        assert!(
+            err.contains("cannot be used") && err.contains("end process"),
+            "{err}"
+        );
+        assert_eq!((ledger(&r), starts(&r)), (before, 0));
+        drop(server);
+    }
+
+    /// `start` of a command may take long.
+    #[cfg(unix)]
+    #[test]
+    fn a_service_that_ends_while_commands_are_started_is_started_again() {
+        let r = setup();
+        let config = config(&["web"]);
+        let (first, _reaper) = up(&r, &config);
+        first.unwrap();
+        wait_for_service(&r, "web");
         let web = process(&r, "web");
-        let other = good.replace("web-up", "web-other");
-        let err = format!("{:#}", run(&r, &other).unwrap_err());
-        assert!(err.contains("service \"web\" is not the one"), "{err}");
-        assert!(proc::is_running(web));
+        // A moment for the supervisor to notice.
+        let hook = format!("kill -9 {}; sleep 1\n", web.pid);
+        fs::write(r.linked.join("hook"), hook).unwrap();
+        let (again, _reaper) = up(&r, &config);
+        assert_eq!(again.unwrap().outcome, Outcome::Restarted);
+        assert!(process(&r, "web") != web && proc::is_running(process(&r, "web")));
         down(&r);
     }
 

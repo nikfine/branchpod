@@ -21,8 +21,8 @@ const JSON_SCHEMA: u32 = 1;
 /// 2 is taken by usage errors.
 const EXIT_LEFTOVERS: u8 = 3;
 
-/// Exit codes of `bp status` when the pod is not healthy. Two, because what to do differs: take a
-/// degraded pod down, but wait for whoever works on a busy one.
+/// Exit codes of `bp status` when the pod is not healthy. Two, because what to do differs: act on the
+/// hint for a degraded pod, but wait for whoever works on a busy one.
 const EXIT_DEGRADED: u8 = 4;
 const EXIT_BUSY: u8 = 5;
 
@@ -62,7 +62,15 @@ pub fn up(path: Option<&OsStr>) -> Result<ExitCode> {
         report.pod.worktree.display()
     );
     for item in &report.items {
-        println!("  {:<10} {:<24} {}", item.kind, item.name, item.detail);
+        println!(
+            "  {:<10} {:<24} {:>7}  {}",
+            item.kind,
+            item.name,
+            item.took
+                .map(|took| format!("{:.1}s", took.as_secs_f64()))
+                .unwrap_or_default(),
+            item.detail
+        );
     }
     for warning in &report.warnings {
         eprintln!("bp: warning: {warning}");
@@ -94,9 +102,10 @@ pub fn status(path: Option<&OsStr>, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
     if json {
-        // `mark` is nobody else's business.
+        // Nobody else's business.
         let pod = pod::PodMeta {
             mark: None,
+            config_hash: None,
             ..report.pod
         };
         let out = json!({
@@ -345,6 +354,9 @@ fn print_logs(
             "service {service} is not running any more, but something it started still \
              writes to its log"
         )),
+        read::End::Gone if is_there(&store, &meta) => {
+            notice(format_args!("service {service} was started again"));
+        }
         read::End::Gone => notice(format_args!("pod {} was torn down", meta.id)),
     }
     Ok(())
@@ -451,7 +463,7 @@ fn service_state(
     Ok(match (process, resource.status) {
         (Some(process), _) if proc::is_running(process) => read::State::Active,
         (None, Status::Pending) => {
-            *failure = Some("`bp up` ended before it recorded the start; run `bp down`".into());
+            *failure = Some("`bp up` ended before it recorded the start; see `bp status`".into());
             read::State::Exited
         }
         (None, Status::Failed) => {

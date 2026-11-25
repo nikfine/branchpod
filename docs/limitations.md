@@ -47,6 +47,8 @@
 
 ## Versions and systems
 
+- **Any change of the config takes `down` and `up`** for a pod that is there, also one of `branchpod.local.toml`, which
+  all worktrees share.
 - **A pod of version 0.1.0 is not brought up again**: run `down` and `up` once.
 - **Windows 10 has not been tested**, although it is meant to work. CI runs on a Windows Server image, macOS on
   Apple silicon and Ubuntu.

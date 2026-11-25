@@ -80,6 +80,9 @@ pub(crate) struct PodMeta {
     /// worktrees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mark: Option<Mark>,
+    /// Of the config it was created from ([`crate::config::Config::hash`]). Recorded since `mark` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) config_hash: Option<String>,
 }
 
 /// What a pod is in the middle of.
@@ -290,6 +293,7 @@ mod tests {
             main_checkout: None,
             unfinished: None,
             mark: None,
+            config_hash: None,
         };
         store.write_meta(&meta).unwrap();
 
