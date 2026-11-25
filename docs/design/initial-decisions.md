@@ -94,6 +94,14 @@ Rules:
   leaves a pod with nothing to tear down); its lock file is kept. Files with command output
   (`output = "file"`) go with it and not earlier: after an exit with code `3` a `destroy` that reads one
   runs again.
+- The ledger is not removed but moved to `history/<pod id>-<time, Unix ms>.jsonl` in the `bp` home, never onto
+  another file: how long each resource took and what failed is in it, and would be lost with the pod. It is
+  moved right before `pod.json` goes; if that fails, the pod stays and the exit code is `3`, as for any state
+  that cannot be removed. An empty one is not kept. Nothing looks for pods in the history, and nothing cleans
+  it up: that is for `gc` (#20). On Unix the file has mode 0600, in a directory with mode 0700; on Windows both
+  inherit the permissions of the `bp` home.
+- **Why not a run log for that.** A log of every invocation (#9) tells more: runs refused before the first
+  resource, `start` of commands. It is also much more to build, and the ledger has the times already.
 - Known limitation until `gc` exists: a resource that cannot be undone from the ledger (a command whose
   `destroy` needs output never captured, kinds without teardown yet) keeps `bp down` at exit code `3`;
   there is no way to forget it.

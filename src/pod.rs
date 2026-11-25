@@ -210,10 +210,11 @@ impl Store {
         Ok(ledger::state(&ledger::read(&self.ledger_path(id))?))
     }
 
-    /// Removes the state of pod `id` once nothing recorded in it is left. Everything else goes
-    /// before `pod.json`: interrupted or failing before that, the pod is still listed with nothing
-    /// to tear down, and the next `bp down` finishes the removal. The lock file is kept (see
-    /// `podlock`).
+    /// Removes the state of pod `id` once nothing recorded in it is left; its ledger is moved to the
+    /// history. Everything else goes before `pod.json`: interrupted or failing before that, the pod
+    /// is still listed with nothing to tear down, and the next `bp down` finishes the removal. The
+    /// ledger goes right before it, as that run tells from it what was kept. The lock file is kept
+    /// (see `podlock`). The caller holds the pod lock.
     pub(crate) fn remove_pod(&self, id: &str) -> Result<()> {
         use crate::fsutil::retry;
 
@@ -225,6 +226,7 @@ impl Store {
         };
         let dir = self.pod_dir(id);
         let meta = dir.join("pod.json");
+        let ledger = self.ledger_path(id);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -233,7 +235,7 @@ impl Store {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path == meta {
+            if path == meta || path == ledger {
                 continue;
             }
             let result = if entry.file_type()?.is_dir() {
@@ -243,8 +245,37 @@ impl Store {
             };
             checked(&path, result)?;
         }
+        match fs::symlink_metadata(&ledger) {
+            Ok(found) if found.len() > 0 => self.keep_ledger(id, ledger::now_ms())?,
+            Ok(_) => checked(&ledger, retry(|| fs::remove_file(&ledger)))?,
+            Err(e) => checked(&ledger, Err(e))?,
+        }
         checked(&meta, retry(|| fs::remove_file(&meta)))?;
         checked(&dir, retry(|| fs::remove_dir(&dir)))
+    }
+
+    /// Moves the ledger of pod `id` to `history/<pod id>-<time>.jsonl`, or a numbered name if there
+    /// is such a file. Nobody else takes the name meanwhile: the caller holds the pod lock.
+    fn keep_ledger(&self, id: &str, now_ms: u64) -> Result<()> {
+        use crate::fsutil;
+
+        let ledger = self.ledger_path(id);
+        let history = self.home.join("history");
+        let moved = || -> std::io::Result<()> {
+            fsutil::create_private_dir(&history)?;
+            fsutil::sync_parent(&history)?;
+            let mut target = history.join(format!("{id}-{now_ms}.jsonl"));
+            let mut n = 0;
+            while target.try_exists()? {
+                n += 1;
+                target = history.join(format!("{id}-{now_ms}-{n}.jsonl"));
+            }
+            fsutil::retry(|| fs::rename(&ledger, &target))?;
+            // On disk before `pod.json` goes.
+            fsutil::sync_parent(&target)
+        };
+        moved()
+            .with_context(|| format!("cannot move {} to {}", ledger.display(), history.display()))
     }
 }
 
@@ -302,6 +333,110 @@ mod tests {
             store.find_by_worktree(&dir.path().join("other")).unwrap(),
             None
         );
+    }
+
+    fn history(store: &Store) -> Vec<PathBuf> {
+        let entries = fs::read_dir(store.home().join("history"));
+        let entries = entries.into_iter().flatten();
+        entries.map(|e| e.unwrap().path()).collect()
+    }
+
+    /// A pod with a ledger that says `text`.
+    fn pod(store: &Store, text: &str) -> PathBuf {
+        let meta = r#"{ "v": 1, "id": "p", "worktree": "/wt" }"#;
+        store
+            .write_meta(&serde_json::from_str(meta).unwrap())
+            .unwrap();
+        fs::write(store.ledger_path("p"), text).unwrap();
+        store.pod_dir("p")
+    }
+
+    #[test]
+    fn the_ledger_is_all_that_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().join("caf\u{e9}"));
+        for n in 1..=2 {
+            let dir = pod(&store, "x\n");
+            fs::create_dir(dir.join("logs")).unwrap();
+            fs::write(dir.join("logs").join("a.log"), "log").unwrap();
+            drop(ledger::Ledger::open(&store.ledger_path("p")).unwrap());
+            store.remove_pod("p").unwrap();
+            assert!(!dir.exists());
+            assert!(store.list().unwrap().is_empty());
+            let kept = history(&store);
+            assert_eq!(kept.len(), n);
+            for path in kept {
+                assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode(&path), 0o600);
+                    assert_eq!(mode(path.parent().unwrap()), 0o700);
+                }
+            }
+        }
+        // Nothing to keep.
+        for without in [false, true] {
+            let dir = pod(&store, "");
+            if without {
+                fs::remove_file(store.ledger_path("p")).unwrap();
+            }
+            store.remove_pod("p").unwrap();
+            assert!(!dir.exists());
+            assert_eq!(history(&store).len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_kept_ledger_is_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().to_path_buf());
+        for text in ["1", "2", "3"] {
+            pod(&store, text);
+            store.keep_ledger("p", 7).unwrap();
+        }
+        assert_eq!(history(&store).len(), 3);
+        for (name, text) in [("p-7", "1"), ("p-7-1", "2"), ("p-7-2", "3")] {
+            let path = tmp.path().join("history").join(format!("{name}.jsonl"));
+            assert_eq!(fs::read_to_string(path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn an_interrupted_removal_is_finished_with_one_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().to_path_buf());
+        // Before the ledger was moved, and after.
+        for moved in [false, true] {
+            let dir = pod(&store, "x");
+            if moved {
+                store.keep_ledger("p", 7).unwrap();
+            }
+            assert_eq!(store.list().unwrap().len(), 1);
+            store.remove_pod("p").unwrap();
+            assert!(!dir.exists());
+            let kept = history(&store);
+            assert_eq!(kept.len(), 1, "{kept:?}");
+            fs::remove_file(&kept[0]).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_be_moved_stays_with_its_pod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::at(tmp.path().to_path_buf());
+        let dir = pod(&store, "x");
+        let in_the_way = tmp.path().join("history");
+        fs::write(&in_the_way, "").unwrap();
+        let err = store.remove_pod("p").unwrap_err();
+        assert!(format!("{err:#}").contains("cannot move"), "{err:#}");
+        assert_eq!(fs::read_to_string(store.ledger_path("p")).unwrap(), "x");
+        assert_eq!(store.list().unwrap().len(), 1);
+        fs::remove_file(&in_the_way).unwrap();
+        store.remove_pod("p").unwrap();
+        assert!(!dir.exists());
+        assert_eq!(history(&store).len(), 1);
     }
 
     /// Written by older versions, and read by them: no field is required or refused.

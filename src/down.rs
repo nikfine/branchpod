@@ -4,8 +4,8 @@
 //! after the config changed. Every resource that is not destroyed is visited, pending and failed
 //! ones included (they may exist partially). Each step is idempotent and its outcome is recorded;
 //! a failure does not stop the others, and what is left is reported at the end. Once nothing is
-//! left, the pod's state is removed as well. Copies edited in the worktree are kept in the `bp`
-//! home instead of being deleted.
+//! left, the pod's state is removed as well, except for the ledger, which is moved to the history.
+//! Copies edited in the worktree are kept in the `bp` home instead of being deleted.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

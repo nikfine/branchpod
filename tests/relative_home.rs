@@ -161,15 +161,19 @@ fn round_trip(s: &Setup, home: &OsStr) {
     let (code, out) = s.bp(home, &["down"]);
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("clean"), "{out}");
-    // Lock files are kept on purpose; no pod is left and no second home inside the home.
+    // Lock files and ledgers are kept on purpose; no pod is left and no second home inside the home.
     assert_eq!(names(&s.cwd), [HOME]);
-    assert_eq!(names(&s.cwd.join(HOME)), ["locks", "pods"]);
-    assert_eq!(files(&s.cwd.join(HOME)), [format!("locks/{pod}.lock")]);
+    assert_eq!(names(&s.cwd.join(HOME)), ["history", "locks", "pods"]);
+    let (ledgers, others): (Vec<String>, Vec<String>) = files(&s.cwd.join(HOME))
+        .into_iter()
+        .partition(|f| f.starts_with(&format!("history/{pod}-")));
+    assert!(!ledgers.is_empty());
+    assert_eq!(others, [format!("locks/{pod}.lock")]);
     assert!(names(&pods).is_empty());
 }
 
 #[test]
-fn nothing_is_left_after_down() {
+fn only_locks_and_ledgers_are_left_after_down() {
     let s = Setup::new();
     round_trip(&s, HOME.as_ref());
 }
@@ -205,5 +209,5 @@ fn a_linked_home_works() {
     fs::create_dir(&real).unwrap();
     std::os::unix::fs::symlink(&real, s.cwd.join(HOME)).unwrap();
     round_trip(&s, HOME.as_ref());
-    assert_eq!(names(&real), ["locks", "pods"]);
+    assert_eq!(names(&real), ["history", "locks", "pods"]);
 }
