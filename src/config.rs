@@ -16,6 +16,7 @@ use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub(crate) const PROJECT_FILE: &str = "branchpod.toml";
 pub(crate) const LOCAL_FILE: &str = "branchpod.local.toml";
@@ -42,6 +43,11 @@ pub(crate) struct Config {
     /// Long-running processes under the supervisor.
     #[serde(default)]
     pub(crate) service: Vec<ServiceSpec>,
+
+    /// Of the TOML it was read from, both files together. Not of the fields above: one that a later
+    /// version adds, with a default, must not make every config another one.
+    #[serde(skip)]
+    pub(crate) hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +163,10 @@ pub(crate) struct CommandSpec {
     pub(crate) create: Vec<String>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) output: OutputMode,
+    /// Argument array run when `bp up` finds the pod there already, to start again what `create`
+    /// made (a container that was stopped); may reference this command's captured output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) start: Option<Vec<String>>,
     /// Argument array run on teardown; may reference this command's captured output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) destroy: Option<Vec<String>>,
@@ -229,16 +239,21 @@ impl Config {
 
         // The config may come from another directory than the worktree, so every error names it.
         let invalid = || format!("invalid configuration in {source}");
-        let config: Config = value.try_into().with_context(invalid)?;
-        config.validate().with_context(invalid)?;
+        Config::from_table(value).with_context(invalid)
+    }
+
+    fn from_table(table: toml::Table) -> Result<Config> {
+        // Comments, spelling and the order of keys are gone by now.
+        let digest = Sha256::digest(serde_json::to_vec(&table)?);
+        let mut config: Config = table.try_into()?;
+        config.validate()?;
+        config.hash = digest.iter().map(|b| format!("{b:02x}")).collect();
         Ok(config)
     }
 
     #[cfg(test)]
     pub(crate) fn parse(text: &str) -> Result<Config> {
-        let config: Config = toml::from_str(text)?;
-        config.validate()?;
-        Ok(config)
+        Config::from_table(toml::from_str(text)?)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -327,7 +342,11 @@ impl Config {
             }
             check_argv(&command.create)
                 .with_context(|| format!("command.{}.create", command.name))?;
-            for (field, argv) in [("destroy", &command.destroy), ("gc", &command.gc)] {
+            for (field, argv) in [
+                ("start", &command.start),
+                ("destroy", &command.destroy),
+                ("gc", &command.gc),
+            ] {
                 if let Some(argv) = argv {
                     check_argv(argv)
                         .with_context(|| format!("command.{}.{field}", command.name))?;

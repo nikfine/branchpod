@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ServiceSpec;
-use crate::proc::ProcId;
+use crate::proc::{self, ProcId};
 use crate::supervisor::Start;
 use crate::vars::Vars;
 
@@ -26,6 +26,27 @@ pub(crate) struct Record {
     /// Its own process, set once started. On Unix also its process group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) process: Option<ProcId>,
+    /// The boot of the system in which it was started ([`proc::boot_id`]). Not recorded by older
+    /// versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot: Option<String>,
+}
+
+impl Record {
+    /// The record of a planned service that was started as `process`.
+    pub(crate) fn started(&self, process: ProcId) -> Record {
+        Record {
+            process: Some(process),
+            boot: proc::boot_id(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the system was rebooted since: then nothing of it runs any more, and whatever has its
+    /// pid or process group is somebody else's.
+    pub(crate) fn is_of_another_boot(&self) -> bool {
+        self.boot.is_some() && proc::boot_id().is_some_and(|now| self.boot != Some(now))
+    }
 }
 
 /// A rendered service: the supervisor's request and the intent's ledger data.
@@ -81,6 +102,7 @@ fn plan_inner(spec: &ServiceSpec, root: &Path, vars: &Vars, pod_dir: &Path) -> R
             cwd,
             log: Some(log),
             process: None,
+            boot: None,
         },
     })
 }

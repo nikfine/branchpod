@@ -245,6 +245,14 @@ fn plan_inner(spec: &CommandSpec, cwd: &Path, vars: &Vars, pod_dir: &Path) -> Re
     export(&spec.name, &record, &mut vars);
 
     let captured = record.file.is_none();
+    if spec.start.is_some() {
+        // Not rendered until it is run, but a mistake in it is found now.
+        let mut probe = vars.clone();
+        if captured {
+            probe.set(own.as_str(), "x");
+        }
+        render_start(spec, &probe)?;
+    }
     (record.destroy, record.destroy_unresolved) = match &spec.destroy {
         None => (None, None),
         Some(argv) if captured && argv.iter().any(|arg| vars::references(arg, &own)) => {
@@ -362,6 +370,19 @@ pub(crate) fn destroy(record: &Record, cwd: &Path) -> Result<Output> {
     Ok(Output {
         record: record.clone(),
     })
+}
+
+/// The `start` of a created command whose output was exported to `vars`; empty without one.
+pub(crate) fn render_start(spec: &CommandSpec, vars: &Vars) -> Result<Vec<String>> {
+    let argv = spec.start.as_deref().unwrap_or_default();
+    vars.render_all(argv).context("start")
+}
+
+/// Runs the rendered `start` of command `name` in `cwd`, the worktree root. Its output is not used.
+pub(crate) fn start(name: &str, argv: &[String], cwd: &Path) -> Result<()> {
+    run(argv, cwd)
+        .map(drop)
+        .with_context(|| format!("command {name:?}: start"))
 }
 
 struct Run {
@@ -496,6 +517,7 @@ mod tests {
             name: name.into(),
             create,
             output: OutputMode::Stdout,
+            start: None,
             destroy,
             gc: None,
         }
@@ -505,6 +527,32 @@ mod tests {
         CommandSpec {
             output: OutputMode::File,
             ..spec(name, create, destroy)
+        }
+    }
+
+    #[test]
+    fn start_is_checked_when_planning_and_may_use_the_own_output() {
+        let cwd = tempfile::tempdir().unwrap();
+        let with_start = |mut spec: CommandSpec, arg: &str| {
+            spec.start = Some(strings(&["x", arg]));
+            spec
+        };
+        let create = || strings(&["x"]);
+        let own = with_start(spec("app", create(), None), "{{command.app.stdout}}");
+        plan(&own, cwd.path(), &vars()).unwrap();
+        let mut known = vars();
+        known.set("command.app.stdout", "abc");
+        assert_eq!(render_start(&own, &known).unwrap(), ["x", "abc"]);
+
+        let file = with_start(file_spec("app", create(), None), "{{command.app.file}}");
+        plan(&file, cwd.path(), &vars()).unwrap();
+        for wrong in [
+            with_start(spec("app", create(), None), "{{command.app.file}}"),
+            with_start(file_spec("app", create(), None), "{{command.app.stdout}}"),
+            with_start(spec("app", create(), None), "{{port.nope}}"),
+        ] {
+            let err = format!("{:#}", plan(&wrong, cwd.path(), &vars()).unwrap_err());
+            assert!(err.contains("command \"app\": start"), "{err}");
         }
     }
 

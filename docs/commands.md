@@ -5,7 +5,7 @@ and `logs` refuse a directory inside a worktree that has a pod, with code `1`.
 
 | Command | What it does | Exit codes |
 |---|---|---|
-| `branchpod up [PATH]` | Creates what the config describes. Refuses if the pod already has anything recorded: run `down` first. | `0` everything was created, `1` failed |
+| `branchpod up [PATH]` | Creates what the config describes. A pod that is there already is brought up again, see [Up again](#up-again). | `0` the pod is up, `1` failed or refused |
 | `branchpod status [PATH] [--json]` | Shows what is recorded for the pod and whether it still runs, see [Status](#status). Only looks. | `0` healthy, or there is no pod; `4` degraded; `5` busy; `1` failed, for example without a path outside a git worktree |
 | `branchpod down [PATH]` | Tears down everything recorded, in reverse order. | `0` nothing is left, or there is no pod (see below); `3` something is left: fix the cause and run it again; `1` could not run |
 | `branchpod logs SERVICE [PATH] [-f] [-n N]` | Prints the output of a service: the last 200 lines, `-n N` or `-n all`. `-f` follows it until the service is gone. | `0`; `1` no such pod, service or log, or failed |
@@ -25,6 +25,21 @@ stays, and the message lists it with the `down` command to run.
 
 One `up` or `down` runs at a time for a pod. A second one says whom it waits for, and waits without a limit.
 
+## Up again
+
+After a reboot, or when a service has died, `up` starts what does not run any more. It destroys nothing, creates
+nothing anew and does not touch services that run. It prints `is up again`, or `is already up` if no service had to be
+started.
+
+- Services are started again.
+- The [`start`](config.md#command) of each command is run every time. A command that has a `destroy` but no `start` is
+  `left as it is`.
+- Ports stay as they are and are not checked. Files stay as they are, and deleted ones are not brought back.
+
+It refuses, with `already has resources recorded` and the reason, if the config has changed since (other than in
+comments), if an earlier `up` or `down` did not finish, or if this is not the worktree the pod was created for but a new one at
+the same path. Then run `down` first.
+
 ## Status
 
 `status` ends with one of these, and with a hint at what to do unless it is `healthy`:
@@ -32,7 +47,7 @@ One `up` or `down` runs at a time for a pod. A second one says whom it waits for
 | | Exit code | Meaning |
 |---|---|---|
 | `healthy` | `0` | Everything is as `up` left it. Not that a service is ready: that is not checked. |
-| `degraded` | `4` | A process does not run as it should, something failed, or `up` or `down` did not finish. Mostly: `down`, then `up`. |
+| `degraded` | `4` | A process does not run as it should, something failed, or `up` or `down` did not finish. The hint says what to do: `up`, or `down` and then `up`. |
 | `busy` | `5` | `up` or `down` is at work. Wait: do not take the pod down. |
 
 For a service that does not run, the last 10 lines of its log are shown (at most 4 KB), whatever they are: a service
@@ -70,7 +85,10 @@ What was created, command output and service logs are kept outside the worktree,
 | macOS | `~/Library/Application Support/branchpod` |
 | Linux | `$XDG_DATA_HOME/branchpod`, by default `~/.local/share/branchpod` |
 
-Every command must see the same one. Arguments of commands and services are recorded there as they were run, so do
+Besides, `up` writes one small file, `.branchpod`, into the git directory of the worktree (`.git/worktrees/<name>`), to
+tell the worktree from a later one at the same path. `down` removes it.
+
+Every command must see the same state directory. Arguments of commands and services are recorded there as they were run, so do
 not pass secrets in them.
 
 Edited files that `down` kept are in `saved/<pod id>/<time>/`, where `<time>` is in milliseconds since 1970, under

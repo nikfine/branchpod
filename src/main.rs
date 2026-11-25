@@ -25,6 +25,11 @@ enum Cmd {
         json: bool,
     },
     /// Provision a worktree: ports, files, commands and services from its configuration.
+    ///
+    /// A pod that is there already is brought up again, after a reboot for example: services that do
+    /// not run are started, and the `start` of commands is run. Nothing is destroyed or created anew.
+    /// If the pod is not what the configuration describes any more, or an earlier command did not
+    /// finish, it has to be taken down first.
     Up {
         /// Worktree path; defaults to the current directory.
         path: Option<OsString>,

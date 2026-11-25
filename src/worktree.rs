@@ -58,6 +58,19 @@ impl Worktree {
         })
     }
 
+    /// The git directory of this worktree alone: `.git/worktrees/<name>` of the main checkout for a
+    /// linked worktree, `.git` for the main checkout itself. Found from the root: a git hook sets
+    /// variables that would lead to the repository it runs for.
+    pub(crate) fn git_dir(&self) -> Result<PathBuf> {
+        let mut command = Command::new("git");
+        for name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"] {
+            command.env_remove(name);
+        }
+        let out = run_git(command, &self.root, &["rev-parse", "--absolute-git-dir"])?;
+        let dir = out.trim_end_matches(['\r', '\n']);
+        canonical(Path::new(dir))
+    }
+
     /// The checked-out branch name (`feature/x`); `None` on a detached HEAD. A branch without
     /// commits yet counts as checked out.
     pub(crate) fn branch(&self) -> Result<Option<String>> {
@@ -176,7 +189,11 @@ pub(crate) fn normalize(path: &Path) -> Result<PathBuf> {
 /// Runs git without a shell and returns stdout. Git prints paths as UTF-8 on every platform, so
 /// the output is never decoded with the console code page.
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    run_git(Command::new("git"), cwd, args)
+}
+
+fn run_git(mut command: Command, cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = command
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -296,6 +313,13 @@ mod tests {
         let from_linked = Worktree::resolve(Some(linked.as_os_str())).unwrap();
         assert_eq!(from_linked.root, canonical(&linked).unwrap());
         assert_eq!(from_linked.main_checkout, Some(canonical(&main).unwrap()));
+
+        assert_eq!(
+            from_main.git_dir().unwrap(),
+            canonical(&main.join(".git")).unwrap()
+        );
+        let admin = main.join(".git/worktrees/feature-na\u{ef}ve");
+        assert_eq!(from_linked.git_dir().unwrap(), canonical(&admin).unwrap());
 
         assert_eq!(from_linked.branch().unwrap().as_deref(), Some("feature"));
         // A tag with the same name does not change how the branch is named.

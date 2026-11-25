@@ -123,9 +123,11 @@ pub(crate) fn connect(endpoint: &str) -> Result<Stream> {
 pub(crate) fn remove_stale(endpoint: &str) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
     match fs::symlink_metadata(endpoint) {
-        Ok(meta) if meta.file_type().is_socket() => {
-            fs::remove_file(endpoint).with_context(|| format!("cannot remove {endpoint}"))
-        }
+        Ok(meta) if meta.file_type().is_socket() => match fs::remove_file(endpoint) {
+            // Its supervisor, which is just exiting, was faster.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result.with_context(|| format!("cannot remove {endpoint}")),
+        },
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("cannot inspect {endpoint}")),

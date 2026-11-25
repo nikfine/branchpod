@@ -95,6 +95,8 @@ branchpod status ../demo-feature
 branchpod logs web ../demo-feature
 ```
 
+After a reboot, or if the service has died, `branchpod up ../demo-feature` starts it again.
+
 Open the address from the log, then tear the pod down. Remove the worktree only after `down` printed `clean`:
 
 ```

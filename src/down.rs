@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::files::{self, EntryType};
 use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
+use crate::mark::Mark;
 use crate::pod::{PodMeta, Store, Unfinished};
 use crate::saved::Saved;
 use crate::supervisor::{self, Request};
@@ -123,7 +124,10 @@ pub(crate) fn teardown(
                 }
             }
         }
-        report.state_error = store.remove_pod(&meta.id).err().map(|e| format!("{e:#}"));
+        // The mark first: later it would not be known any more.
+        let mark = meta.mark.as_ref().map_or(Ok(()), Mark::remove);
+        let removed = mark.and_then(|()| store.remove_pod(&meta.id));
+        report.state_error = removed.err().map(|e| format!("{e:#}"));
     }
     Ok(report)
 }
@@ -192,7 +196,7 @@ fn destroy(
 /// Asks the supervisor to stop the service. When it is gone, the service's process tree is
 /// stopped by its recorded leader instead; a service never reported as started had its pid known
 /// only to that supervisor.
-fn stop_service(
+pub(crate) fn stop_service(
     supervisor: Option<&supervisor::Record>,
     name: &str,
     record: &services::Record,
@@ -208,7 +212,9 @@ fn stop_service(
         }
     }
     // Also after the supervisor answered: it may not know a process recorded for this pod.
-    if let Some(process) = record.process {
+    if let Some(process) = record.process
+        && !record.is_of_another_boot()
+    {
         proc::stop_recorded_tree(process, supervisor::GRACE)?;
     }
     Ok(())
@@ -249,7 +255,7 @@ fn stop_supervisor(record: &supervisor::Record) -> Result<()> {
     control::remove_stale(&record.endpoint)
 }
 
-fn data<T: DeserializeOwned>(r: &ResourceState) -> Result<T> {
+pub(crate) fn data<T: DeserializeOwned>(r: &ResourceState) -> Result<T> {
     serde_json::from_value(r.data.clone())
         .with_context(|| format!("unreadable ledger data of {} {:?}", r.kind, r.name))
 }
@@ -296,6 +302,8 @@ mod tests {
             worktree,
             main_checkout: None,
             unfinished: None,
+            mark: None,
+            config_hash: None,
         };
         store.write_meta(&meta).unwrap();
         Setup {
@@ -619,6 +627,7 @@ mod tests {
             cwd: start.cwd,
             log: None,
             process: Some(serde_json::from_value(data).unwrap()),
+            boot: proc::boot_id(),
         };
         reaper.0.extend(web.process);
         // From then on it writes nothing, so on Unix it outlives a killed supervisor.
@@ -661,6 +670,43 @@ mod tests {
         let report = s.teardown().unwrap();
         assert!(report.is_clean(), "{report:?}");
         assert!(proc::wait_gone(web_process, Duration::from_secs(5)));
+    }
+
+    /// After a reboot the process group with the recorded id may be anybody's. Within one boot a
+    /// group whose leader is gone is what is left of the service.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_group_of_another_boot_is_left_alone() {
+        use std::os::unix::process::CommandExt;
+        for same_boot in [false, true] {
+            let s = setup(true);
+            let mut leader = std::process::Command::new("sh")
+                .args(["-c", "sleep 300 &"])
+                .process_group(0)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let group = leader.id() as libc::pid_t;
+            assert!(leader.wait().unwrap().success());
+            let boot = if same_boot {
+                proc::boot_id().unwrap()
+            } else {
+                "another".to_owned()
+            };
+            s.live(
+                Kind::Service,
+                "web",
+                json!({
+                    "run": ["x"], "cwd": "/", "boot": boot,
+                    "process": { "pid": group, "start": 1 },
+                }),
+            );
+            let report = s.teardown().unwrap();
+            // SAFETY: plain system call on a group of ours; whether there was one to kill.
+            let left = unsafe { libc::killpg(group, libc::SIGKILL) } == 0;
+            assert!(report.is_clean(), "{report:?}");
+            assert_eq!(left, !same_boot);
+        }
     }
 
     #[test]

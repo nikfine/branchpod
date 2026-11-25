@@ -381,6 +381,11 @@ pub(crate) fn stop_recorded_tree(leader: ProcId, grace: Duration) -> io::Result<
     Ok(())
 }
 
+/// A creation time is not repeated by a later boot, and a tree is stopped by its leader only.
+pub(crate) fn boot_id() -> Option<String> {
+    None
+}
+
 pub(crate) fn kill(id: ProcId) -> io::Result<()> {
     terminate(id, EXITING_WAIT).map(drop)
 }
