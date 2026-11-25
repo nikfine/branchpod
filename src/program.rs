@@ -1,8 +1,8 @@
 //! Programs named without their extension, `npx` for `npx.cmd`.
 //!
 //! Only Windows has such names. There std finds `npx.exe` for `npx`, but no script, so the same
-//! config would not work everywhere: node tools are installed as `.cmd` scripts. What std finds is
-//! left to it, so a script is only looked for where there is no `.exe`.
+//! config would not work everywhere: node tools are installed as `.cmd` scripts. An `.exe` is left
+//! to std, so a script is only looked for where there is none.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -76,8 +76,8 @@ fn extensions(pathext: &str) -> Vec<&'static str> {
 }
 
 /// The script that `program` names without its extension, if std would find no `.exe` for it. A
-/// file without an extension, such as the `sh` script that npm puts next to `npx.cmd`, is nothing
-/// that Windows runs.
+/// file without an extension does not count: next to a script it is the `sh` script of npm. At a
+/// path std would run it if it were an executable, so that one gives way to a script beside it.
 #[cfg(any(windows, test))]
 fn find(program: &Path, dirs: &[PathBuf], extensions: &[&str]) -> Option<PathBuf> {
     let name = program.file_name()?.to_str()?;

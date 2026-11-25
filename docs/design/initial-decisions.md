@@ -364,9 +364,10 @@ shown as `saved`, its new path printed on stderr, and the exit code stays `0`.
   commands and services alike, on `PATH` or at a path (`node_modules/.bin/vite`). Spawning without a shell finds
   only `.exe`, so `bp` looks for the others, in the order of `PATHEXT`, in the directories that the standard
   library searches for an `.exe`, the working directory not among them. An `.exe` in any of them comes first, even
-  where a shell would take a script from an earlier directory: what was found before scripts were stays the same.
-  A file without an extension (the `sh` script next to `npx.cmd`) does not count. `cmd.exe` parses the arguments of
-  a batch file: the standard library escapes them, and what it refuses (a line break) is an error.
+  where a shell would take a script from an earlier directory: what a bare name found before stays the same. A file
+  without an extension (the `sh` script next to `npx.cmd`) does not count; at a path, even an executable one gives
+  way to a script beside it. `cmd.exe` parses the arguments of a batch file: the standard library escapes them, and
+  what it refuses (a line break) is an error.
 
 ### Command output in a file
 
