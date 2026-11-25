@@ -57,7 +57,13 @@ pub fn up(path: Option<&OsStr>) -> Result<ExitCode> {
         report.pod.worktree.display()
     );
     for item in &report.items {
-        println!("  {:<10} {:<24} {}", item.kind, item.name, item.detail);
+        println!(
+            "  {:<10} {:<24} {:>6.1}s  {}",
+            item.kind,
+            item.name,
+            item.took.as_secs_f64(),
+            item.detail
+        );
     }
     for warning in &report.warnings {
         eprintln!("bp: warning: {warning}");

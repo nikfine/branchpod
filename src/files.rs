@@ -14,6 +14,10 @@
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
@@ -307,15 +311,14 @@ fn create_inner(plan: &Plan, record: &mut Record) -> Result<()> {
     let path = &record.path;
     match &plan.action {
         Action::Copy { source, reflink } => {
-            let mut cloned = None;
-            if record.entry == EntryType::Dir {
+            let cloned = if record.entry == EntryType::Dir {
                 fs::create_dir(path)?;
-                copy_tree(source, path, *reflink, &mut cloned)?;
+                copy_tree(source, path, *reflink, copy_threads())?
             } else {
                 let copied = copy_file(source, path, *reflink, true)?;
-                cloned = Some(copied.cloned);
                 record.fingerprint = copied.fingerprint;
-            }
+                Some(copied.cloned)
+            };
             // `None` for a reflink of a tree without files: nothing was cloned or copied.
             record.cloned = if *reflink { cloned } else { None };
         }
@@ -373,9 +376,74 @@ fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Re
     })
 }
 
-/// Copies the contents of `source` into the existing, empty `dest`. Links inside the tree are
-/// recreated as links to the same target, never followed.
-fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut Option<bool>) -> Result<()> {
+/// More threads than this hardly help: the disk is the limit.
+const MAX_COPY_THREADS: usize = 8;
+
+fn copy_threads() -> usize {
+    thread::available_parallelism().map_or(1, |n| n.get().min(MAX_COPY_THREADS))
+}
+
+/// Files waiting to be copied. Kept short, so that a file is copied soon after it was listed.
+const COPY_QUEUE: usize = 64;
+
+/// Source and destination.
+type Pair = (PathBuf, PathBuf);
+
+/// Copies the contents of `source` into the existing, empty `dest`; files on `threads` threads, the
+/// rest on this one. Links inside the tree are recreated as links to the same target, never followed.
+/// Returns whether every file was cloned, `None` without files.
+///
+/// The first error stops the other threads. Nothing is written any more when this returns.
+fn copy_tree(source: &Path, dest: &Path, reflink: bool, threads: usize) -> Result<Option<bool>> {
+    let stop = AtomicBool::new(false);
+    let mut dirs = vec![(source.to_path_buf(), dest.to_path_buf())];
+    let cloned = thread::scope(|scope| -> Result<Option<bool>> {
+        let (files, queue) = sync_channel(COPY_QUEUE);
+        // Owned by the threads alone: once the last one is gone, sending fails instead of waiting.
+        let queue = Arc::new(Mutex::new(queue));
+        let workers = (0..threads)
+            .map(|_| {
+                let (queue, stop) = (Arc::clone(&queue), &stop);
+                thread::Builder::new()
+                    .spawn_scoped(scope, move || copy_queued(&queue, reflink, stop))
+            })
+            .collect::<io::Result<Vec<_>>>()
+            .context("cannot start a thread")?;
+        drop(queue);
+
+        let listed = list_tree(source, dest, &files, &mut dirs);
+        if listed.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        drop(files);
+
+        let mut cloned = None;
+        // Every thread is waited for by the scope, also after an error.
+        for worker in workers {
+            let this = worker
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))?;
+            cloned = both(cloned, this);
+        }
+        // Last: when a thread failed, listing fails only because of that.
+        listed.map(|()| cloned)
+    })?;
+
+    // Last, so that a read-only source directory does not block writing its contents; the inner
+    // ones first.
+    for (source, dest) in dirs.iter().rev() {
+        copy_dir_mode(source, dest)?;
+    }
+    Ok(cloned)
+}
+
+/// Creates the directories and links of the tree and queues its files.
+fn list_tree(
+    source: &Path,
+    dest: &Path,
+    files: &SyncSender<Pair>,
+    dirs: &mut Vec<Pair>,
+) -> Result<()> {
     let entries =
         fs::read_dir(source).with_context(|| format!("cannot read {}", source.display()))?;
     for entry in entries {
@@ -387,23 +455,61 @@ fn copy_tree(source: &Path, dest: &Path, reflink: bool, cloned: &mut Option<bool
             copy_link(&from, &to)?;
         } else if file_type.is_dir() {
             fs::create_dir(&to)?;
-            copy_tree(&from, &to, reflink, cloned)?;
+            dirs.push((from.clone(), to.clone()));
+            list_tree(&from, &to, files, dirs)?;
         } else if file_type.is_file() {
-            let this = copy_file(&from, &to, reflink, false)
-                .with_context(|| format!("cannot copy {}", from.display()))?;
-            *cloned = Some(cloned.unwrap_or(true) && this.cloned);
+            files.send((from, to)).context("copying has stopped")?;
         } else {
             bail!("{} is not a file, directory or link", from.display());
         }
     }
-    // Last, so that a read-only source directory does not block writing its contents. The owner
-    // keeps write access: in a read-only directory nothing could be removed on teardown.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(source)?.permissions().mode() | 0o200;
-        fs::set_permissions(dest, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Copies queued files until there are no more or `stop` is set, which it does itself on an error.
+fn copy_queued(
+    queue: &Mutex<Receiver<Pair>>,
+    reflink: bool,
+    stop: &AtomicBool,
+) -> Result<Option<bool>> {
+    let mut cloned = None;
+    loop {
+        // A statement of its own: the lock must not be held while copying.
+        let next = queue.lock().expect("no thread panics with the lock").recv();
+        let Ok((from, to)) = next else {
+            return Ok(cloned);
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(cloned);
+        }
+        match copy_file(&from, &to, reflink, false) {
+            Ok(this) => cloned = both(cloned, Some(this.cloned)),
+            Err(e) => {
+                stop.store(true, Ordering::Relaxed);
+                return Err(e.context(format!("cannot copy {}", from.display())));
+            }
+        }
     }
+}
+
+/// Whether all were cloned; `None` is nothing to clone.
+fn both(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a && b),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The owner keeps write access: in a read-only directory nothing could be removed on teardown.
+#[cfg(unix)]
+fn copy_dir_mode(source: &Path, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(source)?.permissions().mode() | 0o200;
+    Ok(fs::set_permissions(dest, fs::Permissions::from_mode(mode))?)
+}
+
+#[cfg(windows)]
+fn copy_dir_mode(_source: &Path, _dest: &Path) -> Result<()> {
     Ok(())
 }
 
