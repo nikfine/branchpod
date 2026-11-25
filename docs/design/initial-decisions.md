@@ -172,7 +172,10 @@ One supervisor process per worktree, no global daemon; control over a local sock
   When nothing listens on the supervisor's endpoint (or the channel breaks, as it does when the
   supervisor is being killed, and its recorded process is gone), a service's tree is stopped by its recorded leader: on Unix
   `killpg(pid)` unless the pid now belongs to another process (a pid is not reused while a group with
-  that id exists, so a group whose leader is gone is still ours). A service that never reported its
+  that id exists, so a group whose leader is gone is still ours). That holds within one boot of the system only,
+  so a service also records the id of the boot (Linux `boot_id`, macOS `kern.bootsessionuuid`), and after a
+  reboot none of its processes are looked for: the group with its id may be anybody's. Windows needs no such
+  id, as a creation time is not repeated. Records without it (older versions) are treated as of this boot. A service that never reported its
   pid was known only to that supervisor and is considered gone with it (it is, once the platform
   measures below tie services to the supervisor's life).
 - Windows: Job Objects, see "Services on Windows".

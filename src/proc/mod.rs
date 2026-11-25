@@ -145,6 +145,12 @@ pub(crate) fn stop_recorded_tree(leader: ProcId, grace: Duration) -> io::Result<
     sys::stop_recorded_tree(leader, grace)
 }
 
+/// What tells this boot of the system from others, where a process tree recorded before a reboot
+/// cannot be told from another one by its leader alone. `None` on Windows, where it can.
+pub(crate) fn boot_id() -> Option<String> {
+    sys::boot_id()
+}
+
 /// Kills `id` at once, if it is still that process.
 pub(crate) fn kill(id: ProcId) -> io::Result<()> {
     sys::kill(id)
@@ -182,6 +188,16 @@ pub(crate) fn spawn_detached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_boot_is_the_same_each_time_it_is_asked_for() {
+        let boot = boot_id();
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            // A UUID.
+            assert_eq!(boot.as_ref().map(String::len), Some(36), "{boot:?}");
+        }
+        assert_eq!(boot, boot_id());
+    }
 
     #[test]
     fn identifies_this_process() {

@@ -334,10 +334,7 @@ fn provision(
         let intent = serde_json::to_value(&plan.record)?;
         let record = step(journal, Kind::Service, &spec.name, intent, || {
             let data = supervisor::request(&sup.endpoint, &Request::Start(plan.start.clone()))?;
-            Ok(services::Record {
-                process: Some(serde_json::from_value(data)?),
-                ..plan.record.clone()
-            })
+            Ok(plan.record.started(serde_json::from_value(data)?))
         })
         .with_context(|| format!("service {:?}", spec.name))?;
         items.push(Item {

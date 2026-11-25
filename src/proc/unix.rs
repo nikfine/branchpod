@@ -153,6 +153,38 @@ fn signal_group(group: libc::pid_t, signal: libc::c_int) -> io::Result<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn boot_id() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(text.trim().to_owned())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn boot_id() -> Option<String> {
+    let mut text = [0u8; 64];
+    let mut len = text.len();
+    // SAFETY: a name that ends with NUL, and a buffer with its length.
+    let done = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            text.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if done != 0 {
+        return None;
+    }
+    let text = std::ffi::CStr::from_bytes_until_nul(&text).ok()?;
+    Some(text.to_str().ok()?.to_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn boot_id() -> Option<String> {
+    None
+}
+
 pub(crate) fn kill(id: ProcId) -> io::Result<()> {
     if identify(id.pid) != Some(id) {
         return Ok(());

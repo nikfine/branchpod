@@ -984,6 +984,7 @@ mod tests {
             cwd: start.cwd,
             log: Some(start.log),
             process: Some(web),
+            boot: proc::boot_id(),
         };
         let live = |kind, name, data| resource(kind, name, Status::Live, data);
         let resources = vec![
