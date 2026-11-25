@@ -900,6 +900,10 @@ fn parents_below(root: &Path, path: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+#[path = "files_bench.rs"]
+mod bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Replace;
