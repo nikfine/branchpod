@@ -76,6 +76,7 @@ create = [
     "-v", "{{worktree | slash}}:/app",
     "example/app",
 ]
+start = ["docker", "start", "example-{{pod.id}}"]
 destroy = ["docker", "rm", "-f", "-v", "example-{{pod.id}}"]
 
 [[service]]
@@ -174,6 +175,7 @@ Anything created by one command and removed by another: a container, a volume, a
 |---|---|---|---|
 | `name` | string | required | Unique among commands. |
 | `create` | array of strings | required | Program and arguments. |
+| `start` | array of strings | none | Program and arguments, to start again what `create` made. See below. |
 | `destroy` | array of strings | none | Program and arguments. Without it, there is nothing to undo. |
 | `output` | `"stdout"` or `"file"` | `"stdout"` | What becomes of the output of `create`, see below. |
 | `gc` | array of strings | none | Accepted but not used yet, and its variables are not checked. |
@@ -181,7 +183,7 @@ Anything created by one command and removed by another: a container, a volume, a
 **How they run.** Without a shell: no pipes, `&&` or `$VAR`. Standard input is closed, the environment is that of
 `up` or `down`. An exit code other than 0 is a failure, and the end of stderr is shown. There is no time limit.
 
-- `create` runs in the root of the worktree. `destroy` too while it exists, otherwise in the
+- `create` and `start` run in the root of the worktree. `destroy` too while it exists, otherwise in the
   [state directory](commands.md#state): have it use absolute paths, such as `{{main}}`.
 - A bare program name is searched on `PATH`. A relative one with a directory (`./scripts/up.sh`) is taken from the
   working directory. On Windows a `.cmd` or `.bat` script is named with its extension (`npx.cmd`), which other
@@ -211,6 +213,12 @@ create = ["docker", "run", "-d", "--name", "example-{{pod.id}}", "--env-file", "
 destroy = ["docker", "rm", "-f", "-v", "example-{{pod.id}}"]
 ```
 
+**`start`** is run whenever `up` finds the pod there already, for a container that a reboot stopped:
+`["docker", "start", "example-{{pod.id}}"]`. Whether it is needed is not known, so it must succeed and do nothing if
+what `create` made runs. It may use what `destroy` may, its own output included. It is not recorded: it can be added
+or changed while the pod is there. If it fails, so does `up`, and no service is started. Without it, the command is
+left alone.
+
 **`destroy`** is rendered at `up` and recorded, so changing the config later does not change it. It may use the
 built-in variables, ports, the output of earlier commands, and its own output. `create` cannot use its own.
 
@@ -233,8 +241,8 @@ A long-running process. All services of a pod run under one supervisor process, 
 | `cwd` | string | the root | Working directory, relative to the root of the worktree. Same rules as a file path: not a template, stays inside. It must exist when the service starts. Use `/`. |
 | `env` | table of strings | `{}` | Added to the environment of `up`. Variables are substituted in the values. Not recorded. |
 
-`up` returns once the process exists, not once it is ready. A service that exits is not restarted; `status`
-shows it. Standard input is closed; stdout and stderr go to one log, shown by `branchpod logs <name>`, which keeps about 30 MB.
+`up` returns once the process exists, not once it is ready. A service that exits is not restarted until the next `up`;
+`status` shows it. Standard input is closed; stdout and stderr go to one log, shown by `branchpod logs <name>`, which keeps about 30 MB.
 
 `down` stops a service with what it started. On Windows that is the whole process tree, at once. On macOS and Linux
 it is the process group, with `SIGTERM`, then `SIGKILL` after 10 seconds: a process that left the group (`setsid`)
@@ -260,7 +268,7 @@ UTF-8. A value is not substituted again.
 |---|---|
 | template text, `replace.with` | built-in variables, ports |
 | `command.create` | and the output of earlier commands |
-| `command.destroy` | and its own output |
+| `command.start`, `command.destroy` | and its own output |
 | `service.run`, values of `service.env` | built-in variables, ports, the output of all commands |
 
 Nowhere else: not in names, paths, `cwd`, `find` or the keys of `env`.
@@ -327,7 +335,7 @@ does not stop the others.
 | `output is not valid UTF-8` | Output of a command without `output = "file"`. |
 | `no free port` | Every port of the range is taken. |
 | `program not found` | Not on `PATH`, or a Windows script without its extension. |
-| `already has resources recorded` | The pod is up, or an earlier `up` failed: run `down` first. If the worktree is a new one at a path used before, `down` takes what is at the recorded paths for its own, even if it is yours: it deletes directories and moves changed files to `saved`. Move them away first. |
+| `already has resources recorded` | The pod is there and cannot be [brought up again](commands.md#up-again); the message says why: run `down` first. If the worktree is a new one at a path used before, `down` takes what is at the recorded paths for its own, even if it is yours: it deletes directories and moves changed files to `saved`. Move them away first. |
 | `looks like an unexpanded variable` | The caller passed `%NAME%` or `$NAME` as the path. |
 
 All of them exit with code 1. The other codes are in the [command reference](commands.md).

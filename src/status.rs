@@ -75,8 +75,8 @@ pub(crate) struct View {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-struct Runtime {
-    state: State,
+pub(crate) struct Runtime {
+    pub(crate) state: State,
     /// Not known for a service that a supervisor of an older version saw exit.
     #[serde(skip_serializing_if = "Option::is_none")]
     exit: Option<Exit>,
@@ -207,7 +207,10 @@ fn look_with(
         let (state, hint) = match work {
             Some(work) => (Health::Busy, Some(busy_hint(&work, &pod, hang))),
             None if good => (Health::Healthy, None),
-            None => (Health::Degraded, Some(hint(&pod, hang))),
+            None if pod.unfinished.is_none() && startable(&problems) => {
+                (Health::Degraded, Some(up_hint(&pod)))
+            }
+            None => (Health::Degraded, Some(down_hint(&pod, hang))),
         };
         return Ok(Some(Report {
             pod,
@@ -224,7 +227,7 @@ fn look_with(
 
 /// What was found out about the supervisor.
 #[derive(Debug)]
-enum Supervisor {
+pub(crate) enum Supervisor {
     /// It answered; its services.
     Running(Vec<ServiceStatus>),
     Unresponsive {
@@ -237,7 +240,7 @@ enum Supervisor {
     Unknown,
 }
 
-fn supervisor_record(resources: &[ResourceState]) -> Option<supervisor::Record> {
+pub(crate) fn supervisor_record(resources: &[ResourceState]) -> Option<supervisor::Record> {
     let resource = resources
         .iter()
         .rfind(|r| r.kind == Kind::Supervisor && r.status != Status::Destroyed)?;
@@ -248,7 +251,7 @@ fn record<T: serde::de::DeserializeOwned>(resource: &ResourceState) -> Result<T>
     serde_json::from_value(resource.data.clone()).context("unreadable ledger data")
 }
 
-fn observe(record: Option<&supervisor::Record>) -> Supervisor {
+pub(crate) fn observe(record: Option<&supervisor::Record>) -> Supervisor {
     let Some(record) = record else {
         return Supervisor::Unknown;
     };
@@ -310,7 +313,7 @@ fn supervisor_runtime(supervisor: &Supervisor) -> Runtime {
     }
 }
 
-fn service_runtime(
+pub(crate) fn service_runtime(
     resource: &ResourceState,
     supervisor: &Supervisor,
     alive: impl Fn(ProcId) -> bool,
@@ -372,7 +375,7 @@ fn problems(views: &[View]) -> Vec<Problem> {
 }
 
 /// What to do about a supervisor that hangs: `bp down` waits for its answer, however long that takes.
-fn hang(supervisor: &Supervisor, process: Option<ProcId>) -> Option<String> {
+pub(crate) fn hang(supervisor: &Supervisor, process: Option<ProcId>) -> Option<String> {
     let Supervisor::Unresponsive { hangs: true, .. } = supervisor else {
         return None;
     };
@@ -385,9 +388,24 @@ fn hang(supervisor: &Supervisor, process: Option<ProcId>) -> Option<String> {
     ))
 }
 
-/// The next step for a pod that is degraded. With the path: the caller may be in another worktree.
-/// Two commands, not `a && b`, which not every shell has.
-fn hint(pod: &PodMeta, hang: Option<String>) -> String {
+/// Whether `bp up` can deal with the problems of a pod that is not unfinished.
+fn startable(problems: &[Problem]) -> bool {
+    problems.iter().all(|p| match (p.kind, &p.is) {
+        (Kind::Service, is) => *is != Is::State(State::Unknown),
+        (Kind::Supervisor, is) => matches!(is, Is::State(State::Gone | State::NotStarted)),
+        _ => false,
+    })
+}
+
+/// The next step for a pod of which only processes do not run. With the path: the caller may be in
+/// another worktree.
+fn up_hint(pod: &PodMeta) -> String {
+    format!("run `bp up {}`", up::quote(&pod.worktree))
+}
+
+/// The same for a pod that has to be taken down. Two commands, not `a && b`, which not every shell
+/// has.
+pub(crate) fn down_hint(pod: &PodMeta, hang: Option<String>) -> String {
     let path = up::quote(&pod.worktree);
     let (reason, again) = match pod.unfinished {
         Some(Unfinished::Up) => ("`bp up` did not finish; ", ""),
@@ -606,6 +624,7 @@ mod tests {
             worktree: "/wt".into(),
             main_checkout: None,
             unfinished,
+            mark: None,
         }
     }
 
@@ -852,9 +871,9 @@ mod tests {
         for supervisor in [cut_off, Supervisor::Gone] {
             assert_eq!(hang(&supervisor, Some(P)), None);
         }
-        assert_eq!(hint(&meta(None), None), steps);
+        assert_eq!(down_hint(&meta(None), None), steps);
         let hang = hang(&unresponsive(), Some(P));
-        let text = hint(&meta(None), hang.clone());
+        let text = down_hint(&meta(None), hang.clone());
         assert!(text.contains("end process 7, then run"), "{text}");
         assert!(text.ends_with(&steps), "{text}");
 
@@ -866,6 +885,41 @@ mod tests {
         let text = busy_hint("bp down (pid 5)", &meta(None), hang);
         assert!(text.starts_with("bp down (pid 5)"), "{text}");
         assert!(text.ends_with("end process 7"), "{text}");
+    }
+
+    #[test]
+    fn up_is_the_next_step_if_only_processes_do_not_run() {
+        let p = |kind, is| Problem {
+            kind,
+            name: "x".into(),
+            is,
+        };
+        use Kind::{Command, Service, Supervisor};
+        for (problems, expected) in [
+            (vec![p(Service, Is::State(State::Exited))], true),
+            (vec![p(Service, Is::Status(Status::Pending))], true),
+            (
+                vec![
+                    p(Supervisor, Is::State(State::Gone)),
+                    p(Service, Is::State(State::Orphaned)),
+                ],
+                true,
+            ),
+            (vec![p(Supervisor, Is::State(State::NotStarted))], true),
+            (vec![p(Supervisor, Is::State(State::Unresponsive))], false),
+            // It answers, but its process was not recorded.
+            (vec![p(Supervisor, Is::Status(Status::Pending))], false),
+            (vec![p(Service, Is::State(State::Unknown))], false),
+            (
+                vec![
+                    p(Service, Is::State(State::Gone)),
+                    p(Command, Is::Status(Status::Failed)),
+                ],
+                false,
+            ),
+        ] {
+            assert_eq!(startable(&problems), expected, "{problems:?}");
+        }
     }
 
     #[test]

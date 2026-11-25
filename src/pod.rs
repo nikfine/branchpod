@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ledger;
+use crate::mark::Mark;
 
 pub(crate) const META_VERSION: u32 = 1;
 const HOME_ENV: &str = "BRANCHPOD_HOME";
@@ -75,6 +76,10 @@ pub(crate) struct PodMeta {
     /// interrupted. The ledger does not tell: what `up` rejects while planning is not recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) unfinished: Option<Unfinished>,
+    /// What tells the worktree from another one at the same path. Versions before it did not mark
+    /// worktrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mark: Option<Mark>,
 }
 
 /// What a pod is in the middle of.
@@ -284,6 +289,7 @@ mod tests {
             worktree: worktree.clone(),
             main_checkout: None,
             unfinished: None,
+            mark: None,
         };
         store.write_meta(&meta).unwrap();
 

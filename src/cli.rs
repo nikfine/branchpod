@@ -52,8 +52,13 @@ pub fn up(path: Option<&OsStr>) -> Result<ExitCode> {
         None => eprintln!("bp: waiting for another bp process on this worktree"),
     })?;
     println!(
-        "pod {} is up ({})",
+        "pod {} is {} ({})",
         report.pod.id,
+        match report.outcome {
+            up::Outcome::Created => "up",
+            up::Outcome::Restarted => "up again",
+            up::Outcome::AlreadyUp => "already up",
+        },
         report.pod.worktree.display()
     );
     for item in &report.items {
@@ -89,9 +94,14 @@ pub fn status(path: Option<&OsStr>, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
     if json {
+        // `mark` is nobody else's business.
+        let pod = pod::PodMeta {
+            mark: None,
+            ..report.pod
+        };
         let out = json!({
             "schema": JSON_SCHEMA,
-            "pod": report.pod,
+            "pod": pod,
             "resources": report.resources,
             "health": report.health,
         });

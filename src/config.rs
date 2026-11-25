@@ -157,6 +157,10 @@ pub(crate) struct CommandSpec {
     pub(crate) create: Vec<String>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) output: OutputMode,
+    /// Argument array run when `bp up` finds the pod there already, to start again what `create`
+    /// made (a container that was stopped); may reference this command's captured output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) start: Option<Vec<String>>,
     /// Argument array run on teardown; may reference this command's captured output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) destroy: Option<Vec<String>>,
@@ -327,7 +331,11 @@ impl Config {
             }
             check_argv(&command.create)
                 .with_context(|| format!("command.{}.create", command.name))?;
-            for (field, argv) in [("destroy", &command.destroy), ("gc", &command.gc)] {
+            for (field, argv) in [
+                ("start", &command.start),
+                ("destroy", &command.destroy),
+                ("gc", &command.gc),
+            ] {
                 if let Some(argv) = argv {
                     check_argv(argv)
                         .with_context(|| format!("command.{}.{field}", command.name))?;

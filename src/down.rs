@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::files::{self, EntryType};
 use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
+use crate::mark::Mark;
 use crate::pod::{PodMeta, Store, Unfinished};
 use crate::saved::Saved;
 use crate::supervisor::{self, Request};
@@ -123,7 +124,10 @@ pub(crate) fn teardown(
                 }
             }
         }
-        report.state_error = store.remove_pod(&meta.id).err().map(|e| format!("{e:#}"));
+        // The mark first: later it would not be known any more.
+        let mark = meta.mark.as_ref().map_or(Ok(()), Mark::remove);
+        let removed = mark.and_then(|()| store.remove_pod(&meta.id));
+        report.state_error = removed.err().map(|e| format!("{e:#}"));
     }
     Ok(report)
 }
@@ -192,7 +196,7 @@ fn destroy(
 /// Asks the supervisor to stop the service. When it is gone, the service's process tree is
 /// stopped by its recorded leader instead; a service never reported as started had its pid known
 /// only to that supervisor.
-fn stop_service(
+pub(crate) fn stop_service(
     supervisor: Option<&supervisor::Record>,
     name: &str,
     record: &services::Record,
@@ -251,7 +255,7 @@ fn stop_supervisor(record: &supervisor::Record) -> Result<()> {
     control::remove_stale(&record.endpoint)
 }
 
-fn data<T: DeserializeOwned>(r: &ResourceState) -> Result<T> {
+pub(crate) fn data<T: DeserializeOwned>(r: &ResourceState) -> Result<T> {
     serde_json::from_value(r.data.clone())
         .with_context(|| format!("unreadable ledger data of {} {:?}", r.kind, r.name))
 }
@@ -298,6 +302,7 @@ mod tests {
             worktree,
             main_checkout: None,
             unfinished: None,
+            mark: None,
         };
         store.write_meta(&meta).unwrap();
         Setup {

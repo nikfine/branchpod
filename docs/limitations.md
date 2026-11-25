@@ -25,7 +25,7 @@
 ## Services and commands
 
 - **`up` does not wait until a service is ready**, only until its process exists. A service that exits later is not
-  restarted; `status` shows that, with its exit code. It does not see what such a service left running, and
+  restarted until the next `up`; `status` shows that, with its exit code. It does not see what such a service left running, and
   `running` does not mean that it is ready.
 - **`status` shows the end of the log of a service that does not run**, secrets that it printed included, also with
   `--json`.
@@ -40,8 +40,14 @@
 - **Windows: a daemon that a command leaves running keeps whoever waits for the end of the output of `up` or
   `down` waiting** ([#82](https://github.com/nikfine/branchpod/issues/82)).
 
+- **`up` does not know whether a container runs.** It only runs the `start` of its command, and `status` does not look
+  at commands at all.
+- **`up` on a pod that is there keeps its ports.** If another program has taken one meanwhile, whoever needs it fails,
+  or uses another one if it may. `down` and `up` choose a free one.
+
 ## Versions and systems
 
+- **A pod of version 0.1.0 is not brought up again**: run `down` and `up` once.
 - **Windows 10 has not been tested**, although it is meant to work. CI runs on a Windows Server image, macOS on
   Apple silicon and Ubuntu.
 - **Run `down` for every pod before an upgrade or a downgrade.** State written by a newer format, and a supervisor

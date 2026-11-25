@@ -50,8 +50,8 @@ pub(crate) fn new_endpoint(pod: &str) -> Result<String> {
     sys::new_endpoint(pod, &nonce(pod))
 }
 
-/// 16 hex digits that differ between supervisors of the same pod.
-fn nonce(pod: &str) -> String {
+/// 16 hex digits that differ each time, also for the same pod.
+pub(crate) fn nonce(pod: &str) -> String {
     // The clock alone may not advance between two calls (100 ns steps on Windows).
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);

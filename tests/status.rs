@@ -88,6 +88,13 @@ impl Pod {
             json!(run)
         );
         fs::write(pod.worktree.join("branchpod.toml"), config).unwrap();
+        pod.run_up();
+        pod
+    }
+
+    /// Runs `bp up`; its output.
+    fn run_up(&self) -> String {
+        let pod = self;
         // To a file: should the supervisor hold a pipe, its end would come only with it.
         let path = pod.home.with_file_name("up.log");
         let log = fs::File::create(&path).unwrap();
@@ -100,8 +107,9 @@ impl Pod {
             .stderr(log)
             .status()
             .unwrap();
-        assert!(status.success(), "{}", text(&fs::read(&path).unwrap()));
-        pod
+        let out = text(&fs::read(&path).unwrap());
+        assert!(status.success(), "{out}");
+        out
     }
 
     fn bp(&self, args: &[&OsStr]) -> Output {
@@ -270,12 +278,13 @@ fn a_service_that_exited_degrades_the_pod() {
         health["problems"],
         json!([{ "kind": "service", "name": "web", "state": "exited" }])
     );
-    assert!(health["hint"].as_str().unwrap().contains("`bp down "));
+    let hint = health["hint"].as_str().unwrap();
+    assert!(hint.starts_with("run `bp up "), "{hint}");
 
     let (code, out) = pod.text();
     assert_eq!(code, DEGRADED);
     assert!(out.contains("exited (code 3) "), "{out}");
-    assert!(out.contains("\ndegraded: run `bp down "), "{out}");
+    assert!(out.contains("\ndegraded: run `bp up "), "{out}");
     assert!(out.ends_with("\n  | last words\n"), "{out}");
 }
 
@@ -309,7 +318,7 @@ fn a_killed_supervisor_degrades_the_pod() {
     let hint = status["health"]["hint"].as_str().unwrap();
     let path = pod.worktree.to_str().unwrap();
     assert!(
-        hint.starts_with("run `bp down ") && hint.matches(path).count() == 2,
+        hint.starts_with("run `bp up ") && hint.contains(path),
         "{hint}"
     );
     let (code, out) = pod.text();
@@ -319,6 +328,11 @@ fn a_killed_supervisor_degrades_the_pod() {
     // Nothing was changed by looking.
     assert_eq!(resource(&pod.json().1, "service")["status"], "live");
     // And the hint is right.
+    let out = pod.run_up();
+    assert!(out.contains(" is up again ("), "{out}");
+    assert_eq!(pod.json_when_free().0, HEALTHY);
+    let out = pod.run_up();
+    assert!(out.contains(" is already up ("), "{out}");
     let down = pod.bp(&["down".as_ref(), pod.worktree.as_os_str()]);
     assert!(down.status.success(), "{}", text(&down.stderr));
 }

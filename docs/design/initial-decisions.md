@@ -51,7 +51,7 @@ Lessons from running it on Windows, which the new tool must handle by design:
 | `git` | `git worktree add` (optional thin wrapper) | unlink links, then `git worktree remove`, `prune` | the worktree |
 | `file` | copy / reflink / link / template | delete, edited copies kept; links removed **as links** | `.env`, `node_modules` |
 | `port` | allocate from a range, verify by binding | release in the registry | web, dev server |
-| `command` | `create` command, stdout captured into a variable or a file | `destroy` with those variables, `gc` query | container, volume, sync session |
+| `command` | `create` command, stdout captured into a variable or a file; `start` later | `destroy` with those variables, `gc` query | container, volume, sync session |
 | `service` | long-running process under the supervisor | the whole process tree dies | dev server |
 
 Rules:
@@ -163,7 +163,7 @@ One supervisor process per worktree, no global daemon; control over a local sock
   data (`{"code": 1}`, `{"signal": 9}`), not the platform's text. The supervisor resets an ignored `SIGCHLD`,
   which it may inherit: the system would reap the services and their status would be lost. The protocol stays at version 1: a `bp`
   that refused older supervisors could not take their pods down. Their text is read as "exited".
-- **Services** are not restarted; one that exits keeps its status until it is stopped. Their output goes
+- **Services** are not restarted but by `bp up`; one that exits keeps its status until it is stopped. Their output goes
   to files through the supervisor, see "Service logs". The environment is passed to the supervisor but
   not recorded (it may hold secrets).
 - **Stop.** `bp down` asks the supervisor to stop each service, then to shut down, and waits for it to
@@ -175,9 +175,9 @@ One supervisor process per worktree, no global daemon; control over a local sock
   that id exists, so a group whose leader is gone is still ours). That holds within one boot of the system only,
   so a service also records the id of the boot (Linux `boot_id`, macOS `kern.bootsessionuuid`), and after a
   reboot none of its processes are looked for: the group with its id may be anybody's. Windows needs no such
-  id, as a creation time is not repeated. Records without it (older versions) are treated as of this boot. A service that never reported its
-  pid was known only to that supervisor and is considered gone with it (it is, once the platform
-  measures below tie services to the supervisor's life).
+  id, as a creation time is not repeated. Records without it (older versions) are treated as of this boot.
+  A service that never reported its pid was known only to that supervisor and is considered gone with it (it
+  is, once the platform measures below tie services to the supervisor's life).
 - Windows: Job Objects, see "Services on Windows".
 - Linux: own process group + `PR_SET_PDEATHSIG` (#15); cgroups via `systemd-run --user --scope` when
   available.
@@ -340,7 +340,7 @@ shown as `saved`, its new path printed on stderr, and the exit code stays `0`.
 
 ## Command resources
 
-- `create` and `destroy` are argument arrays run without a shell, stdin closed, output captured. A
+- `create`, `start` and `destroy` are argument arrays run without a shell, stdin closed, output captured. A
   non-zero exit fails the step; its stderr is quoted (tail) in the error and kept whole for the run log.
 - stdout is decoded as UTF-8, never with the console code page; invalid UTF-8 is an error. A leading
   byte order mark is dropped and surrounding whitespace trimmed; the result is
@@ -443,9 +443,8 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
   ports; a command (a container) may mount a file provisioned for it. The price: a file cannot reference
   `{{command.<name>.stdout}}` or `{{command.<name>.file}}`. A single ordered list or ordering by references
   would lift that, at the cost of a format change or implicit ordering.
-- `up` is not re-entrant: if the ledger holds any resource that is not destroyed (live, pending or failed),
-  it fails at once, lists them and asks for `bp down` first. Reconciling a live pod with a changed config
-  is a separate feature, not a side effect of `up`.
+- If the ledger holds any resource that is not destroyed, nothing is created, see "A pod that is there already".
+  Reconciling a live pod with a changed config is a separate feature, not a side effect of `up`.
 - Before the first resource is created, the whole config is planned once with stand-in values for what
   only creation yields (the first port of each range, a placeholder for command output): a typo in the
   last command or a missing source fails before any port is allocated. Only what creation itself reveals
@@ -460,6 +459,52 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
   detached HEAD, a bare repository, a path that is not UTF-8), a reference to it fails and says why.
 - `up` returns once every service is started (its process exists), not once it is ready: readiness
   hooks are #18.
+
+### A pod that is there already
+
+After a reboot services and supervisors are gone and containers are stopped. `up` then starts what does not run
+and destroys nothing. It used to refuse any pod that was there, which left `down` and `up` in each worktree:
+that deletes copied directories with what was changed in them, and the data of containers. A command of its own
+(`bp start`) was rejected: callers know `up`, and what it is asked for is that the pod is up.
+
+- **What is resumed.** A pod that `up` finished, in the worktree it was created for, that has the resources of
+  the config and no others: the same names, ports within their ranges, the same rendered `create`, `run` and
+  `cwd`. Otherwise `up` refuses with `already has resources recorded` and the reason, and asks for `down`. `env`
+  is not recorded, so the one of the config is used. Not compared: the contents of files, the rules they come
+  from, `destroy` and `start`. Files that were deleted are not brought back.
+- **Commands.** `bp` cannot tell whether what a command created runs, so the optional `start` of each is run, in
+  config order and before the services; it must do no harm if there is nothing to start (`docker start`). One
+  with `destroy` but without `start` is left as it is, which the output says; it is no warning, as volumes and
+  the like need no `start`. `start` is rendered from the current config and is not recorded: it can be added to
+  a pod that is there. Rejected: `destroy` and `create` anew. That loses what is in a container and volumes that
+  survived the reboot, and takes a healthy container down when only a service failed.
+- **Services.** One that runs is not touched. One that does not is stopped, as `down` would, for what is left of
+  its tree, and started again: under its supervisor if that answers, otherwise under a new one with an endpoint
+  of its own. A supervisor that neither answers nor is gone is refused.
+- **Ports** are not checked: the pod's own container may hold them, and `bp` could not tell it from a stranger.
+  Who needs a port that is taken fails and says so; another one takes `down` and `up`.
+- **Interruption.** Services and their supervisor are recorded as in a first `up`, so `down` works at any point
+  and `up` goes on where it stopped: pending and failed ones are started. `unfinished` is not set, as the
+  resources tell. The exception: a supervisor that answers but whose process was not recorded has to go through
+  `down`.
+- One worktree at a time. Whoever wants more calls it more often; bringing up all of them after a reboot is
+  rarely wanted.
+
+**The mark.** A worktree removed without `down` and another one created at its path would be taken for the pod.
+So `up` writes a file with a random id, `.branchpod`, into the git directory of the worktree
+(`.git/worktrees/<name>`, for the main checkout `.git`) and records the id in `pod.json`. It is the only thing
+`bp` writes into a git directory, which was avoided so far; it survives checkouts, `clean`, `gc`, `prune` and
+`repair`, and goes with `git worktree remove` and `prune`.
+
+- Another id, or none, is another worktree: `up` refuses. So it does for a pod without one (an older version).
+- The id and the path are recorded before the file is written, and an earlier mark of the pod is removed before
+  that, so no mark is left that its pod does not know. `down` removes it last but for the state, at the recorded
+  path as the worktree may be gone, and only with its own id.
+- A name with a leading dot cannot be a ref, which git looks for in this directory too. `GIT_DIR`, `GIT_WORK_TREE`
+  and `GIT_COMMON_DIR`, which git sets for hooks, are not passed on when the directory is looked up.
+- Rejected: looking whether the recorded files exist (there may be none, and deleting one is no reason to refuse);
+  a hash of the copied directories (caches and package managers change the copies, the sources do not show a new
+  worktree, and reading them after a reboot is slow).
 
 ## `bp status`
 
@@ -491,8 +536,9 @@ The ledger says what was created; `bp status` adds what has become of it. It onl
   the answer and cannot tell slow work from a hang; here the hang is the answer. Slow work, up to 10 s for
   each service being stopped, happens under the pod lock and is reported as `busy`. The request runs on a
   thread that is left behind, because connecting can hang too (a full backlog, no free pipe instance).
-- **The hint** names the worktree, as the caller may be in another one, and two commands, not `a && b`, which
-  Windows PowerShell does not have. For a supervisor that took the request and does not answer it says to end
+- **The hint** names the worktree, as the caller may be in another one. It is `bp up` if all that is wrong is that
+  processes do not run, otherwise `bp down` and `bp up`: two commands, not `a && b`, which Windows PowerShell does
+  not have. For a supervisor that took the request and does not answer it says to end
   that process first, also while the pod is busy: `bp down` waits for the answer.
 - **The end of the log** of a service that is not running: 10 lines, at most 4 KB, also in the text output.
   Bytes that are not UTF-8 are replaced (`lossy`), and in the text control characters too; `bp logs` has the
@@ -550,8 +596,8 @@ Docker Desktop's built-in synchronized file shares require a paid subscription; 
   | `4` | the pod is degraded: act on the hint | `status` |
   | `5` | the pod is busy: `up` or `down` is at work, wait | `status` |
 
-  `4` and `5` differ because whoever sees `4` takes the pod down, which would be wrong in the middle of
-  somebody else's `up`.
+  `4` and `5` differ because whoever sees `4` acts on the pod, possibly taking it down, which would be wrong in the
+  middle of somebody else's `up`.
 - Example: an Orca plugin opens a log tab (`bp logs -f <service>`) on `service.started`; closing the tab
   does not stop the service. Orca also attributes listening ports to a worktree by process cwd, so services
   started with cwd inside the worktree show up without any plugin; container-published ports do not.

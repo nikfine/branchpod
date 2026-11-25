@@ -15,9 +15,9 @@
 //! interrupted creation) before it is created, its data after, or the failure. On failure nothing
 //! is rolled back here: what was created stays recorded and `bp down` removes it.
 //!
-//! `up` is not re-entrant on a pod: if the ledger holds any resource that is not destroyed, it
-//! fails straight away and asks for `bp down` first. Reconciling a live pod with a changed config
-//! is a different feature.
+//! If the ledger holds any resource that is not destroyed, nothing is created: what does not run is
+//! started again ([`resume`]), or `up` fails and asks for `bp down` first. Reconciling a live pod
+//! with a changed config is a different feature.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::config::{Config, FileMode};
 use crate::ledger::{Event, Kind, Ledger, ResourceState, Status};
+use crate::mark::Mark;
 use crate::pod::{self, META_VERSION, PodMeta, Store};
 use crate::podlock::Holder;
 use crate::ports::{self, Registry};
@@ -35,16 +36,25 @@ use crate::proc::ProcId;
 use crate::supervisor::{self, Launcher, Request};
 use crate::vars::Vars;
 use crate::worktree::Worktree;
-use crate::{commands, control, files, services};
+use crate::{commands, control, files, resume, services};
 
 /// A provisioned pod.
 #[derive(Debug)]
 pub(crate) struct Report {
+    pub(crate) outcome: Outcome,
     pub(crate) pod: PodMeta,
-    /// What this run did, in creation order.
+    /// What the pod has and what this run did, in creation order.
     pub(crate) items: Vec<Item>,
     /// For the user: the pod is up, but may not stay so.
     pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Created,
+    /// It was there; services had to be started again.
+    Restarted,
+    AlreadyUp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,13 +104,22 @@ impl fmt::Display for Failed {
 impl std::error::Error for Failed {}
 
 /// The ledger, remembering whether this run wrote anything to it.
-struct Journal {
+pub(crate) struct Journal {
     ledger: Ledger,
     wrote: bool,
 }
 
-/// Provisions the pod of `wt` from `config`. `on_wait` is called if another `bp` holds the pod
-/// lock, before waiting for it.
+impl Journal {
+    pub(crate) fn open(store: &Store, id: &str) -> Result<Journal> {
+        Ok(Journal {
+            ledger: Ledger::open(&store.ledger_path(id))?,
+            wrote: false,
+        })
+    }
+}
+
+/// Provisions the pod of `wt` from `config`, or starts again what does not run of it. `on_wait` is
+/// called if another `bp` holds the pod lock, before waiting for it.
 pub(crate) fn up(
     store: &Store,
     wt: &Worktree,
@@ -129,12 +148,7 @@ pub(crate) fn up(
 
     let existing = live(store.resources(&id)?);
     if !existing.is_empty() {
-        bail!(
-            "pod {id} already has resources recorded:\n{}\
-             run `bp down {}` first",
-            listing(&existing),
-            quote(&wt.root)
-        );
+        return resume::resume(store, wt, config, launcher, &id, &existing);
     }
     // Left when an earlier `down` could not remove the pod's state: no `destroy` needs it any more,
     // it may hold secrets, and it must not pass for the output of a command of this run.
@@ -146,19 +160,22 @@ pub(crate) fn up(
         launcher.preflight().context("cannot run services")?;
     }
 
+    if let Some(old) = store.meta(&id)?.and_then(|meta| meta.mark) {
+        old.remove()?;
+    }
+    let mark = Mark::new(&id, wt)?;
     let meta = PodMeta {
         v: META_VERSION,
         id: id.clone(),
         worktree: wt.root.clone(),
         main_checkout: wt.main_checkout.clone(),
         unfinished: None,
+        mark: Some(mark.clone()),
     };
     store.write_meta(&meta.with(Some(pod::Unfinished::Up)))?;
+    mark.write()?;
 
-    let mut journal = Journal {
-        ledger: Ledger::open(&store.ledger_path(&id))?,
-        wrote: false,
-    };
+    let mut journal = Journal::open(store, &id)?;
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let result = provision(
@@ -175,6 +192,7 @@ pub(crate) fn up(
     );
     match result.and_then(|()| store.write_meta(&meta)) {
         Ok(()) => Ok(Report {
+            outcome: Outcome::Created,
             pod: meta,
             items,
             warnings,
@@ -301,6 +319,23 @@ fn provision(
     if config.service.is_empty() {
         return Ok(());
     }
+    let endpoint = start_supervisor(store, id, launcher, journal, items, warnings)?;
+    for spec in &config.service {
+        let plan = services::plan(spec, &wt.root, vars, &pod_dir)?;
+        start_service(&endpoint, &plan, journal, items)?;
+    }
+    Ok(())
+}
+
+/// Starts and records a supervisor; its endpoint.
+pub(crate) fn start_supervisor(
+    store: &Store,
+    id: &str,
+    launcher: &Launcher,
+    journal: &mut Journal,
+    items: &mut Vec<Item>,
+    warnings: &mut Vec<String>,
+) -> Result<String> {
     let intent = supervisor::Record {
         endpoint: control::new_endpoint(id)?,
         process: None,
@@ -314,7 +349,7 @@ fn provision(
         SUPERVISOR,
         serde_json::to_value(&intent)?,
         || {
-            let log = pod_dir.join("logs").join("supervisor.log");
+            let log = store.pod_dir(id).join("logs").join("supervisor.log");
             let launched = launcher.launch(&intent.endpoint, &cwd, &log)?;
             warnings.extend(launched.warning);
             Ok(supervisor::Record {
@@ -328,21 +363,28 @@ fn provision(
         name: SUPERVISOR.to_owned(),
         detail: process_detail(sup.process),
     });
+    Ok(sup.endpoint)
+}
 
-    for spec in &config.service {
-        let plan = services::plan(spec, &wt.root, vars, &pod_dir)?;
-        let intent = serde_json::to_value(&plan.record)?;
-        let record = step(journal, Kind::Service, &spec.name, intent, || {
-            let data = supervisor::request(&sup.endpoint, &Request::Start(plan.start.clone()))?;
-            Ok(plan.record.started(serde_json::from_value(data)?))
-        })
-        .with_context(|| format!("service {:?}", spec.name))?;
-        items.push(Item {
-            kind: Kind::Service,
-            name: spec.name.clone(),
-            detail: process_detail(record.process),
-        });
-    }
+/// Starts a service under the supervisor at `endpoint` and records it.
+pub(crate) fn start_service(
+    endpoint: &str,
+    plan: &services::Plan,
+    journal: &mut Journal,
+    items: &mut Vec<Item>,
+) -> Result<()> {
+    let name = &plan.start.name;
+    let intent = serde_json::to_value(&plan.record)?;
+    let record = step(journal, Kind::Service, name, intent, || {
+        let data = supervisor::request(endpoint, &Request::Start(plan.start.clone()))?;
+        Ok(plan.record.started(serde_json::from_value(data)?))
+    })
+    .with_context(|| format!("service {name:?}"))?;
+    items.push(Item {
+        kind: Kind::Service,
+        name: name.clone(),
+        detail: process_detail(record.process),
+    });
     Ok(())
 }
 
@@ -394,7 +436,7 @@ const NO_MAIN_CHECKOUT: &str =
 /// `pod.id`, `worktree`, `main` and `branch`. A name that has no value here (a detached HEAD, no
 /// main checkout, a path that is not UTF-8) is declared unavailable with the reason, so that a
 /// reference to it fails with an explanation instead of rendering something wrong.
-fn builtin_vars(id: &str, wt: &Worktree) -> Vars {
+pub(crate) fn builtin_vars(id: &str, wt: &Worktree) -> Vars {
     let mut vars = Vars::new();
     vars.set("pod.id", id);
     path_var(&mut vars, "worktree", &wt.root);
@@ -449,7 +491,7 @@ fn live(resources: Vec<ResourceState>) -> Vec<ResourceState> {
 }
 
 /// One indented line per resource: kind, name, status.
-fn listing(resources: &[ResourceState]) -> String {
+pub(crate) fn listing(resources: &[ResourceState]) -> String {
     let mut out = String::new();
     for r in resources {
         out.push_str(&format!("  {:<10} {:<24} {}\n", r.kind, r.name, r.status));
@@ -458,20 +500,20 @@ fn listing(resources: &[ResourceState]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_support::{fail, git_ok, launcher, long_running, reap_pod, wait_for_log};
     use std::fs;
 
-    struct Repo {
+    pub(crate) struct Repo {
         _tmp: tempfile::TempDir,
-        store: Store,
-        main: PathBuf,
-        linked: PathBuf,
+        pub(crate) store: Store,
+        pub(crate) main: PathBuf,
+        pub(crate) linked: PathBuf,
     }
 
     /// A main checkout and a linked worktree on branch `feature`, with a `bp` home of their own.
-    fn repo() -> Repo {
+    pub(crate) fn repo() -> Repo {
         let tmp = tempfile::tempdir().unwrap();
         // Non-ASCII on purpose: it is the normal case on many developer machines.
         let main = tmp.path().join("main-caf\u{e9}");
@@ -515,7 +557,7 @@ mod tests {
         Worktree::resolve(Some(r.linked.as_os_str())).unwrap()
     }
 
-    fn run(r: &Repo, config: &str) -> Result<Report> {
+    pub(crate) fn run(r: &Repo, config: &str) -> Result<Report> {
         let config = Config::parse(config).unwrap();
         up(&r.store, &worktree(r), &config, &launcher(), |_| {
             panic!("lock is busy")
@@ -523,7 +565,7 @@ mod tests {
     }
 
     /// TOML array printing its arguments joined by spaces, using what every CI runner has.
-    fn echo(text: &str) -> String {
+    pub(crate) fn echo(text: &str) -> String {
         if cfg!(windows) {
             format!("['cmd', '/d', '/c', 'echo {text}']")
         } else {
@@ -531,7 +573,7 @@ mod tests {
         }
     }
 
-    fn resources(r: &Repo) -> Vec<ResourceState> {
+    pub(crate) fn resources(r: &Repo) -> Vec<ResourceState> {
         r.store.resources(&pod::pod_id(&r.linked)).unwrap()
     }
 
@@ -617,23 +659,6 @@ mod tests {
             .registered(&id, "web")
             .unwrap();
         assert_eq!(registered.map(|p| p.to_string()), Some(port));
-    }
-
-    #[test]
-    fn a_second_up_fails_without_touching_anything() {
-        let r = repo();
-        fs::write(r.main.join(".env"), "A=1\n").unwrap();
-        run(&r, &config("")).unwrap();
-        let ledger = fs::read(r.store.ledger_path(&pod::pod_id(&r.linked))).unwrap();
-
-        let err = format!("{:#}", run(&r, &config("")).unwrap_err());
-        assert!(
-            err.contains("already has resources") && err.contains("bp down"),
-            "{err}"
-        );
-        assert!(err.contains("port") && err.contains("live"), "{err}");
-        let after = fs::read(r.store.ledger_path(&pod::pod_id(&r.linked))).unwrap();
-        assert_eq!(ledger, after, "nothing recorded by the refused run");
     }
 
     #[test]
