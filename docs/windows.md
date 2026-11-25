@@ -9,7 +9,7 @@ The executable needs no installer, no Visual C++ runtime and no administrator ri
 In PowerShell, in the directory with both files, with the name you downloaded:
 
 ```powershell
-$name = "branchpod-v0.1.0-x86_64-pc-windows-msvc.exe"
+$name = "branchpod-v0.2.0-x86_64-pc-windows-msvc.exe"
 (Get-FileHash $name).Hash -eq (Get-Content "$name.sha256").Split(" ")[0]
 ```
 
