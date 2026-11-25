@@ -360,8 +360,13 @@ shown as `saved`, its new path printed on stderr, and the exit code stays `0`.
   redirected, and whoever waits for the end of `bp`'s output waits for it. The handle list of the supervisor
   ("Process supervision") does not cover commands.
 - `output = "file"` keeps the output in a file instead, see "Command output in a file".
-- On Windows a `.cmd` / `.bat` program is named with its extension (`npx.cmd`): spawning without a
-  shell does not resolve it through `PATHEXT`.
+- On Windows a program named without its extension may be a `.com`, `.bat` or `.cmd` (`npx` for `npx.cmd`), for
+  commands and services alike, on `PATH` or at a path (`node_modules/.bin/vite`). Spawning without a shell finds
+  only `.exe`, so `bp` looks for the others, in the order of `PATHEXT`, in the directories that the standard
+  library searches for an `.exe`, the working directory not among them. An `.exe` in any of them comes first, even
+  where a shell would take a script from an earlier directory: what was found before scripts were stays the same.
+  A file without an extension (the `sh` script next to `npx.cmd`) does not count. `cmd.exe` parses the arguments of
+  a batch file: the standard library escapes them, and what it refuses (a line break) is an error.
 
 ### Command output in a file
 
