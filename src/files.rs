@@ -376,8 +376,8 @@ fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Re
     })
 }
 
-/// Whatever the number of CPUs: the time goes into waiting for the disk and the antivirus. 16 were no
-/// faster.
+/// Whatever the number of CPUs: measured on 4 of them, 8 threads were faster than 4 on Windows and about
+/// as fast on Linux. 16 were hardly faster than 8 anywhere.
 const COPY_THREADS: usize = 8;
 
 /// Files waiting to be copied. Kept short, so that a file is copied soon after it was listed.
@@ -429,7 +429,8 @@ fn copy_tree(source: &Path, dest: &Path, reflink: bool) -> Result<Option<bool>> 
     // Last, so that a read-only source directory does not block writing its contents; the inner
     // ones first.
     for (source, dest) in dirs.iter().rev() {
-        copy_dir_mode(source, dest)?;
+        copy_dir_mode(source, dest)
+            .with_context(|| format!("cannot set the permissions of {}", dest.display()))?;
     }
     Ok(cloned)
 }
@@ -451,7 +452,7 @@ fn list_tree(
         if file_type.is_symlink() {
             copy_link(&from, &to)?;
         } else if file_type.is_dir() {
-            fs::create_dir(&to)?;
+            fs::create_dir(&to).with_context(|| format!("cannot create {}", to.display()))?;
             dirs.push((from.clone(), to.clone()));
             list_tree(&from, &to, files, dirs)?;
         } else if file_type.is_file() {
