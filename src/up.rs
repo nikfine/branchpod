@@ -21,6 +21,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -47,12 +48,14 @@ pub(crate) struct Report {
     pub(crate) warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Item {
     pub(crate) kind: Kind,
     pub(crate) name: String,
     /// Short human-readable result: the port, the file mode, the command's output.
     pub(crate) detail: String,
+    /// Planning, creating and recording it.
+    pub(crate) took: Duration,
 }
 
 /// `up` failed after recording resources. They may exist and are left for `bp down`.
@@ -239,6 +242,7 @@ fn provision(
     // The pod lock is held: the registry lock is taken after it, as the lock order requires.
     let registry = Registry::new(store.home());
     for (name, spec) in &config.port {
+        let started = Instant::now();
         let record = step(journal, Kind::Port, name, Value::Null, || {
             // The pod has nothing live, so a registration it still has is stale (a lost ledger,
             // a pod directory removed by hand): it would be returned without a bind check.
@@ -252,6 +256,7 @@ fn provision(
             kind: Kind::Port,
             name: name.clone(),
             detail: record.port.to_string(),
+            took: started.elapsed(),
         });
     }
 
@@ -261,6 +266,7 @@ fn provision(
         }
         let main = main.expect("checked before taking the lock");
         let name = spec.name();
+        let started = Instant::now();
         // Planned again with the real values; still before the intent, so a rule that cannot be
         // created records nothing.
         let Some(plan) = files::plan(spec, main, &wt.root, vars)? else {
@@ -268,6 +274,7 @@ fn provision(
                 kind: Kind::File,
                 name,
                 detail: "skipped (optional, no source)".into(),
+                took: started.elapsed(),
             });
             continue;
         };
@@ -277,11 +284,13 @@ fn provision(
             kind: Kind::File,
             name,
             detail: spec.mode.as_str().to_owned(),
+            took: started.elapsed(),
         });
     }
 
     let pod_dir = store.pod_dir(id);
     for spec in &config.command {
+        let started = Instant::now();
         let plan = commands::plan(spec, &wt.root, vars, &pod_dir)?;
         let intent = serde_json::to_value(&plan.record)?;
         let record = step(journal, Kind::Command, &spec.name, intent, || {
@@ -295,12 +304,14 @@ fn provision(
                 Some(file) => format!("output in {file}"),
                 None => command_detail(record.stdout.as_deref().unwrap_or_default()),
             },
+            took: started.elapsed(),
         });
     }
 
     if config.service.is_empty() {
         return Ok(());
     }
+    let started = Instant::now();
     let intent = supervisor::Record {
         endpoint: control::new_endpoint(id)?,
         process: None,
@@ -327,9 +338,11 @@ fn provision(
         kind: Kind::Supervisor,
         name: SUPERVISOR.to_owned(),
         detail: process_detail(sup.process),
+        took: started.elapsed(),
     });
 
     for spec in &config.service {
+        let started = Instant::now();
         let plan = services::plan(spec, &wt.root, vars, &pod_dir)?;
         let intent = serde_json::to_value(&plan.record)?;
         let record = step(journal, Kind::Service, &spec.name, intent, || {
@@ -344,6 +357,7 @@ fn provision(
             kind: Kind::Service,
             name: spec.name.clone(),
             detail: process_detail(record.process),
+            took: started.elapsed(),
         });
     }
     Ok(())
@@ -657,7 +671,11 @@ mod tests {
         drop(ledger);
 
         let second = run(&r, &text).unwrap();
-        assert_eq!(second.items, first.items);
+        let summary = |report: Report| -> Vec<(Kind, String, String)> {
+            let items = report.items.into_iter();
+            items.map(|i| (i.kind, i.name, i.detail)).collect()
+        };
+        assert_eq!(summary(second), summary(first));
         assert!(resources(&r).iter().all(|s| s.status == Status::Live));
     }
 

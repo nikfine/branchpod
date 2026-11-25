@@ -76,15 +76,15 @@ git worktree add ../demo-feature
 branchpod up ../demo-feature
 ```
 
-The id, the port and the pids will be different:
+The id, the port, the times and the pids will be different:
 
 ```
 pod demo-feature-1a2b3c4d is up (/work/demo-feature)
-  port       web                      8014
-  file       .env                     template
-  command    base                     (no output)
-  supervisor supervisor               pid 4320
-  service    web                      pid 4321
+  port       web                         0.0s  8014
+  file       .env                        0.0s  template
+  command    base                        0.4s  (no output)
+  supervisor supervisor                  0.1s  pid 4320
+  service    web                         0.0s  pid 4321
 ```
 
 A *pod* is everything created for one worktree. Look at it, and at what the service printed. `status` ends with

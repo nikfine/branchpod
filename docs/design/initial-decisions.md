@@ -282,6 +282,10 @@ Rules for file resources:
   without passing through a link; otherwise it is left in place and reported. A copied directory is removed
   with whatever was written into it; parent directories created for it are removed while empty. A single file
   whose content changed is kept, see "Edited copies".
+- A directory is copied on 8 threads, whatever the number of CPUs; not configurable. One thread lists the
+  source, creates directories and links, and passes files on through a short queue, so that little time passes
+  between listing a file and copying it. The first error stops all threads, and they are waited for before the
+  failure is recorded: nothing is written after that. On Unix directories get their permissions at the end.
 - `link`: symlink on Unix; on Windows a junction for directories (no privileges needed) and a symlink for
   files. Without the right to create a file symlink (Developer Mode or admin) it is an error with a hint,
   not a silent copy: a copy would quietly stop propagating edits. Hard links are rejected (editors that
@@ -457,6 +461,8 @@ destroy = ["docker", "rm", "-f", "-v", "bp-{{pod.id}}"]
   detached HEAD, a bare repository, a path that is not UTF-8), a reference to it fails and says why.
 - `up` returns once every service is started (its process exists), not once it is ready: readiness
   hooks are #18.
+- The text output tells how long each resource took: planning, creating and recording it. After a failure
+  nothing is listed but what is recorded, without times.
 
 ## `bp status`
 
