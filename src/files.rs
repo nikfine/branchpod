@@ -313,7 +313,7 @@ fn create_inner(plan: &Plan, record: &mut Record) -> Result<()> {
         Action::Copy { source, reflink } => {
             let cloned = if record.entry == EntryType::Dir {
                 fs::create_dir(path)?;
-                copy_tree(source, path, *reflink, copy_threads())?
+                copy_tree(source, path, *reflink)?
             } else {
                 let copied = copy_file(source, path, *reflink, true)?;
                 record.fingerprint = copied.fingerprint;
@@ -376,12 +376,9 @@ fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Re
     })
 }
 
-/// More threads than this hardly help: the disk is the limit.
-const MAX_COPY_THREADS: usize = 8;
-
-fn copy_threads() -> usize {
-    thread::available_parallelism().map_or(1, |n| n.get().min(MAX_COPY_THREADS))
-}
+/// Whatever the number of CPUs: the time goes into waiting for the disk and the antivirus. 16 were no
+/// faster.
+const COPY_THREADS: usize = 8;
 
 /// Files waiting to be copied. Kept short, so that a file is copied soon after it was listed.
 const COPY_QUEUE: usize = 64;
@@ -389,19 +386,19 @@ const COPY_QUEUE: usize = 64;
 /// Source and destination.
 type Pair = (PathBuf, PathBuf);
 
-/// Copies the contents of `source` into the existing, empty `dest`; files on `threads` threads, the
+/// Copies the contents of `source` into the existing, empty `dest`; files on threads of their own, the
 /// rest on this one. Links inside the tree are recreated as links to the same target, never followed.
 /// Returns whether every file was cloned, `None` without files.
 ///
 /// The first error stops the other threads. Nothing is written any more when this returns.
-fn copy_tree(source: &Path, dest: &Path, reflink: bool, threads: usize) -> Result<Option<bool>> {
+fn copy_tree(source: &Path, dest: &Path, reflink: bool) -> Result<Option<bool>> {
     let stop = AtomicBool::new(false);
     let mut dirs = vec![(source.to_path_buf(), dest.to_path_buf())];
     let cloned = thread::scope(|scope| -> Result<Option<bool>> {
         let (files, queue) = sync_channel(COPY_QUEUE);
         // Owned by the threads alone: once the last one is gone, sending fails instead of waiting.
         let queue = Arc::new(Mutex::new(queue));
-        let workers = (0..threads)
+        let workers = (0..COPY_THREADS)
             .map(|_| {
                 let (queue, stop) = (Arc::clone(&queue), &stop);
                 thread::Builder::new()
@@ -903,6 +900,7 @@ fn parents_below(root: &Path, path: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::config::Replace;
+    use std::collections::BTreeMap;
 
     struct Tree {
         _tmp: tempfile::TempDir,
@@ -1024,6 +1022,125 @@ mod tests {
         rm(&record).unwrap();
         assert!(!t.wt.join("deep").exists());
         assert!(t.wt.exists());
+    }
+
+    /// What is below `dir`, by relative path: the text of a file, where a link leads, or a directory.
+    fn contents(dir: &Path) -> BTreeMap<PathBuf, String> {
+        fn visit(base: &Path, dir: &Path, found: &mut BTreeMap<PathBuf, String>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let file_type = fs::symlink_metadata(&path).unwrap().file_type();
+                let what = if file_type.is_symlink() {
+                    format!("link to {}", fs::canonicalize(&path).unwrap().display())
+                } else if file_type.is_dir() {
+                    visit(base, &path, found);
+                    "directory".to_owned()
+                } else {
+                    format!("file {}", fs::read_to_string(&path).unwrap())
+                };
+                found.insert(path.strip_prefix(base).unwrap().to_path_buf(), what);
+            }
+        }
+        let mut found = BTreeMap::new();
+        visit(dir, dir, &mut found);
+        found
+    }
+
+    #[test]
+    fn a_tree_of_many_files_is_copied_whole() {
+        let t = tree();
+        let source = t.main.join("vendor");
+        for i in 0..600 {
+            let dir = format!("pkg-{}/caf\u{e9}/{}", i % 7, i % 5);
+            write(&source.join(dir).join(format!("{i}.txt")), &i.to_string());
+        }
+        write(&source.join("pkg-0/empty.txt"), "");
+        fs::create_dir(source.join("empty")).unwrap();
+        write(&t.main.join("shared/sentinel.txt"), "keep me");
+        dir_link(&t.main.join("shared"), &source.join("pkg-3/lib"));
+
+        for mode in [FileMode::Copy, FileMode::Reflink] {
+            let record = up(&t, &spec("vendor", mode));
+            assert_eq!(record.cloned.is_some(), mode == FileMode::Reflink);
+            let copied = contents(&t.wt.join("vendor"));
+            assert_eq!(copied, contents(&source), "{mode:?}");
+            assert_eq!(copied.values().filter(|w| w.starts_with("link")).count(), 1);
+            rm(&record).unwrap();
+            assert!(!t.wt.join("vendor").exists());
+        }
+        assert!(t.main.join("shared/sentinel.txt").exists());
+    }
+
+    /// With more files than the queue holds. Not returning is a failure, too: nobody might be left to
+    /// take from a full queue.
+    fn copy_tree_in_time(source: &Path, dest: &Path) -> Result<Option<bool>> {
+        let (done, result) = sync_channel(1);
+        let (source, dest) = (source.to_path_buf(), dest.to_path_buf());
+        thread::spawn(move || done.send(copy_tree(&source, &dest, false)));
+        result
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("copying does not end")
+    }
+
+    #[test]
+    fn the_first_error_stops_copying_and_names_the_file() {
+        const FILES: usize = 4000;
+        let t = tree();
+        let source = t.main.join("vendor");
+        fs::create_dir(&source).unwrap();
+        for i in 0..FILES {
+            fs::write(source.join(format!("{i}.txt")), "from main").unwrap();
+        }
+        let plan = plan(&spec("vendor", FileMode::Copy), &t.main, &t.wt, &vars());
+        let record = plan.unwrap().unwrap().record;
+
+        // In the way of the file that comes first.
+        let first = fs::read_dir(&source).unwrap().next().unwrap().unwrap();
+        let dest = t.wt.join("vendor");
+        fs::create_dir(&dest).unwrap();
+        let planted = dest.join(first.file_name());
+        fs::write(&planted, "user data").unwrap();
+
+        let err = format!("{:#}", copy_tree_in_time(&source, &dest).unwrap_err());
+        let expected = format!("cannot copy {}", first.path().display());
+        assert!(err.contains(&expected), "{err}");
+        assert_eq!(fs::read_to_string(&planted).unwrap(), "user data");
+        let copied = files_in(&dest);
+        assert!(copied < FILES, "the other threads went on: {copied}");
+
+        // What was copied by then goes as after any failure.
+        rm(&record).unwrap();
+        assert!(!dest.exists());
+        assert_eq!(files_in(&source), FILES);
+    }
+
+    /// The error is about what cannot be copied, not about the threads.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_cannot_be_copied_stops_copying() {
+        let t = tree();
+        let source = t.main.join("vendor");
+        for i in 0..200 {
+            write(&source.join(format!("{i}.txt")), "x");
+        }
+        let pipe = source.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        assert!(made.unwrap().success());
+        let dest = t.wt.join("vendor");
+        fs::create_dir(&dest).unwrap();
+        let err = format!("{:#}", copy_tree_in_time(&source, &dest).unwrap_err());
+        let expected = format!("{} is not a file, directory or link", pipe.display());
+        assert!(err.contains(&expected), "{err}");
+    }
+
+    #[test]
+    fn a_tree_is_cloned_only_if_all_of_it_is() {
+        assert_eq!(both(None, None), None);
+        assert_eq!(both(Some(true), None), Some(true));
+        assert_eq!(both(None, Some(false)), Some(false));
+        assert_eq!(both(Some(true), Some(true)), Some(true));
+        assert_eq!(both(Some(false), Some(true)), Some(false));
+        assert_eq!(both(Some(true), Some(false)), Some(false));
     }
 
     #[test]
@@ -1191,11 +1308,14 @@ mod tests {
     fn an_interrupted_creation_is_undone_from_the_plan() {
         let t = tree();
         write(&t.main.join("d/a.txt"), "a");
+        write(&t.main.join("d/sub/b.txt"), "b");
         let mut s = spec("p/d", FileMode::Copy);
         s.source = Some("d".into());
         let plan = plan(&s, &t.main, &t.wt, &vars()).unwrap().unwrap();
-        // Crash halfway: parents and part of the tree exist, `create` never returned.
+        // Crash halfway: parents and part of the tree exist, `create` never returned. Directories
+        // are ahead of their files.
         write(&t.wt.join("p/d/a.txt"), "half");
+        fs::create_dir(t.wt.join("p/d/sub")).unwrap();
         rm(&plan.record).unwrap();
         assert!(!t.wt.join("p").exists());
 
@@ -1800,12 +1920,12 @@ mod tests {
         let t = tree();
         write(&t.main.join("bin/run.sh"), "#!/bin/sh\n");
         write(&t.main.join("tpl.sh"), "#!/bin/sh\necho {{port.web}}\n");
-        for p in ["bin/run.sh", "tpl.sh"] {
+        for p in ["bin/run.sh", "bin", "tpl.sh"] {
             fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o750)).unwrap();
         }
         up(&t, &spec("bin", FileMode::Copy));
         up(&t, &template("tpl.sh"));
-        for p in ["bin/run.sh", "tpl.sh"] {
+        for p in ["bin/run.sh", "bin", "tpl.sh"] {
             let mode = fs::metadata(t.wt.join(p)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o750, "{p}");
         }
@@ -1839,6 +1959,11 @@ mod tests {
             fs::set_permissions(t.main.join(p), fs::Permissions::from_mode(0o555)).unwrap();
         }
         let record = up(&t, &spec("modcache", FileMode::Copy));
+        // As the source, but writable by the owner.
+        for p in ["modcache/pkg", "modcache"] {
+            let mode = fs::metadata(t.wt.join(p)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{p}");
+        }
         let result = rm(&record);
         // Let the temporary directory clean up the source either way.
         for p in ["modcache", "modcache/pkg"] {
