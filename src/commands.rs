@@ -17,6 +17,7 @@
 //!
 //! Recording in the ledger is the caller's job (`bp up` / `bp down`).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -28,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{CommandSpec, OutputMode};
 use crate::fsutil;
+use crate::program;
 use crate::vars::{self, Vars};
 
 /// Lines of stderr quoted in an error message; the full text goes to the run log.
@@ -400,12 +402,12 @@ fn run(argv: &[String], cwd: &Path) -> Result<Run> {
             cwd.display()
         );
     }
-    let output = Command::new(resolve_program(program, cwd))
+    let output = Command::new(resolve_program(program, cwd, &BTreeMap::new()))
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| spawn_error(program, e))?;
+        .map_err(|e| spawn_error(program, args, e))?;
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
         return Err(Failed {
@@ -424,8 +426,17 @@ fn run(argv: &[String], cwd: &Path) -> Result<Run> {
 /// A program given as a relative path with a directory part (`./scripts/up.sh`,
 /// `tools\up.cmd`) is resolved against `cwd` here: Unix would do so, Windows would resolve it
 /// against `bp`'s own working directory, and the same config must mean the same thing on every
-/// platform. A bare name (`docker`) is left to the `PATH` search.
-pub(crate) fn resolve_program(program: &str, cwd: &Path) -> PathBuf {
+/// platform. A bare name (`docker`) is left to the `PATH` search, unless it is a Windows script
+/// ([`program::complete`]). `env` is what is added to the environment of the process.
+pub(crate) fn resolve_program(
+    program: &str,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> PathBuf {
+    program::complete(locate(program, cwd), env)
+}
+
+fn locate(program: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(program);
     let relative = path.components().all(|c| {
         matches!(
@@ -445,15 +456,19 @@ pub(crate) fn resolve_program(program: &str, cwd: &Path) -> PathBuf {
     resolved
 }
 
-pub(crate) fn spawn_error(program: &str, e: io::Error) -> anyhow::Error {
+pub(crate) fn spawn_error(program: &str, args: &[String], e: io::Error) -> anyhow::Error {
     if e.kind() == io::ErrorKind::NotFound {
-        // Windows does not resolve `npx` to `npx.cmd` by PATHEXT when spawning without a shell.
-        let hint = if cfg!(windows) && Path::new(program).extension().is_none() {
-            " (a .cmd or .bat script must be named with its extension, e.g. `npx.cmd`)"
-        } else {
-            ""
-        };
-        return anyhow::anyhow!("cannot run {program}: program not found{hint}");
+        return anyhow::anyhow!("cannot run {program}: program not found");
+    }
+    // What std refuses to pass to a batch file, without saying what is wrong with it.
+    if cfg!(windows)
+        && e.kind() == io::ErrorKind::InvalidInput
+        && let Some(arg) = args.iter().find(|arg| arg.contains(['\n', '\r']))
+    {
+        return anyhow::anyhow!(
+            "cannot run {program}: a .cmd or .bat script cannot be given an argument with a line \
+             break: {arg:?}"
+        );
     }
     anyhow::Error::new(e).context(format!("cannot run {program}"))
 }
@@ -479,6 +494,8 @@ fn trim(text: &str) -> &str {
 mod tests {
     use super::*;
     use crate::test_support::fail;
+    #[cfg(windows)]
+    use crate::test_support::print_args;
 
     /// With the working directory as the pod's state directory, which only `output = "file"` uses.
     fn plan(spec: &CommandSpec, cwd: &Path, vars: &Vars) -> Result<Plan> {
@@ -804,24 +821,98 @@ mod tests {
     #[test]
     fn program_resolution() {
         let cwd = Path::new("base");
-        assert_eq!(resolve_program("docker", cwd), Path::new("docker"));
-        assert_eq!(
-            resolve_program("./a/b", cwd),
-            Path::new("base").join("a").join("b")
-        );
-        assert_eq!(
-            resolve_program("../x", cwd),
-            Path::new("base").join("..").join("x")
-        );
+        assert_eq!(locate("docker", cwd), Path::new("docker"));
+        assert_eq!(locate("./a/b", cwd), Path::new("base").join("a").join("b"));
+        assert_eq!(locate("../x", cwd), Path::new("base").join("..").join("x"));
         if cfg!(windows) {
-            assert_eq!(
-                resolve_program(r"C:\t\x.exe", cwd),
-                Path::new(r"C:\t\x.exe")
-            );
-            assert_eq!(resolve_program(r"\t\x.exe", cwd), Path::new(r"\t\x.exe"));
+            assert_eq!(locate(r"C:\t\x.exe", cwd), Path::new(r"C:\t\x.exe"));
+            assert_eq!(locate(r"\t\x.exe", cwd), Path::new(r"\t\x.exe"));
         } else {
-            assert_eq!(resolve_program("/usr/bin/x", cwd), Path::new("/usr/bin/x"));
+            assert_eq!(locate("/usr/bin/x", cwd), Path::new("/usr/bin/x"));
         }
+    }
+
+    /// Exactly as given, through `cmd` and the `%*` of a script like those of npm. The script is
+    /// found for its name without the extension, not the `sh` script beside it.
+    #[cfg(windows)]
+    #[test]
+    fn arguments_reach_a_program_behind_a_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("my tools & more");
+        fs::create_dir(&tools).unwrap();
+        fs::write(tools.join("launch"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        fs::write(tools.join("launch.cmd"), "@%*\r\n").unwrap();
+        let args = strings(&[
+            "plain",
+            "",
+            "two words",
+            r#""quoted""#,
+            r#"a"b & c"#,
+            r"back\slash\",
+            r#"back \" slash\"#,
+            "100%",
+            "%PATH%",
+            "%CD:~0,1%",
+            "a&b|c>d<e^f",
+            "!x!",
+            "(x)",
+            "a=b,c;d",
+            "*.*",
+            "\u{43f}\u{440}\u{438} \u{65e5} \u{1f980}",
+        ]);
+        let mut argv = strings(&["./my tools & more/launch"]);
+        argv.extend(print_args(&args));
+        let run = run(&argv, dir.path()).unwrap();
+        let text = String::from_utf8(run.stdout).unwrap();
+        let printed: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("arg "))
+            .collect();
+        let expected: Vec<String> = args
+            .iter()
+            .map(|arg| arg.escape_default().to_string())
+            .collect();
+        assert_eq!(printed, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_and_exit_code_of_a_script() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("fails.bat"),
+            "@echo out\r\n@echo boom 1>&2\r\n@exit /b %1\r\n",
+        )
+        .unwrap();
+        let run = |code: &str| run(&strings(&["./fails", code]), dir.path());
+        let ok = run("0").unwrap();
+        assert_eq!(ok.stdout, b"out\r\n");
+        assert!(ok.stderr.contains("boom"), "{}", ok.stderr);
+        let err = run("3").err().unwrap();
+        let failed = err.downcast_ref::<Failed>().expect("typed error");
+        assert_eq!(failed.status.code(), Some(3));
+        assert!(failed.stderr.contains("boom"), "{}", failed.stderr);
+        // As configured.
+        assert_eq!(failed.program, "./fails");
+
+        let err = format!("{:#}", run("0\nx").err().unwrap());
+        assert!(
+            err.contains("line break") && err.contains(r#""0\nx""#),
+            "{err}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_name_is_searched_for() {
+        let dir = tempfile::tempdir().unwrap();
+        // `chcp.com` of Windows itself.
+        assert!(run(&strings(&["chcp"]), dir.path()).is_ok());
+        // Not in the working directory.
+        fs::write(dir.path().join("bp-no-such-program-7f3a.cmd"), "").unwrap();
+        let err = run(&strings(&["bp-no-such-program-7f3a"]), dir.path());
+        let err = format!("{:#}", err.err().unwrap());
+        assert!(err.contains("program not found"), "{err}");
     }
 
     #[test]
@@ -925,9 +1016,6 @@ mod tests {
         .unwrap();
         let err = format!("{:#}", create(&plan).unwrap_err());
         assert!(err.contains("program not found"), "{err}");
-        if cfg!(windows) {
-            assert!(err.contains(".cmd"), "{err}");
-        }
     }
 
     #[test]

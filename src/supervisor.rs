@@ -581,14 +581,14 @@ fn start_service(start: &Start, services: &mut BTreeMap<String, Service>) -> Res
     }
     let (pump, output) = Pump::start(&start.log)
         .with_context(|| format!("cannot open log {}", start.log.display()))?;
-    let mut cmd = Command::new(commands::resolve_program(program, &start.cwd));
+    let mut cmd = Command::new(commands::resolve_program(program, &start.cwd, &start.env));
     cmd.args(args)
         .current_dir(&start.cwd)
         .envs(&start.env)
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output);
-    let mut tree = Tree::spawn(&mut cmd).map_err(|e| commands::spawn_error(program, e))?;
+    let mut tree = Tree::spawn(&mut cmd).map_err(|e| commands::spawn_error(program, args, e))?;
     // It holds our copies of the pipe's writing end: the pump must see the service close the last.
     drop(cmd);
     let Some(process) = proc::identify(tree.child().id()) else {
@@ -876,12 +876,22 @@ mod tests {
     /// Starts a service that has a child; both.
     #[cfg(windows)]
     fn start_tree(r: &Running, mode: &str) -> (ProcId, ProcId) {
+        let env = BTreeMap::from([(TREE_ENV.into(), mode.into())]);
+        start_tree_as(r, tree(), env)
+    }
+
+    #[cfg(windows)]
+    fn start_tree_as(
+        r: &Running,
+        run: Vec<String>,
+        env: BTreeMap<String, String>,
+    ) -> (ProcId, ProcId) {
         let log = r.dir.join("logs/tree.log");
         let start = Start {
             name: "tree".into(),
-            run: tree(),
+            run,
             cwd: r.dir.clone(),
-            env: BTreeMap::from([(TREE_ENV.into(), mode.into())]),
+            env,
             log: log.clone(),
         };
         let data = request(&r.endpoint, &Request::Start(start)).unwrap();
@@ -910,6 +920,28 @@ mod tests {
         let (leader, child) = start_tree(&r, "wait");
         stop_tree(&r);
         // The answer came after all of it was gone.
+        assert!(proc::wait_gone(leader, Duration::ZERO));
+        assert!(proc::wait_gone(child, Duration::ZERO));
+        assert!(proc::is_running(r.process));
+    }
+
+    /// As `npx vite` is: found on the `PATH` of the service, and stopped with all that runs behind
+    /// `cmd`.
+    #[cfg(windows)]
+    #[test]
+    fn a_service_behind_a_script() {
+        let r = running();
+        let bin = r.dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("bp-test-launch"), "#!/bin/sh\n").unwrap();
+        std::fs::write(bin.join("bp-test-launch.cmd"), "@%*\r\n").unwrap();
+        let mut run = vec!["bp-test-launch".to_owned()];
+        run.extend(tree());
+        let path = format!("{};{}", bin.display(), std::env::var("PATH").unwrap());
+        let env = BTreeMap::from([(TREE_ENV.into(), "wait".into()), ("Path".into(), path)]);
+        let (leader, child) = start_tree_as(&r, run, env);
+        assert!(proc::is_running(leader));
+        stop_tree(&r);
         assert!(proc::wait_gone(leader, Duration::ZERO));
         assert!(proc::wait_gone(child, Duration::ZERO));
         assert!(proc::is_running(r.process));
