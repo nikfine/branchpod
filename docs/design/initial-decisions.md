@@ -617,14 +617,18 @@ the Orca plugin catalog).
 - **The commit in `--version`:** `bp 0.1.0 (abc123456)`; `-V` is the bare version, for scripts. Found out by
   `build.rs`, which runs `git` and needs no crates: a variable set by whoever installs `bp` would leave
   `cargo install --git` without the commit.
-  - The build never fails because of git. Without it, or when the sources are not the top of a repository
-    (an archive unpacked inside another one), the version is the bare one.
+  - The build script never fails because of git. Without it, or when the sources are not the top of a work tree
+    (an archive unpacked inside another one), the version is the bare one. Cargo itself looks at the repository
+    of a package that has a build script, though, and fails for sources at the top of a bare repository or with
+    a broken index. A linked worktree of a bare repository is fine.
   - `-dirty` is appended when `src`, `Cargo.toml`, `Cargo.lock` or `build.rs` differ from the commit, new files
     in `src` included. Nothing else goes into the binary, so nothing else marks it or causes a rebuild.
   - A rebuild after a commit or a checkout updates it. The price: `bp` itself is compiled again then, and
     while the ref of the branch is packed, also after commits to other branches.
-  - Known limitation: a repository that appears (or a git that starts to work) after a build without one is
-    noticed at the next change of the sources.
+  - Known limitation: a repository that appears, gets its first commit, or becomes readable after a build
+    without a commit is noticed at the next change of the sources.
+  - Known limitation: linked worktrees that share a target directory (`CARGO_TARGET_DIR`) can show the commit of
+    one another, without `-dirty`.
 
 ## Name
 

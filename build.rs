@@ -1,6 +1,6 @@
 //! Puts the commit into `bp --version`: `0.1.0 (abc123456)`, with `-dirty` after the commit when the
-//! sources differ from it. Without git, or when anything about it fails, it is the bare version: the
-//! build never fails because of git.
+//! sources differ from it. Without git, or when anything about it fails, it is the bare version: this
+//! script never fails because of git.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -36,16 +36,19 @@ fn commit() -> Option<String> {
     let git = Git::new()?;
     let found = git.run(&[
         "rev-parse",
+        "--is-inside-work-tree",
         "--show-prefix",
         "--git-dir",
         "--git-common-dir",
         "HEAD",
     ])?;
-    let [prefix, git_dir, common_dir, head] = found.split('\n').collect::<Vec<_>>()[..] else {
+    let [inside, prefix, git_dir, common_dir, head] = found.split('\n').collect::<Vec<_>>()[..]
+    else {
         return None;
     };
-    // Not the top of a repository: sources unpacked inside an unrelated one.
-    if !prefix.is_empty() {
+    // Not the top of a work tree: sources unpacked inside an unrelated one, or in its `.git`, where
+    // the prefix is empty, too.
+    if inside != "true" || !prefix.is_empty() {
         return None;
     }
     let watched = watched(&git, Path::new(git_dir), Path::new(common_dir))?;

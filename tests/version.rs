@@ -18,8 +18,9 @@ fn short_version_is_bare_and_long_one_may_have_the_commit() {
     let bare = concat!("bp ", env!("CARGO_PKG_VERSION"));
     assert_eq!(bp("-V"), format!("{bare}\n"));
 
-    // Whether these sources are in a repository is not known here.
     let long = bp("--version");
+    assert_eq!(long, concat!("bp ", env!("BRANCHPOD_LONG_VERSION"), "\n"));
+    // Whether these sources are in a repository is not known here.
     let rest = long.strip_prefix(bare).unwrap().trim_end();
     if !rest.is_empty() {
         let commit = rest.strip_prefix(" (").unwrap().strip_suffix(')').unwrap();
@@ -45,6 +46,42 @@ fn without_a_repository_of_its_own_the_version_is_bare() {
     sandbox.git(&outer, &["commit", "-q", "-m", "outer"]);
     package.edit();
     assert_eq!(package.version(), "1.2.3");
+}
+
+#[test]
+fn sources_outside_the_work_tree_are_not_of_that_repository() {
+    let sandbox = Sandbox::new();
+    let outer = sandbox.repository("outer");
+    let package = sandbox.package("outer/.git/package");
+    assert_eq!(package.version(), "1.2.3");
+
+    let elsewhere = sandbox.dir("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    outer.git(&["config", "core.worktree", elsewhere.to_str().unwrap()]);
+    assert_eq!(outer.version(), "1.2.3");
+}
+
+#[test]
+fn a_repository_of_another_owner_takes_safe_directory() {
+    let sandbox = Sandbox::new();
+    let package = sandbox.repository("package");
+    let cargo = || {
+        let mut cargo = package.cargo();
+        // What the tests of git itself use.
+        cargo.env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
+        cargo
+    };
+    assert_eq!(read_build(cargo()).version, "1.2.3");
+
+    package.edit();
+    package.git(&["commit", "-q", "-a", "-m", "edit"]);
+    let mut trusting = cargo();
+    trusting
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "safe.directory")
+        .env("GIT_CONFIG_VALUE_0", "*");
+    let expected = format!("1.2.3 ({})", &package.head()[..9]);
+    assert_eq!(read_build(trusting).version, expected);
 }
 
 #[test]
@@ -111,7 +148,8 @@ fn changed_sources_are_marked() {
     package.git(&["checkout", "-q", "--", "src"]);
     package.assert_commit("");
 
-    // Not tracked yet, but a part of the build.
+    // Not tracked yet, but a part of the build, whatever `git status` shows by default.
+    package.git(&["config", "status.showUntrackedFiles", "no"]);
     let module = package.dir.join("src").join("new.rs");
     fs::write(&module, "").unwrap();
     package.assert_commit("-dirty");
@@ -121,6 +159,12 @@ fn changed_sources_are_marked() {
     package.edit();
     package.git(&["commit", "-q", "-a", "-m", "edit"]);
     package.assert_commit("");
+
+    // `git status` fails, so whether there are changes is not known.
+    package.edit();
+    package.git(&["commit", "-q", "-a", "-m", "edit"]);
+    package.git(&["config", "status.showUntrackedFiles", "bogus"]);
+    package.assert_commit("-dirty");
 }
 
 #[test]
@@ -146,6 +190,10 @@ fn a_linked_worktree_shows_its_own_commit() {
     main.git(&["pack-refs", "--all"]);
     linked.assert_commit("");
     linked.commit();
+    linked.assert_commit("");
+
+    // Only its own HEAD changes.
+    linked.git(&["checkout", "-q", "--detach", "HEAD~1"]);
     linked.assert_commit("");
 }
 
@@ -335,7 +383,9 @@ impl Package<'_> {
             .args(["run", "--offline", "--locked", "--color", "never"])
             .arg("--target-dir")
             .arg(self.dir.join("target"))
-            .env_remove("CARGO_BUILD_TARGET");
+            .env_remove("CARGO_BUILD_TARGET")
+            // `compiled` is read from what cargo says.
+            .env_remove("CARGO_TERM_QUIET");
         command
     }
 
