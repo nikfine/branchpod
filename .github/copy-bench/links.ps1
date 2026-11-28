@@ -32,7 +32,11 @@ $root = Join-Path $env:RUNNER_TEMP 'links'
 function Get-State($dest, $target) {
     $item = Get-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
     $d = if (-not $item) { 'gone' } elseif ($item.LinkType) { "link" } else { "file: $((Get-Content -LiteralPath $dest -Raw).Trim())" }
-    $t = if (Test-Path -LiteralPath $target) { "exists: $((Get-Content -LiteralPath $target -Raw).Trim())" } else { 'absent' }
+    $t = if (Test-Path -LiteralPath $target -PathType Container) {
+        "directory with: $((Get-ChildItem -LiteralPath $target -Force).Name -join ', ')"
+    } elseif (Test-Path -LiteralPath $target) {
+        "exists: $((Get-Content -LiteralPath $target -Raw).Trim())"
+    } else { 'absent' }
     "$d | $t"
 }
 $n = 0
