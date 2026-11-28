@@ -1,7 +1,6 @@
 name: copy-bench
 
-# Throwaway: measures how fast `[[file]] mode = "copy"` copies a directory, against the copy tools of
-# each OS. Lives on its own branch only and is never merged.
+# Throwaway: experiments on the copy of files. Lives on its own branch only and is never merged.
 on:
   push:
     branches: [chore-copy-bench]
@@ -10,28 +9,11 @@ permissions:
   contents: read
 
 jobs:
-  bench:
-    name: bench (${{ matrix.os }}, defender ${{ matrix.defender }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Windows twice: as the runner comes (real-time protection off) and with it turned on, as on a
-        # developer's machine. Linux and macOS were measured in the first run.
-        os: [windows-latest]
-        defender: ['off', 'on']
-    runs-on: ${{ matrix.os }}
+  links:
+    name: CopyFile2 and links (windows-latest)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked
-      - name: turn on real-time protection
-        if: matrix.defender == 'on'
+      - name: links
         shell: pwsh
-        run: |
-          Set-MpPreference -DisableRealtimeMonitoring $false
-          Start-Sleep -Seconds 5
-          (Get-MpComputerStatus).RealTimeProtectionEnabled
-      - name: bench
-        shell: pwsh
-        run: ./.github/copy-bench/bench.ps1
+        run: ./.github/copy-bench/links.ps1
