@@ -1,0 +1,27 @@
+name: copy-bench
+
+# Throwaway: measures how fast `[[file]] mode = "copy"` copies a directory, against the copy tools of
+# each OS. Lives on its own branch only and is never merged.
+on:
+  push:
+    branches: [chore-copy-bench]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: bench
+        shell: pwsh
+        run: ./.github/copy-bench/bench.ps1
