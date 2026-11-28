@@ -35,8 +35,11 @@ function Get-State($dest, $target) {
     $t = if (Test-Path -LiteralPath $target) { "exists: $((Get-Content -LiteralPath $target -Raw).Trim())" } else { 'absent' }
     "$d | $t"
 }
+$n = 0
 function New-Case($case, $kind) {
-    if (Test-Path $root) { [IO.Directory]::Delete($root, $true) }
+    # A directory of its own for every case: nothing is cleaned up in between.
+    $script:n++
+    $script:root = Join-Path $env:RUNNER_TEMP "links-$script:n"
     New-Item -ItemType Directory $root | Out-Null
     Set-Content -LiteralPath (Join-Path $root 'src.txt') 'from main'
     $target = Join-Path $root 'target'
@@ -55,11 +58,12 @@ function New-Case($case, $kind) {
 $lines = @('| Destination | Operation | Result | Destination after | Link target after |', '|---|---|---|---|---|')
 foreach ($kind in 'symlink', 'junction') {
     foreach ($case in 'dangling', 'live') {
-        $src = Join-Path $root 'src.txt'; $dest = Join-Path $root 'dest.txt'; $target = Join-Path $root 'target'
         New-Case $case $kind
+        $src = Join-Path $root 'src.txt'; $dest = Join-Path $root 'dest.txt'; $target = Join-Path $root 'target'
         $hr = [Copy2]::Copy($src, $dest, [uint32]($FAIL -bor $SYMLINK))
         $lines += "| $case $kind | CopyFile2 FAIL_IF_EXISTS+COPY_SYMLINK | 0x$('{0:x8}' -f $hr) | $(Get-State $dest $target) |"
         New-Case $case $kind
+        $src = Join-Path $root 'src.txt'; $dest = Join-Path $root 'dest.txt'; $target = Join-Path $root 'target'
         $tmp = Join-Path $root 'tmp-1234.txt'
         $hr = [Copy2]::Copy($src, $tmp, [uint32]$FAIL)
         $err = [Copy2]::Move($tmp, $dest)
