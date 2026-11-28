@@ -297,6 +297,16 @@ Rules for file resources:
   source, creates directories and links, and passes files on through a short queue, so that little time passes
   between listing a file and copying it. The first error stops all threads, and they are waited for before the
   failure is recorded: nothing is written after that. On Unix directories get their permissions at the end.
+- On Windows the files of a copied directory are copied by the system (`CopyFile2`), not read and written by
+  `bp`: an antivirus that scans files on open scans every file a process opens, but lets the system copy
+  through (a `node_modules` of 28 000 files: 30 s cold before, 7 s now). A single file is still copied by
+  `bp`, which hashes it while writing (see "Edited copies").
+  - The one exception to "nothing is created through a link": a link to nothing that appears at the place of
+    a file in the copy is followed and its target created (`CopyFile2` does so whatever its flags say). It
+    would have to be made in the directory `bp` has just created, in the moment before the file is copied, by
+    a process allowed to create symbolic links; and it overwrites nothing (a link to an existing file, a file
+    or a junction fails the copy). Catching it, by copying under another name and renaming, made the
+    antivirus scan every file again: 13 s instead of 7, warm or cold.
 - `link`: symlink on Unix; on Windows a junction for directories (no privileges needed) and a symlink for
   files. Without the right to create a file symlink (Developer Mode or admin) it is an error with a hint,
   not a silent copy: a copy would quietly stop propagating edits. Hard links are rejected (editors that
