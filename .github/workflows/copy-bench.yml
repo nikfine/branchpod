@@ -11,17 +11,27 @@ permissions:
 
 jobs:
   bench:
-    name: bench (${{ matrix.os }})
+    name: bench (${{ matrix.os }}, defender ${{ matrix.defender }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows twice: as the runner comes (real-time protection off) and with it turned on, as on a
+        # developer's machine. Linux and macOS were measured in the first run.
+        os: [windows-latest]
+        defender: ['off', 'on']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
+      - name: turn on real-time protection
+        if: matrix.defender == 'on'
+        shell: pwsh
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $false
+          Start-Sleep -Seconds 5
+          (Get-MpComputerStatus).RealTimeProtectionEnabled
       - name: bench
         shell: pwsh
         run: ./.github/copy-bench/bench.ps1

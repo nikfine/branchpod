@@ -124,3 +124,5 @@ $lines += "CPUs: $([Environment]::ProcessorCount)."
 $text = $lines -join "`n"
 $text
 Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY $text
+# robocopy reports copied files with exit code 1; the step would fail with it.
+exit 0
