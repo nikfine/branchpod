@@ -402,34 +402,67 @@ mod system_copy {
     use std::path::Path;
     use std::ptr;
 
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use windows_sys::Win32::Storage::FileSystem::{
-        COPY_FILE_COPY_SYMLINK, COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2,
-        GetFullPathNameW,
+        COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2, GetFullPathNameW,
+        MoveFileExW,
     };
 
     /// Copies `source` into a new `dest`. Anything at `dest`, also what appeared since it was planned,
-    /// fails the copy (a file or a link with `AlreadyExists`, a junction with `PermissionDenied`) and is
-    /// neither overwritten nor written through.
+    /// fails the copy with `AlreadyExists` and is neither overwritten nor written through.
     ///
-    /// `COPY_FILE_COPY_SYMLINK` is what makes a link at `dest` fail the copy even when its target does
-    /// not exist; without it the system follows such a link and creates the target ("fails only if the
-    /// target of the symbolic link exists", the remarks of `CopyFileExW`). A `source` that has become a
-    /// link since it was listed is copied as a link, as links in a tree are.
+    /// `CopyFile2` cannot promise that on its own: with `COPY_FILE_FAIL_IF_EXISTS` it follows a link at
+    /// the destination whose target does not exist and creates the target, also with
+    /// `COPY_FILE_COPY_SYMLINK`, which its documentation says would prevent it (tried on Windows
+    /// 10.0.26100). So the file is copied under a name of its own in the same directory and renamed
+    /// without replacing (`MoveFileExW` without flags), which fails on anything at `dest`, a link to
+    /// nothing or a junction included. What the rename refuses is removed again.
     pub(super) fn copy(source: &Path, dest: &Path) -> io::Result<()> {
-        let (from, to) = (system_path(source)?, system_path(dest)?);
+        let parent = dest.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a destination without a parent",
+            )
+        })?;
+        let temp = parent.join(temp_name());
+        let (from, to, temp_wide) = (
+            system_path(source)?,
+            system_path(dest)?,
+            system_path(&temp)?,
+        );
         let params = COPYFILE2_EXTENDED_PARAMETERS {
             dwSize: size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32,
-            dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK,
+            dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS,
             pfCancel: ptr::null_mut(),
             pProgressRoutine: None,
             pvCallbackContext: ptr::null_mut(),
         };
         // SAFETY: both paths are NUL-terminated and live through the call; `params` is complete.
-        let hr = unsafe { CopyFile2(from.as_ptr(), to.as_ptr(), &params) };
-        if hr >= 0 {
-            return Ok(());
+        let hr = unsafe { CopyFile2(from.as_ptr(), temp_wide.as_ptr(), &params) };
+        if hr < 0 {
+            // A copy that failed midway may have left the file.
+            let _ = std::fs::remove_file(&temp);
+            return Err(error(hr));
         }
-        Err(error(hr))
+        // SAFETY: both paths are NUL-terminated and live through the call.
+        if unsafe { MoveFileExW(temp_wide.as_ptr(), to.as_ptr(), 0) } == 0 {
+            let e = io::Error::last_os_error();
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// A name nobody can guess: whoever could plant a link there in advance could have it followed.
+    fn temp_name() -> String {
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        // `RandomState` is seeded at random once per process.
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(COUNT.fetch_add(1, Ordering::Relaxed));
+        format!(".bp-copy-{:016x}", hasher.finish())
     }
 
     /// The error of a failed `HRESULT`: a Windows error code where it carries one.
@@ -530,6 +563,13 @@ mod system_copy {
                 system_path(Path::new(&verbatim)).unwrap(),
                 terminated(wide(&verbatim))
             );
+        }
+
+        #[test]
+        fn temporary_names_differ() {
+            let (a, b) = (temp_name(), temp_name());
+            assert_ne!(a, b);
+            assert!(a.starts_with(".bp-copy-") && a.len() == 25, "{a}");
         }
 
         #[test]
