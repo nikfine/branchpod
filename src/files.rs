@@ -343,9 +343,11 @@ struct Copied {
 ///
 /// `dest` is always created exclusively, so a file or link that appeared there since `plan` is
 /// never overwritten or written through (`fs::copy` would do both).
+///
+/// On Windows a file without a fingerprint is copied by the system ([`system_copy`]).
 fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Result<Copied> {
-    let mut from = File::open(source)?;
     if reflink {
+        let from = File::open(source)?;
         match reflink_copy::reflink_file_to_path(&from, dest) {
             Ok(()) => {
                 let fingerprint = match fingerprint {
@@ -362,6 +364,15 @@ fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Re
             Err(_) => {}
         }
     }
+    #[cfg(windows)]
+    if !fingerprint {
+        system_copy::copy(source, dest)?;
+        return Ok(Copied {
+            cloned: false,
+            fingerprint: None,
+        });
+    }
+    let mut from = File::open(source)?;
     let mut to = File::create_new(dest)?;
     let fingerprint = if fingerprint {
         Some(copy_hashed(&mut from, &mut to)?)
@@ -374,6 +385,162 @@ fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Re
         cloned: false,
         fingerprint,
     })
+}
+
+/// A file copied by Windows itself, with `CopyFile2`.
+///
+/// An antivirus that scans files on open scans every file `bp` opens to read, but lets the system
+/// copy through (since Windows 11 the opens of a copy can be marked as such for filters). Measured on a
+/// `node_modules` of 28 000 files with Kaspersky: 30 s with `bp`'s own copy, 7 s with robocopy, the
+/// antivirus using 108 s and 4 s of CPU. Attributes, the read-only one included, come with the copy.
+#[cfg(windows)]
+mod system_copy {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2, GetFullPathNameW,
+    };
+
+    /// Copies `source` into a new `dest`. A file or a link at `dest`, also one that appeared since it
+    /// was planned, fails the copy with `AlreadyExists` and is neither overwritten nor written through.
+    pub(super) fn copy(source: &Path, dest: &Path) -> io::Result<()> {
+        let (from, to) = (system_path(source)?, system_path(dest)?);
+        let params = COPYFILE2_EXTENDED_PARAMETERS {
+            dwSize: size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32,
+            dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS,
+            pfCancel: ptr::null_mut(),
+            pProgressRoutine: None,
+            pvCallbackContext: ptr::null_mut(),
+        };
+        // SAFETY: both paths are NUL-terminated and live through the call; `params` is complete.
+        let hr = unsafe { CopyFile2(from.as_ptr(), to.as_ptr(), &params) };
+        if hr >= 0 {
+            return Ok(());
+        }
+        Err(error(hr))
+    }
+
+    /// The error of a failed `HRESULT`: a Windows error code where it carries one.
+    fn error(hr: i32) -> io::Error {
+        const FACILITY_WIN32: u32 = 7;
+        let code = hr as u32;
+        if (code >> 16) & 0x1fff == FACILITY_WIN32 {
+            return io::Error::from_raw_os_error((code & 0xffff) as i32);
+        }
+        io::Error::other(format!("CopyFile2 failed with HRESULT {code:#010x}"))
+    }
+
+    /// `path`, NUL-terminated, in the form that may be longer than `MAX_PATH` if it is long, as std
+    /// passes paths to the system. Short paths are left to the system, `/` included.
+    fn system_path(path: &Path) -> io::Result<Vec<u16>> {
+        /// What std takes for long: `MAX_PATH` less room for a file name in a directory.
+        const LONG: usize = 248;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a NUL character in a path",
+            ));
+        }
+        let verbatim = starts_with(&wide, r"\\?\") || starts_with(&wide, r"\\.\");
+        if wide.len() < LONG || verbatim {
+            return Ok(terminated(wide));
+        }
+        // Absolute, with `\` only and without `.` and `..`: a `\\?\` path is taken as it is.
+        let full = full_path(&terminated(wide))?;
+        let (prefix, rest): (&str, &[u16]) = if starts_with(&full, r"\\") {
+            (r"\\?\UNC\", &full[2..])
+        } else {
+            (r"\\?\", &full)
+        };
+        let mut long: Vec<u16> = OsStr::new(prefix).encode_wide().collect();
+        long.extend_from_slice(rest);
+        Ok(terminated(long))
+    }
+
+    fn full_path(path: &[u16]) -> io::Result<Vec<u16>> {
+        let mut buffer = vec![0u16; 512];
+        loop {
+            // SAFETY: `path` is NUL-terminated; the buffer holds `len` elements.
+            let n = unsafe {
+                GetFullPathNameW(
+                    path.as_ptr(),
+                    buffer.len() as u32,
+                    buffer.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            } as usize;
+            match n {
+                0 => return Err(io::Error::last_os_error()),
+                // Without the NUL: it fitted.
+                n if n < buffer.len() => {
+                    buffer.truncate(n);
+                    return Ok(buffer);
+                }
+                // With the NUL: the size it needs.
+                n => buffer.resize(n, 0),
+            }
+        }
+    }
+
+    fn terminated(mut wide: Vec<u16>) -> Vec<u16> {
+        wide.push(0);
+        wide
+    }
+
+    fn starts_with(path: &[u16], prefix: &str) -> bool {
+        let prefix: Vec<u16> = OsStr::new(prefix).encode_wide().collect();
+        path.starts_with(&prefix)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn long_paths_take_the_form_the_system_wants() {
+            let short = Path::new(r"C:\a/b");
+            assert_eq!(system_path(short).unwrap(), terminated(wide(r"C:\a/b")));
+            let long = format!(r"C:\{}\.\x/y", "d".repeat(260));
+            let expected = format!(r"\\?\C:\{}\x\y", "d".repeat(260));
+            assert_eq!(
+                system_path(Path::new(&long)).unwrap(),
+                terminated(wide(&expected))
+            );
+            let unc = format!(r"\\server\share\{}", "d".repeat(260));
+            let expected = format!(r"\\?\UNC\server\share\{}", "d".repeat(260));
+            assert_eq!(
+                system_path(Path::new(&unc)).unwrap(),
+                terminated(wide(&expected))
+            );
+            let verbatim = format!(r"\\?\C:\{}", "d".repeat(260));
+            assert_eq!(
+                system_path(Path::new(&verbatim)).unwrap(),
+                terminated(wide(&verbatim))
+            );
+        }
+
+        #[test]
+        fn errors_keep_their_windows_code() {
+            // HRESULT_FROM_WIN32(ERROR_FILE_EXISTS)
+            let e = error(0x8007_0050_u32 as i32);
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(e.raw_os_error(), Some(80));
+            assert!(
+                error(0x8000_4005_u32 as i32)
+                    .to_string()
+                    .contains("0x80004005")
+            );
+        }
+
+        fn wide(text: &str) -> Vec<u16> {
+            OsStr::new(text).encode_wide().collect()
+        }
+    }
 }
 
 /// Whatever the number of CPUs: measured on 4 of them, 8 threads were faster than 4 on Windows and about
@@ -1113,6 +1280,49 @@ mod tests {
         rm(&record).unwrap();
         assert!(!dest.exists());
         assert_eq!(files_in(&source), FILES);
+    }
+
+    /// A link that appeared in the copy of a tree, where a file is to go, is not written through.
+    #[test]
+    fn a_link_in_the_way_of_a_file_of_a_tree_is_not_written_through() {
+        let t = tree();
+        if !file_symlinks_allowed(&t) {
+            return;
+        }
+        let source = t.main.join("vendor");
+        write(&source.join("a.txt"), "from main");
+        write(&t.main.join("victim.txt"), "keep me");
+        let dest = t.wt.join("vendor");
+        fs::create_dir(&dest).unwrap();
+        make_link(&t.main.join("victim.txt"), &dest.join("a.txt"), false).unwrap();
+
+        let err = format!("{:#}", copy_tree_in_time(&source, &dest).unwrap_err());
+        assert!(err.contains("cannot copy"), "{err}");
+        assert_eq!(
+            fs::read_to_string(t.main.join("victim.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(
+            fs::symlink_metadata(dest.join("a.txt"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    /// `node_modules` easily goes past `MAX_PATH` on Windows.
+    #[test]
+    fn a_tree_with_long_paths_is_copied() {
+        let t = tree();
+        let source = t.main.join("vendor");
+        let deep = (0..12).fold(source.clone(), |p, i| {
+            p.join(format!("{i:02}-{}", "d".repeat(20)))
+        });
+        write(&deep.join("long.txt"), "deep");
+        assert!(deep.join("long.txt").as_os_str().len() > 300);
+        let record = up(&t, &spec("vendor", FileMode::Copy));
+        assert_eq!(contents(&t.wt.join("vendor")), contents(&source));
+        rm(&record).unwrap();
+        assert!(!t.wt.join("vendor").exists());
     }
 
     /// The error is about what cannot be copied, not about the threads.
@@ -1944,6 +2154,10 @@ mod tests {
         }
         let dir = up(&t, &spec("objs", FileMode::Copy));
         let file = up(&t, &spec("ro.txt", FileMode::Copy));
+        for p in ["objs/pack.idx", "ro.txt"] {
+            let perms = fs::metadata(t.wt.join(p)).unwrap().permissions();
+            assert!(perms.readonly(), "{p}");
+        }
         for r in rm_all(&[dir, file]) {
             r.unwrap();
         }
