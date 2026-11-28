@@ -390,9 +390,10 @@ fn copy_file(source: &Path, dest: &Path, reflink: bool, fingerprint: bool) -> Re
 /// A file copied by Windows itself, with `CopyFile2`.
 ///
 /// An antivirus that scans files on open scans every file `bp` opens to read, but lets the system
-/// copy through (since Windows 11 the opens of a copy can be marked as such for filters). Measured on a
-/// `node_modules` of 28 000 files with Kaspersky: 30 s with `bp`'s own copy, 7 s with robocopy, the
-/// antivirus using 108 s and 4 s of CPU. Attributes, the read-only one included, come with the copy.
+/// copy through (since Windows 11 the opens of a copy can be marked as such for filters). Measured on
+/// a `node_modules` of 28 000 files with such an antivirus: 30 s with `bp`'s own copy, 7 s with
+/// robocopy, the antivirus using 108 s and 4 s of CPU. Attributes (the read-only one included),
+/// alternate data streams and the modification time come with the copy.
 #[cfg(windows)]
 mod system_copy {
     use std::ffi::OsStr;
@@ -402,16 +403,23 @@ mod system_copy {
     use std::ptr;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2, GetFullPathNameW,
+        COPY_FILE_COPY_SYMLINK, COPY_FILE_FAIL_IF_EXISTS, COPYFILE2_EXTENDED_PARAMETERS, CopyFile2,
+        GetFullPathNameW,
     };
 
-    /// Copies `source` into a new `dest`. A file or a link at `dest`, also one that appeared since it
-    /// was planned, fails the copy with `AlreadyExists` and is neither overwritten nor written through.
+    /// Copies `source` into a new `dest`. Anything at `dest`, also what appeared since it was planned,
+    /// fails the copy (a file or a link with `AlreadyExists`, a junction with `PermissionDenied`) and is
+    /// neither overwritten nor written through.
+    ///
+    /// `COPY_FILE_COPY_SYMLINK` is what makes a link at `dest` fail the copy even when its target does
+    /// not exist; without it the system follows such a link and creates the target ("fails only if the
+    /// target of the symbolic link exists", the remarks of `CopyFileExW`). A `source` that has become a
+    /// link since it was listed is copied as a link, as links in a tree are.
     pub(super) fn copy(source: &Path, dest: &Path) -> io::Result<()> {
         let (from, to) = (system_path(source)?, system_path(dest)?);
         let params = COPYFILE2_EXTENDED_PARAMETERS {
             dwSize: size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32,
-            dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS,
+            dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK,
             pfCancel: ptr::null_mut(),
             pProgressRoutine: None,
             pvCallbackContext: ptr::null_mut(),
@@ -558,8 +566,12 @@ type Pair = (PathBuf, PathBuf);
 /// Returns whether every file was cloned, `None` without files.
 ///
 /// The first error stops the other threads. Nothing is written any more when this returns.
+///
+/// Cloning is given up for the rest of the tree once a file could not be cloned: the tree is on one
+/// file system, and each attempt opens the source, which an antivirus scans ([`system_copy`]).
 fn copy_tree(source: &Path, dest: &Path, reflink: bool) -> Result<Option<bool>> {
     let stop = AtomicBool::new(false);
+    let clone = AtomicBool::new(reflink);
     let mut dirs = vec![(source.to_path_buf(), dest.to_path_buf())];
     let cloned = thread::scope(|scope| -> Result<Option<bool>> {
         let (files, queue) = sync_channel(COPY_QUEUE);
@@ -567,9 +579,8 @@ fn copy_tree(source: &Path, dest: &Path, reflink: bool) -> Result<Option<bool>> 
         let queue = Arc::new(Mutex::new(queue));
         let workers = (0..COPY_THREADS)
             .map(|_| {
-                let (queue, stop) = (Arc::clone(&queue), &stop);
-                thread::Builder::new()
-                    .spawn_scoped(scope, move || copy_queued(&queue, reflink, stop))
+                let (queue, stop, clone) = (Arc::clone(&queue), &stop, &clone);
+                thread::Builder::new().spawn_scoped(scope, move || copy_queued(&queue, clone, stop))
             })
             .collect::<io::Result<Vec<_>>>()
             .context("cannot start a thread")?;
@@ -632,9 +643,10 @@ fn list_tree(
 }
 
 /// Copies queued files until there are no more or `stop` is set, which it does itself on an error.
+/// Tries to clone while `clone` is set, and clears it when a file was copied instead.
 fn copy_queued(
     queue: &Mutex<Receiver<Pair>>,
-    reflink: bool,
+    clone: &AtomicBool,
     stop: &AtomicBool,
 ) -> Result<Option<bool>> {
     let mut cloned = None;
@@ -647,8 +659,15 @@ fn copy_queued(
         if stop.load(Ordering::Relaxed) {
             return Ok(cloned);
         }
+        let reflink = clone.load(Ordering::Relaxed);
         match copy_file(&from, &to, reflink, false) {
-            Ok(this) => cloned = both(cloned, Some(this.cloned)),
+            Ok(this) => {
+                if reflink && !this.cloned {
+                    clone.store(false, Ordering::Relaxed);
+                }
+                // Copied without trying counts as not cloned: once one file was not, the tree is not.
+                cloned = both(cloned, Some(this.cloned));
+            }
             Err(e) => {
                 stop.store(true, Ordering::Relaxed);
                 return Err(e.context(format!("cannot copy {}", from.display())));
@@ -1307,6 +1326,14 @@ mod tests {
                 .unwrap()
                 .is_symlink()
         );
+
+        // A link to nothing is not followed to create its target, either.
+        fs::remove_file(dest.join("a.txt")).unwrap();
+        let nowhere = t.main.join("nowhere.txt");
+        make_link(&nowhere, &dest.join("a.txt"), false).unwrap();
+        let err = format!("{:#}", copy_tree_in_time(&source, &dest).unwrap_err());
+        assert!(err.contains("cannot copy"), "{err}");
+        assert!(!nowhere.exists(), "created through the link");
     }
 
     /// `node_modules` easily goes past `MAX_PATH` on Windows.

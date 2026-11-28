@@ -36,7 +36,8 @@ tempfile = "3.27.0"
 junction = { version = "2.1.0", default-features = false }
 # Restart Manager: names the processes holding a file that teardown cannot remove. Named pipes
 # and process queries: the supervisor's control channel and pid + start time checks. Job Objects
-# and the thread snapshot: services that die with their supervisor.
+# and the thread snapshot: services that die with their supervisor. CopyFile2: copying the files of a
+# directory past an antivirus that scans what a process opens.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
